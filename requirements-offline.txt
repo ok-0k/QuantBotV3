@@ -1,0 +1,16 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements-offline.txt — offline_trainer.py dependencies
+# Run on your LAPTOP / desktop, NOT on the Pi.
+# Install: pip install -r requirements-offline.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Same as Pi requirements (shared modules)
+numpy>=1.26.0
+pandas>=2.2.0
+xgboost>=2.0.0
+pandas-ta>=0.3.14b
+requests>=2.31.0
+
+# ── Offline-only (too heavy for Pi) ──────────────────────────────────────────
+torch>=2.2.0            # SAC actor training (full backprop)
+optuna>=3.6.0           # TPE hyperparameter search

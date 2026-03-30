@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt — Quant Bot v3
+# Install on Pi:     pip install -r requirements.txt
+# Install offline:   pip install -r requirements-offline.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core async I/O ────────────────────────────────────────────────────────────
+aiohttp>=3.9.0          # async HTTP client (REST history fetch)
+websockets>=12.0        # Binance WebSocket stream
+
+# ── API / Dashboard ───────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+sse-starlette>=1.8.2    # Server-Sent Events for FastAPI
+
+# ── Data / ML (Pi 5 ARM64 — all have pre-built ARM wheels) ───────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+xgboost>=2.0.0          # nthread=2, tree_method=hist → ARM64 optimal
+pandas-ta>=0.3.14b       # vectorized technical indicators
+
+# ── Networking ────────────────────────────────────────────────────────────────
+requests>=2.31.0        # offline_trainer data fetch (not on Pi live path)
