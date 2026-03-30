@@ -1,6 +1,6 @@
-# ⚡ Quant Bot v3 — Raspberry Pi 5 Edge Trading System
+# ⚡ Quant Bot v3 — Pi  Edge Trading System
 
-Self-improving algorithmic trading bot: XGBoost signal filtering + SAC reinforcement learning position sizing + genetic strategy evolution. Runs 24/7 on a headless Raspberry Pi 5.
+Self-improving algorithmic trading bot: XGBoost signal filtering + SAC reinforcement learning position sizing + genetic strategy evolution. Runs 24/7 on a headless Raspberry Pi .
 
 ---
 
