@@ -1,0 +1,20 @@
+{
+  "params": {
+    "rsi_period": 10,
+    "bb_period": 15,
+    "macd_fast": 8,
+    "macd_slow": 26,
+    "atr_period": 10,
+    "forward_n": 10,
+    "profit_pct": 0.003,
+    "dd_pct": 0.005,
+    "threshold": 0.6,
+    "n_estimators": 202,
+    "max_depth": 3,
+    "learning_rate": 0.011926324174062874,
+    "subsample": 0.9795542149013333,
+    "colsample_bytree": 0.9828160165372797,
+    "min_child_weight": 9
+  },
+  "sortino": -100.0
+}
