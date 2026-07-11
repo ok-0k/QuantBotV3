@@ -13,7 +13,7 @@ Key design choices:
 """
 
 from __future__ import annotations
-
+import fcntl
 import logging
 import os
 from pathlib import Path
@@ -225,3 +225,4 @@ def get_feature_importance() -> dict[str, float]:
     scores = model.feature_importances_
     # Feature names come from compute_features; we don't have them here
     return {f"f{i}": float(s) for i, s in enumerate(scores)}
+

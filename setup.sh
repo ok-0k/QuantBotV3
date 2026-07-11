@@ -21,7 +21,8 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 TRADING_USER="${SUDO_USER:-pi}"
 HOME_DIR="/home/${TRADING_USER}"
 DATA_DIR="${HOME_DIR}/trading_data"
-BOT_DIR="${HOME_DIR}/quant_bot"
+# Repo path: override with `BOT_DIR=/home/pi/quant_bot sudo -E bash setup.sh` if you use quant_bot.
+BOT_DIR="${BOT_DIR:-${HOME_DIR}/trading_bot}"
 
 info "Setting up Quant Bot v3 for user: ${TRADING_USER}"
 

@@ -265,7 +265,7 @@ REGIME_ENCODING = {
 }
 
 
-def build_sac_state(ml_prob: float, balance_ratio: float,
+def build_sac_state(prob: float, balance_ratio: float,
                     unrealised_pnl_pct: float, drawdown_pct: float,
                     atr_pct: float, adx_norm: float,
                     regime: str, vol_norm: float) -> np.ndarray:
@@ -276,7 +276,7 @@ def build_sac_state(ml_prob: float, balance_ratio: float,
     """
     # Clamp everything to reasonable ranges
     state = np.array([
-        float(np.clip(ml_prob,             0.0, 1.0)),
+        float(np.clip(prob,             0.0, 1.0)),
         float(np.clip(balance_ratio,       0.0, 1.0)),
         float(np.clip(unrealised_pnl_pct, -1.0, 1.0)),
         float(np.clip(drawdown_pct,        0.0, 1.0)),

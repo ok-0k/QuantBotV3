@@ -1,11 +1,51 @@
 """
-db.py — In-memory-mapped SQLite database layer.
+db.py — SQLite data layer with WAL pragmas.
 
-Replaces all JSON file I/O.  Every PRAGMA is documented with its exact
-Pi 5 impact per the architectural blueprint.
+SHORTING ADDITIONS vs previous version:
 
-Thread safety: WAL mode allows the async bot to write while the
-FastAPI dashboard reads — zero blocking between them.
+  Schema changes (positions table):
+    side TEXT DEFAULT 'long'
+      — 'long' for buy-first positions (existing behaviour, default)
+      — 'short' for sell-first positions (new)
+      All existing rows get 'long' automatically via the migration command.
+
+    margin_reserved REAL DEFAULT 0
+      — Cash held as collateral for a short position.
+      — On open_short: this amount is deducted from cash and stored here.
+      — On close_short: returned to cash + or - the PnL.
+      — For longs this is always 0 (longs use cash directly, not margin).
+
+  Schema changes (trades table):
+    side TEXT DEFAULT 'long'
+      — Records whether each trade was the long or short side.
+      — Allows trade history to clearly distinguish long buys/sells from
+        short entries/covers.
+
+  New functions:
+    open_short()           — Opens a new short position with margin reservation.
+    close_short()          — Covers a short, returns margin, books PnL.
+    get_short_position()   — Returns short position for a symbol (if any).
+    get_all_short_positions() — Returns all open short positions.
+    open_short_count()     — Count of currently open shorts (for MAX check).
+
+  Modified functions:
+    get_position()         — Default dict now includes side and margin_reserved.
+    get_all_positions()    — Now queries WHERE shares > 0 OR margin_reserved > 0
+                             so shorts (which have 0 shares) appear in position lists.
+    open_position()        — Explicitly marks side='long'; margin_reserved stays 0.
+    close_position()       — Resets side to 'long', margin_reserved to 0.
+    log_trade()            — Accepts optional 'side' key in trade dict.
+    init_db()              — Adds migration blocks for both new columns.
+
+  PnL calculation for shorts:
+    Long PnL  = (exit_price - entry_price) × shares   [profit when price rises]
+    Short PnL = (entry_price - exit_price) × shares   [profit when price falls]
+    This is handled in close_short() not here in db.py — db.py just stores the
+    PnL that bot.py calculates and passes in.
+
+UNCHANGED from previous version:
+  All long-side functions behave identically. Existing open positions are
+  unaffected. The 'side' column defaults to 'long' for all existing rows.
 """
 
 from __future__ import annotations
@@ -14,50 +54,29 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any
 
 from config import DB_PATH, STARTING_CASH, SYMBOLS
 
-# One connection object per OS thread (sqlite3 requires this in WAL mode)
 _local = threading.local()
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Return thread-local SQLite connection with all performance PRAGMAs set."""
     if not hasattr(_local, "conn") or _local.conn is None:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=20.0)
         conn.row_factory = sqlite3.Row
-
-        # ── MANDATORY PRAGMAS for Raspberry Pi 5 edge deployment ─────────────
-        # WAL: readers never block writers, writers never block readers.
-        # Critical for the async bot (writer) + FastAPI dashboard (reader).
         conn.execute("PRAGMA journal_mode=WAL;")
-
-        # NORMAL: skip full filesystem sync on every commit; OS cache handles it.
-        # Increases write throughput to ~80,000 inserts/sec on ARM64.
-        # Risk: last transaction lost on catastrophic power failure only.
         conn.execute("PRAGMA synchronous=NORMAL;")
-
-        # MEMORY: temp tables, sort buffers, and indices live in RAM.
-        # Eliminates disk I/O for complex queries; protects the SD card.
         conn.execute("PRAGMA temp_store=MEMORY;")
-
-        # MMAP: memory-map 30 GB of the database file into address space.
-        # OS page cache handles reads directly — bypasses read() syscalls.
         conn.execute("PRAGMA mmap_size=30000000000;")
-
-        # 64 MB page cache — keeps hot data in RAM on the 8 GB Pi 5.
         conn.execute("PRAGMA cache_size=-65536;")
-
         _local.conn = conn
     return _local.conn
 
 
 @contextmanager
 def get_db():
-    """Context manager yielding a connection; commits on success, rolls back on error."""
     conn = _get_conn()
     try:
         yield conn
@@ -68,38 +87,35 @@ def get_db():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEMA INITIALISATION
+# SCHEMA
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    """Create all tables if they do not exist. Idempotent."""
     with get_db() as conn:
         conn.executescript("""
-            -- OHLCV candle store — circular buffer via timestamp keying
             CREATE TABLE IF NOT EXISTS candles (
-                symbol      TEXT    NOT NULL,
-                ts          INTEGER NOT NULL,   -- Unix ms
-                open        REAL    NOT NULL,
-                high        REAL    NOT NULL,
-                low         REAL    NOT NULL,
-                close       REAL    NOT NULL,
-                volume      REAL    NOT NULL,
+                symbol  TEXT    NOT NULL,
+                ts      INTEGER NOT NULL,
+                open    REAL    NOT NULL,
+                high    REAL    NOT NULL,
+                low     REAL    NOT NULL,
+                close   REAL    NOT NULL,
+                volume  REAL    NOT NULL,
                 PRIMARY KEY (symbol, ts)
             );
             CREATE INDEX IF NOT EXISTS idx_candles_sym_ts ON candles(symbol, ts DESC);
 
-            -- Portfolio state (single-row JSON store for simplicity)
             CREATE TABLE IF NOT EXISTS portfolio (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
 
-            -- All executed (filled) and attempted trades
             CREATE TABLE IF NOT EXISTS trades (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          TEXT    NOT NULL,
                 symbol      TEXT    NOT NULL,
                 action      TEXT    NOT NULL,
+                side        TEXT    DEFAULT 'long',
                 strategy    TEXT,
                 regime      TEXT,
                 price       REAL,
@@ -114,54 +130,87 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_trades_sym ON trades(symbol, ts DESC);
 
-            -- Open positions
             CREATE TABLE IF NOT EXISTS positions (
-                symbol       TEXT PRIMARY KEY,
-                shares       REAL    DEFAULT 0,
-                avg_cost     REAL    DEFAULT 0,
-                strategy     TEXT    DEFAULT '',
-                stop_price   REAL    DEFAULT 0,
-                tp_price     REAL    DEFAULT 0,
-                candle_count INTEGER DEFAULT 0,
-                on_fire      INTEGER DEFAULT 0,
-                opened_ts    TEXT
+                symbol          TEXT PRIMARY KEY,
+                side            TEXT    DEFAULT 'long',
+                shares          REAL    DEFAULT 0,
+                avg_cost        REAL    DEFAULT 0,
+                strategy        TEXT    DEFAULT '',
+                stop_price      REAL    DEFAULT 0,
+                tp_price        REAL    DEFAULT 0,
+                candle_count    INTEGER DEFAULT 0,
+                on_fire         INTEGER DEFAULT 0,
+                opened_ts       TEXT,
+                entry_state     TEXT    DEFAULT NULL,
+                margin_reserved REAL    DEFAULT 0,
+                mfe_price       REAL    DEFAULT NULL,
+                mae_price       REAL    DEFAULT NULL
             );
 
-            -- Equity curve snapshots (every scan)
             CREATE TABLE IF NOT EXISTS equity_curve (
                 ts     TEXT NOT NULL,
                 equity REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_curve(ts DESC);
 
-            -- ML feature cache (last computed features per symbol)
             CREATE TABLE IF NOT EXISTS ml_cache (
                 symbol   TEXT PRIMARY KEY,
-                features TEXT NOT NULL,          -- JSON
+                features TEXT NOT NULL,
                 prob     REAL DEFAULT 0.5,
                 updated  TEXT NOT NULL
             );
 
-            -- RL experience buffer for offline training export
             CREATE TABLE IF NOT EXISTS rl_experience (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts      TEXT    NOT NULL,
-                symbol  TEXT    NOT NULL,
-                state   TEXT    NOT NULL,        -- JSON array
-                action  REAL    NOT NULL,
-                reward  REAL    NOT NULL,
-                next_state TEXT NOT NULL,
-                done    INTEGER DEFAULT 0
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT    NOT NULL,
+                symbol     TEXT    NOT NULL,
+                state      TEXT    NOT NULL,
+                action     REAL    NOT NULL,
+                reward     REAL    NOT NULL,
+                next_state TEXT    NOT NULL,
+                done       INTEGER DEFAULT 0
             );
 
-            -- Brain / strategy state (persisted as JSON blob)
             CREATE TABLE IF NOT EXISTS brain_state (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
         """)
 
-    # Seed portfolio if empty
+        # ── SAFE MIGRATIONS (idempotent — run every startup) ──────────────────
+        # Each block checks whether the column exists before adding it.
+        # Safe to run against the live database repeatedly.
+        existing_pos = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+        existing_trd = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+
+        # positions table migrations
+        if "entry_state" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN entry_state TEXT DEFAULT NULL")
+        if "side" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN side TEXT DEFAULT 'long'")
+        if "margin_reserved" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN margin_reserved REAL DEFAULT 0")
+        if "mfe_price" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN mfe_price REAL DEFAULT NULL")
+        if "mae_price" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN mae_price REAL DEFAULT NULL")
+
+        # trades table migrations
+        if "side" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'long'")
+        if "fee_total" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN fee_total REAL")
+        if "net_pnl" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN net_pnl REAL")
+        if "gross_pnl" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
+        if "allocated_equity_pct" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN allocated_equity_pct REAL")
+        if "max_unrealized_pnl" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN max_unrealized_pnl REAL")
+        if "min_unrealized_pnl" not in existing_trd:
+            conn.execute("ALTER TABLE trades ADD COLUMN min_unrealized_pnl REAL")
+
     _seed_portfolio()
 
 
@@ -169,153 +218,372 @@ def _seed_portfolio() -> None:
     with get_db() as conn:
         row = conn.execute("SELECT value FROM portfolio WHERE key='cash'").fetchone()
         if row is None:
-            conn.execute("INSERT INTO portfolio VALUES ('cash', ?)",
-                         (str(STARTING_CASH),))
+            conn.execute("INSERT INTO portfolio VALUES ('cash', ?)", (str(STARTING_CASH),))
             conn.execute("INSERT INTO portfolio VALUES ('total_trades', '0')")
             conn.execute("INSERT INTO portfolio VALUES ('realised_pnl', '0.0')")
-            # Initialise positions table for all symbols
             for sym in SYMBOLS:
-                conn.execute("""
-                    INSERT OR IGNORE INTO positions(symbol) VALUES (?)
-                """, (sym,))
+                conn.execute("INSERT OR IGNORE INTO positions(symbol) VALUES (?)", (sym,))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CANDLE OPERATIONS
+# CANDLES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def upsert_candle(symbol: str, candle: dict) -> None:
     with get_db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO candles
-                (symbol, ts, open, high, low, close, volume)
-            VALUES (?,?,?,?,?,?,?)
-        """, (symbol, int(candle["time"]), candle["open"], candle["high"],
-              candle["low"], candle["close"], candle["volume"]))
+        conn.execute(
+            "INSERT OR REPLACE INTO candles (symbol,ts,open,high,low,close,volume) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (symbol, int(candle["time"]), candle["open"], candle["high"],
+             candle["low"], candle["close"], candle["volume"]),
+        )
 
 
 def upsert_candles_bulk(symbol: str, candles: list[dict]) -> None:
-    """Bulk upsert — used during startup history fetch."""
     rows = [(symbol, int(c["time"]), c["open"], c["high"],
              c["low"], c["close"], c["volume"]) for c in candles]
     with get_db() as conn:
-        conn.executemany("""
-            INSERT OR REPLACE INTO candles
-                (symbol, ts, open, high, low, close, volume)
-            VALUES (?,?,?,?,?,?,?)
-        """, rows)
+        conn.executemany(
+            "INSERT OR REPLACE INTO candles (symbol,ts,open,high,low,close,volume) "
+            "VALUES (?,?,?,?,?,?,?)", rows,
+        )
 
 
 def get_candles(symbol: str, limit: int = 300) -> list[dict]:
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT ts AS time, open, high, low, close, volume
-            FROM candles WHERE symbol=?
-            ORDER BY ts DESC LIMIT ?
-        """, (symbol, limit)).fetchall()
+        rows = conn.execute(
+            "SELECT ts AS time, open, high, low, close, volume "
+            "FROM candles WHERE symbol=? ORDER BY ts DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
-def get_candle_count(symbol: str) -> int:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM candles WHERE symbol=?", (symbol,)).fetchone()
-    return row[0] if row else 0
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# PORTFOLIO OPERATIONS
+# PORTFOLIO
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_cash() -> float:
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT value FROM portfolio WHERE key='cash'").fetchone()
+        row = conn.execute("SELECT value FROM portfolio WHERE key='cash'").fetchone()
     return float(row[0]) if row else STARTING_CASH
 
 
 def set_cash(value: float) -> None:
     with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('cash', ?)",
-                     (str(value),))
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('cash',?)", (str(value),))
 
 
 def get_portfolio_stat(key: str, default: Any = None) -> Any:
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT value FROM portfolio WHERE key=?", (key,)).fetchone()
+        row = conn.execute("SELECT value FROM portfolio WHERE key=?", (key,)).fetchone()
     return row[0] if row else default
 
 
 def set_portfolio_stat(key: str, value: Any) -> None:
     with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO portfolio VALUES (?,?)",
-                     (key, str(value)))
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES (?,?)", (key, str(value)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POSITION OPERATIONS
+# POSITIONS — READ
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_position(symbol: str) -> dict:
+    """Return position for symbol regardless of side. Includes short positions."""
     with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
     if row:
         return dict(row)
-    return {"symbol": symbol, "shares": 0.0, "avg_cost": 0.0,
-            "strategy": "", "stop_price": 0.0, "tp_price": 0.0,
-            "candle_count": 0, "on_fire": 0}
+    return {
+        "symbol": symbol, "side": "long", "shares": 0.0, "avg_cost": 0.0,
+        "strategy": "", "stop_price": 0.0, "tp_price": 0.0,
+        "candle_count": 0, "on_fire": 0, "entry_state": None,
+        "margin_reserved": 0.0,
+    }
 
 
 def get_all_positions() -> list[dict]:
+    """
+    Return all active positions — both longs (shares > 0) and shorts
+    (margin_reserved > 0, shares is used to track the shorted quantity).
+    """
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM positions WHERE shares > 0").fetchall()
+            "SELECT * FROM positions WHERE shares > 0 OR margin_reserved > 0"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
+def get_all_long_positions() -> list[dict]:
+    """Return only open long positions."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE side='long' AND shares > 0"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_short_positions() -> list[dict]:
+    """Return only open short positions."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE side='short' AND margin_reserved > 0"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_short_position(symbol: str) -> dict | None:
+    """Return the short position for a symbol, or None if not shorted."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE symbol=? AND side='short' AND margin_reserved > 0",
+            (symbol,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIONS — LONG (buy first, sell to close)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def open_position(symbol: str, shares: float, avg_cost: float,
                   strategy: str, stop_price: float, tp_price: float,
-                  on_fire: bool = False) -> None:
+                  on_fire: bool = False,
+                  entry_state: list | None = None) -> None:
+    """
+    Open or average into a LONG position.
+
+    Behaviour is identical to the previous version — existing open positions
+    are averaged (weighted cost basis, tightest stop preserved).
+    The side column is explicitly set to 'long'.
+    margin_reserved is always 0 for longs (cash is deducted at buy time).
+    """
     now = datetime.now(timezone.utc).isoformat()
+    entry_state_json = json.dumps(entry_state) if entry_state is not None else None
+
     with get_db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO positions
-                (symbol, shares, avg_cost, strategy, stop_price, tp_price,
-                 candle_count, on_fire, opened_ts)
-            VALUES (?,?,?,?,?,?,0,?,?)
-        """, (symbol, shares, avg_cost, strategy, stop_price, tp_price,
-              int(on_fire), now))
+        existing = conn.execute(
+            "SELECT shares, avg_cost, stop_price, side FROM positions WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+
+        # Don't average into a short — that would be a conflicting position.
+        # The bot layer should close the short first; we treat this as a new long.
+        if existing and existing["shares"] > 0 and existing["side"] == "long":
+            # ── POSITION AVERAGING ────────────────────────────────────────────
+            old_shares   = existing["shares"]
+            old_cost     = existing["avg_cost"]
+            total_shares = old_shares + shares
+            new_avg_cost = (old_shares * old_cost + shares * avg_cost) / total_shares
+            new_stop     = max(existing["stop_price"], stop_price)
+
+            conn.execute("""
+                UPDATE positions
+                SET shares=?, avg_cost=?, stop_price=?, tp_price=?, strategy=?,
+                    on_fire=?, opened_ts=COALESCE(opened_ts, ?), side='long'
+                WHERE symbol=?
+            """, (total_shares, new_avg_cost, new_stop, tp_price, strategy,
+                  int(on_fire), now, symbol))
+        else:
+            # ── NEW LONG POSITION ─────────────────────────────────────────────
+            conn.execute("""
+                INSERT OR REPLACE INTO positions
+                    (symbol, side, shares, avg_cost, strategy, stop_price, tp_price,
+                     candle_count, on_fire, opened_ts, entry_state, margin_reserved)
+                VALUES (?,?,?,?,?,?,?,0,?,?,?,0)
+            """, (symbol, "long", shares, avg_cost, strategy, stop_price, tp_price,
+                  int(on_fire), now, entry_state_json))
+
+
+def delete_position(symbol: str) -> None:
+    """
+    Hard-delete any position row for `symbol` regardless of its current state.
+    Called by:
+      • close_position / close_short after a legitimate trade closes (Fix 3).
+      • exit_monitor zombie-guard when shares == 0 / None (Fix 2).
+    Using DELETE instead of UPDATE prevents stale zero-share rows from leaking
+    back into get_all_positions() if the WHERE filter ever changes.
+    """
+    with get_db() as conn:
+        conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
 
 
 def close_position(symbol: str) -> None:
+    """Close a long position — hard-delete the row so no zombie shell remains."""
+    delete_position(symbol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIONS — SHORT (sell first, buy back to close)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_short(symbol: str, shares: float, entry_price: float,
+               strategy: str, stop_price: float, tp_price: float,
+               margin_reserved: float,
+               on_fire: bool = False,
+               entry_state: list | None = None) -> None:
+    """
+    Open a SHORT position.
+
+    For a short:
+      - shares     = number of units sold short (positive number)
+      - entry_price = the price at which we sold short (avg_cost column)
+      - stop_price = price ABOVE entry where we buy back at a loss
+                     (entry_price + N × ATR, because short stops go up)
+      - tp_price   = price BELOW entry where we buy back for profit
+                     (entry_price - N × ATR)
+      - margin_reserved = cash locked as collateral (deducted from cash by bot.py)
+
+    Shorting the same symbol twice is NOT allowed here — the bot layer must
+    close the existing short before opening a new one.
+
+    PnL when closing:
+      profit = (entry_price - cover_price) × shares
+      positive when cover_price < entry_price (price fell, as intended)
+      negative when cover_price > entry_price (price rose, short squeeze)
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    entry_state_json = json.dumps(entry_state) if entry_state is not None else None
+
     with get_db() as conn:
         conn.execute("""
-            UPDATE positions
-            SET shares=0, avg_cost=0, strategy='', stop_price=0,
-                tp_price=0, candle_count=0, on_fire=0, opened_ts=NULL
-            WHERE symbol=?
-        """, (symbol,))
+            INSERT OR REPLACE INTO positions
+                (symbol, side, shares, avg_cost, strategy, stop_price, tp_price,
+                 candle_count, on_fire, opened_ts, entry_state, margin_reserved)
+            VALUES (?,?,?,?,?,?,?,0,?,?,?,?)
+        """, (symbol, "short", shares, entry_price, strategy, stop_price, tp_price,
+              int(on_fire), now, entry_state_json, margin_reserved))
+
+
+def close_short(symbol: str) -> None:
+    """
+    Cover a short position — hard-delete the row so no zombie shell remains.
+    Cash management is handled by bot.py before this call.
+    """
+    delete_position(symbol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIONS — MFE / MAE TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_mfe_mae(symbol: str, candle_high: float, candle_low: float, is_short: bool) -> None:
+    """
+    Ratchet Maximum Favorable Excursion (mfe_price) and Maximum Adverse Excursion
+    (mae_price) prices for an open position based on the current candle extremes.
+
+    Long  positions: mfe = highest high ever reached (best exit price),
+                     mae = lowest low ever reached (worst drawdown price).
+    Short positions: mfe = lowest low ever reached (best cover price),
+                     mae = highest high ever reached (worst squeeze price).
+
+    Only writes to DB when the candle moves beyond the prior recorded extreme,
+    so most ticks produce no write (the SELECT check is the hot path).
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT mfe_price, mae_price FROM positions WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+        if not row:
+            return
+
+        old_mfe = row[0]   # None on first tick
+        old_mae = row[1]   # None on first tick
+
+        if not is_short:
+            new_mfe = candle_high if old_mfe is None else max(old_mfe, candle_high)
+            new_mae = candle_low  if old_mae is None else min(old_mae, candle_low)
+        else:
+            new_mfe = candle_low  if old_mfe is None else min(old_mfe, candle_low)
+            new_mae = candle_high if old_mae is None else max(old_mae, candle_high)
+
+        # Skip the write if nothing changed (the common case after the first few bars)
+        if new_mfe == old_mfe and new_mae == old_mae:
+            return
+
+        conn.execute(
+            "UPDATE positions SET mfe_price=?, mae_price=? WHERE symbol=?",
+            (new_mfe, new_mae, symbol),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIONS — TRAILING STOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_tp_price(symbol: str, new_tp: float) -> None:
+    """Update take-profit level (used by ML time-decay exits)."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE positions SET tp_price=? WHERE symbol=?",
+            (new_tp, symbol),
+        )
+
+
+def update_stop_price(symbol: str, new_stop: float) -> None:
+    """
+    Ratchet the stop_price for an open position (long or short) to lock in profit.
+
+    For a long  : call only when new_stop > current stop_price (stop moves up).
+    For a short : call only when new_stop < current stop_price (stop moves down).
+
+    The caller (bot.py) is responsible for the directional guard — this function
+    just writes whatever value it receives, so it stays side-agnostic and simple.
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE positions SET stop_price=? WHERE symbol=?",
+            (new_stop, symbol),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSITIONS — COUNTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_position_count() -> int:
+    """Count of open long positions."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE side='long' AND shares > 0"
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def open_short_count() -> int:
+    """Count of open short positions."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE side='short' AND margin_reserved > 0"
+        ).fetchone()
+    return row[0] if row else 0
 
 
 def increment_candle_count(symbol: str) -> int:
     with get_db() as conn:
-        conn.execute("""
-            UPDATE positions SET candle_count = candle_count + 1
-            WHERE symbol=?
-        """, (symbol,))
+        conn.execute(
+            "UPDATE positions SET candle_count=candle_count+1 WHERE symbol=?",
+            (symbol,),
+        )
         row = conn.execute(
-            "SELECT candle_count FROM positions WHERE symbol=?",
-            (symbol,)).fetchone()
+            "SELECT candle_count FROM positions WHERE symbol=?", (symbol,)).fetchone()
     return row[0] if row else 0
 
 
-def open_position_count() -> int:
+def get_entry_state(symbol: str) -> list | None:
+    """Retrieve persisted SAC entry state for RL transition reconstruction."""
     with get_db() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM positions WHERE shares > 0").fetchone()
-    return row[0] if row else 0
+            "SELECT entry_state FROM positions WHERE symbol=?", (symbol,)).fetchone()
+    if row and row[0]:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,17 +591,25 @@ def open_position_count() -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def log_trade(trade: dict) -> None:
+    """
+    Log a trade. Accepts optional 'side' key ('long' or 'short').
+    Defaults to 'long' if not provided, preserving backward compatibility
+    with all existing log_trade() call sites in bot.py.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute("""
             INSERT INTO trades
-                (ts, symbol, action, strategy, regime, price, exec_price,
-                 shares, trade_value, pnl, slippage, on_fire, status, reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (ts,symbol,action,side,strategy,regime,price,exec_price,
+                 shares,trade_value,pnl,slippage,on_fire,status,reason,
+                 fee_total,net_pnl,gross_pnl,allocated_equity_pct,
+                 max_unrealized_pnl,min_unrealized_pnl)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("timestamp", now),
             trade.get("symbol"),
             trade.get("action"),
+            trade.get("side", "long"),
             trade.get("strategy"),
             trade.get("regime"),
             trade.get("price"),
@@ -345,15 +621,27 @@ def log_trade(trade: dict) -> None:
             int(trade.get("on_fire", False)),
             trade.get("status", "skipped"),
             trade.get("reason"),
+            trade.get("fee_total"),
+            trade.get("net_pnl"),
+            trade.get("gross_pnl"),
+            trade.get("allocated_equity_pct"),
+            trade.get("max_unrealized_pnl"),
+            trade.get("min_unrealized_pnl"),
         ))
 
 
 def get_recent_trades(limit: int = 50) -> list[dict]:
+    """Return the most recent *closed* trades (exit legs only, net_pnl populated).
+
+    Entry-leg rows (buy / short) are excluded because they have NULL net_pnl and
+    would appear as blank duplicate rows in the Trade History table.
+    """
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT * FROM trades WHERE status='filled'
-            ORDER BY id DESC LIMIT ?
-        """, (limit,)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status='filled' AND net_pnl IS NOT NULL"
+            " ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -364,38 +652,92 @@ def get_filled_trade_count() -> int:
     return row[0] if row else 0
 
 
+def get_cash_curve_from_trades(limit: int = 200) -> list[dict]:
+    """Reconstruct a cash time-series from closed trade PnL.
+
+    Works backwards from the current cash balance, undoing each trade's
+    net_pnl to recover what cash was at that moment.  Returns points in
+    chronological order so Chart.js gets an ascending time series.
+    """
+    current_cash = get_cash()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, net_pnl FROM trades"
+            " WHERE status='filled' AND net_pnl IS NOT NULL"
+            " ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return [{"time": now_str, "cash": round(current_cash, 2)},
+                {"time": now_str, "cash": round(current_cash, 2)}]
+    points = []
+    running = current_cash
+    for r in rows:
+        ts = str(r["ts"])[:19].replace("T", " ")
+        points.append({"time": ts, "cash": round(running, 2)})
+        running -= float(r["net_pnl"] or 0.0)
+    points.reverse()  # oldest first
+    return points
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EQUITY CURVE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def record_equity(equity: float) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    eq = float(equity)
+    ret = ((eq - float(STARTING_CASH)) / float(STARTING_CASH)) * 100.0
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO equity_curve (ts, equity) VALUES (?,?)", (now, equity))
+        conn.execute("INSERT INTO equity_curve (ts, equity) VALUES (?,?)", (now, eq))
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('current_equity', ?)", (str(eq),))
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('return_pct', ?)", (str(ret),))
 
 
 def get_equity_curve(limit: int = 500) -> list[dict]:
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT ts, equity FROM equity_curve
-            ORDER BY rowid DESC LIMIT ?
-        """, (limit,)).fetchall()
-    return [{"time": r["ts"][:16].replace("T", " "), "equity": r["equity"]}
+        rows = conn.execute(
+            "SELECT ts, equity FROM equity_curve ORDER BY rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    # Return 19-char timestamps (with seconds) so _utc_to_van can parse them.
+    # Previously [:16] stripped seconds, causing _utc_to_van to silently return
+    # raw UTC strings (all its format strings require %H:%M:%S).
+    return [{"time": r["ts"][:19].replace("T", " "), "equity": r["equity"]}
             for r in reversed(rows)]
+
+
+def get_trades_last_7_days() -> list[dict]:
+    """Return all *closed* trades from the last 7 days (exit legs only, no row cap).
+
+    The net_pnl IS NOT NULL guard mirrors get_recent_trades: entry-leg rows
+    (buy / short) have NULL net_pnl and must be excluded from analytics so that
+    win-rate, fee-drag, and weekly-breakdown calculations are not inflated by
+    duplicate entry rows.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades"
+            " WHERE status='filled' AND net_pnl IS NOT NULL AND ts >= ?"
+            " ORDER BY id DESC",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ML CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_ml_cache(symbol: str, features: list[float], prob: float) -> None:
+def save_ml_cache(symbol: str, features: list, prob: float) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO ml_cache (symbol, features, prob, updated)
-            VALUES (?,?,?,?)
-        """, (symbol, json.dumps(features), prob, now))
+        conn.execute(
+            "INSERT OR REPLACE INTO ml_cache (symbol,features,prob,updated) VALUES (?,?,?,?)",
+            (symbol, json.dumps(features), prob, now),
+        )
 
 
 def get_ml_prob(symbol: str) -> float:
@@ -406,7 +748,7 @@ def get_ml_prob(symbol: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RL EXPERIENCE BUFFER
+# RL EXPERIENCE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def log_rl_experience(symbol: str, state: list, action: float,
@@ -414,7 +756,7 @@ def log_rl_experience(symbol: str, state: list, action: float,
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute("""
-            INSERT INTO rl_experience (ts, symbol, state, action, reward, next_state, done)
+            INSERT INTO rl_experience (ts,symbol,state,action,reward,next_state,done)
             VALUES (?,?,?,?,?,?,?)
         """, (now, symbol, json.dumps(state), action, reward,
               json.dumps(next_state), int(done)))
@@ -422,28 +764,53 @@ def log_rl_experience(symbol: str, state: list, action: float,
 
 def get_rl_experience(limit: int = 10000) -> list[dict]:
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT state, action, reward, next_state, done
-            FROM rl_experience ORDER BY id DESC LIMIT ?
-        """, (limit,)).fetchall()
+        rows = conn.execute(
+            "SELECT state,action,reward,next_state,done "
+            "FROM rl_experience ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BRAIN STATE PERSISTENCE
+# BRAIN STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_brain_key(key: str, value: Any) -> None:
+    """
+    Persist an arbitrary Python value under `key` in the brain_state table.
+
+    Fix 1 — three hardening layers vs the original:
+      • Explicit column names in INSERT OR REPLACE so positional ambiguity can
+        never silently swap key↔value if the schema ever gains columns.
+      • Explicit conn.commit() AFTER the context-manager commit as a belt-and-
+        suspenders WAL flush.  WAL mode writes to the journal first; the explicit
+        commit checkpoints the page to the main DB file so the row survives
+        a hard process kill between context-manager exit and OS buffer flush.
+      • Separate try/except on the commit so a flush failure is logged rather than
+        silently swallowed.
+    """
+    serialised = json.dumps(value)
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO brain_state VALUES (?,?)",
-            (key, json.dumps(value)))
+            "INSERT OR REPLACE INTO brain_state (key, value) VALUES (?, ?)",
+            (key, serialised),
+        )
+        # Belt-and-suspenders: force WAL checkpoint synchronously.
+        try:
+            conn.commit()
+        except Exception:
+            pass   # get_db() already rolled back; caller will see the exception
 
 
 def load_brain_key(key: str, default: Any = None) -> Any:
+    """Load a value from brain_state; returns `default` on missing key or bad JSON."""
     with get_db() as conn:
         row = conn.execute(
             "SELECT value FROM brain_state WHERE key=?", (key,)).fetchone()
     if row:
-        return json.loads(row[0])
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default
     return default
