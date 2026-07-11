@@ -58,7 +58,10 @@ from config import (
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
+    MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
+    STARTING_CASH,
 )
+from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
 from ml_engine import predict_signal, incremental_train, initial_train
 from brain import Brain
@@ -83,6 +86,7 @@ from db import (
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
     upsert_candle, upsert_candles_bulk, open_short, close_short,
     open_short_count, update_stop_price, update_tp_price, update_mfe_mae,
+    get_open_orders, reduce_position, try_create_order, update_order,
 )
 
 import asyncio
@@ -193,6 +197,13 @@ log = logging.getLogger(__name__)
 # ── Module-level state ────────────────────────────────────────────────────────
 brain = Brain()
 _EDGE_PROFILE_DB_KEY = "adaptive_edge_profiles_v1"
+
+# V4: execution backend (paper by default; testnet via EXECUTION_MODE).
+# Selected once at import so a misconfigured mode fails at boot, not mid-trade.
+_exec_adapter = get_execution_adapter()
+
+# V4: WS-outage tracking for the reconnect backfill.
+_ws_down_since: Optional[float] = None
 
 _candles_cache:        dict[str, list[dict]] = {}
 _closed_candle_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
@@ -359,6 +370,34 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _last_candle_ts(candles: list[dict]) -> Optional[int]:
+    """Open-time (ms) of the newest candle, or None if unavailable."""
+    if not candles:
+        return None
+    try:
+        return int(candles[-1].get("time"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_data_stale_reason(candles: list[dict]) -> Optional[str]:
+    """
+    V4 stale-data gate — NEW ENTRIES only, exits are never gated.
+
+    Returns a block reason when the newest candle's open time is older than
+    STALE_ENTRY_MAX_SECS (default 180s = the live bar plus two closed 1m bars),
+    or when no timestamp is available at all. A dead feed must not be allowed
+    to open positions at prices that no longer exist.
+    """
+    ts = _last_candle_ts(candles)
+    if ts is None:
+        return "stale_data (no candle timestamp)"
+    age = time.time() - ts / 1000.0
+    if age > STALE_ENTRY_MAX_SECS:
+        return f"stale_data (last candle {age:.0f}s old > {STALE_ENTRY_MAX_SECS:.0f}s)"
+    return None
+
+
 def _trade_lock(symbol: str) -> asyncio.Lock:
     if symbol not in _trade_locks:
         _trade_locks[symbol] = asyncio.Lock()
@@ -514,6 +553,7 @@ def _ws_url() -> str:
 
 async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
     # Fix #3: websockets imported at module level, not inside the reconnect loop.
+    global _ws_down_since
     url = _ws_url()
     backoff = 1.0
 
@@ -522,6 +562,23 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 backoff = 1.0
+                # V4: after a long outage the in-memory candle cache has a gap
+                # that would poison every indicator — REST-backfill first.
+                # (New entries were already frozen by the stale-data gate.)
+                if _ws_down_since is not None:
+                    gap = time.time() - _ws_down_since
+                    if gap > WS_BACKFILL_AFTER_SECS:
+                        log.warning(
+                            "WS was down %.0fs (> %.0fs) — backfilling candle "
+                            "history before consuming the stream",
+                            gap, WS_BACKFILL_AFTER_SECS,
+                        )
+                        try:
+                            refreshed = await _load_history_for_all_symbols()
+                            log.info("Backfill complete for %d symbols", len(refreshed))
+                        except Exception as _bf_exc:
+                            log.error("Backfill failed (%s) — stale gate still protects entries", _bf_exc)
+                    _ws_down_since = None
                 log.info("WebSocket connected")
                 async for raw_msg in ws:
                     if _shutdown_event.is_set():
@@ -531,6 +588,8 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
         except Exception as exc:
             if _shutdown_event.is_set():
                 return
+            if _ws_down_since is None:
+                _ws_down_since = time.time()
             log.error("WebSocket error: %s - reconnecting in %.1fs", exc, backoff)
             try:
                 await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff)
@@ -970,6 +1029,14 @@ async def _evaluate_and_trade(
     if direction not in ("buy", "sell", "short", "cover"):
         return
 
+    # V4: cheap early stale-data skip for entries (executor re-checks — this
+    # just avoids burning SAC/margin work on a dead feed).
+    if direction in ("buy", "short"):
+        _stale_early = _entry_data_stale_reason(candles)
+        if _stale_early:
+            log.info("%s %s skipped — %s", symbol, direction.upper(), _stale_early)
+            return
+
     # ── Belt-and-suspenders: refuse any inbound entry ensemble whose ml_prob
     # field is missing or out of range. Pin ml_prob to the freshly-computed
     # XGBoost value so downstream gates see a single, trusted source.
@@ -1212,6 +1279,17 @@ def _execute_trade(
             log_trade(trade_rec)
             return
 
+        # ── V4 STALE-DATA GATE (entries only) ─────────────────────────────
+        # A stalled feed (WS outage, reconnect gap) must never open a new
+        # position at a price that may no longer exist. Exits bypass this —
+        # closing on the freshest price we have beats staying exposed.
+        _stale = _entry_data_stale_reason(candles)
+        if _stale:
+            trade_rec["reason"] = _stale
+            log.warning("%s %s BLOCKED at executor — %s", symbol, action.upper(), _stale)
+            log_trade(trade_rec)
+            return
+
     # ── Shared SAC-driven sizing (used by BUY and SHORT) ──────────────────────
     def _calc_trade_value() -> tuple[float, float, float]:
         """
@@ -1285,6 +1363,21 @@ def _execute_trade(
 
         trade_value = total_equity * trade_pct
 
+        # ── V4 PER-ORDER CEILING (defense in depth) ────────────────────────
+        # Current sizing maths tops out at 0.35 × 1.35 = 47.25% of equity, so
+        # at the default 50% this clamp never fires — it exists to stop a
+        # future sizing bug from deploying the whole account in one order.
+        _order_cap_value = total_equity * MAX_ORDER_EQUITY_FRAC
+        if trade_value > _order_cap_value:
+            log.warning(
+                "ORDER CAP: %s %s trade_value $%.2f exceeds %.0f%% of equity — "
+                "clamped to $%.2f (sizing bug upstream?)",
+                symbol, action.upper(), trade_value,
+                MAX_ORDER_EQUITY_FRAC * 100, _order_cap_value,
+            )
+            trade_value = _order_cap_value
+            trade_pct = MAX_ORDER_EQUITY_FRAC
+
         # Binance requires ≥ $10 notional per order; a heavily penalised
         # size_mult can push a small account below this floor — veto cleanly.
         _BINANCE_MIN_NOTIONAL = 10.0
@@ -1332,12 +1425,59 @@ def _execute_trade(
             )
             return
 
+        # ── V4 DUPLICATE-ORDER GUARD + EXECUTION ──────────────────────────
+        # Claim the deterministic (symbol, action, candle) order id BEFORE any
+        # money moves. A second identical signal — retry, WS replay, racing
+        # task — fails the claim and cannot double the position.
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        if not try_create_order(_coid, symbol, action, "long", _candle_ts,
+                                shares, exec_price, _exec_adapter.name):
+            trade_rec["reason"] = "duplicate_order_blocked"
+            log.warning(
+                "BUY %s BLOCKED — duplicate order for this candle (id=%s)",
+                symbol, _coid,
+            )
+            log_trade(trade_rec)
+            return
+
+        _fill = _exec_adapter.execute(OrderIntent(
+            client_order_id=_coid, symbol=symbol, action=action, side="long",
+            qty=shares, ref_price=raw_price, limit_price=exec_price,
+            candle_ts=_candle_ts,
+        ))
+        if not _fill.executed:
+            update_order(_coid, state=_fill.status if _fill.status in
+                         ("REJECTED", "FAILED") else "FAILED", note=_fill.note)
+            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+            log.warning("BUY %s not executed (%s: %s)", symbol, _fill.status, _fill.note)
+            log_trade(trade_rec)
+            return
+
+        # Book what actually happened (paper: identical to the request).
+        if abs(_fill.price - exec_price) > exec_price * 1e-9:
+            stop_price, tp_price = brain.get_stop_take(
+                _fill.price, candles, is_yolo, side="long", regime=regime,
+                confidence_mult=confidence_multiplier,
+            )
+            stop_price, tp_price = apply_dynamic_rr(
+                entry=_fill.price, stop=stop_price, take=tp_price,
+                atr=_atr_now, side="long",
+            )
+        exec_price = _fill.price
+        shares = _fill.qty
+        trade_value = shares * exec_price
+        trade_rec["exec_price"] = exec_price
+
         set_cash(cash - trade_value)
         open_position(
             symbol, shares, exec_price, strategy_name,
             stop_price, tp_price, on_fire,
             entry_state=pre_state.tolist() if pre_state is not None else None,
         )
+        update_order(_coid, state=_fill.status, filled_qty=shares,
+                     avg_fill_price=exec_price,
+                     exchange_order_id=_fill.exchange_order_id, note=_fill.note)
         set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
 
         trade_rec.update({
@@ -1368,8 +1508,37 @@ def _execute_trade(
             log_trade(trade_rec)
             return
 
-        shares    = float(pos["shares"])
-        avg_cost  = float(pos["avg_cost"])
+        pos_shares = float(pos["shares"])
+        avg_cost   = float(pos["avg_cost"])
+
+        # ── V4 EXECUTION (exit — fail-open on the journal, position-safe) ──
+        # Exits must never be blocked by bookkeeping: if the journal claim
+        # fails (e.g. a crashed prior attempt already holds the id for this
+        # candle) we proceed anyway. But if the adapter reports the order did
+        # NOT execute, the position must stay open for the monitor to retry.
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        _journaled = try_create_order(_coid, symbol, action, "long", _candle_ts,
+                                      pos_shares, exec_price, _exec_adapter.name)
+        _fill = _exec_adapter.execute(OrderIntent(
+            client_order_id=_coid, symbol=symbol, action=action, side="long",
+            qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
+            candle_ts=_candle_ts,
+        ))
+        if not _fill.executed:
+            if _journaled:
+                update_order(_coid, state="FAILED", note=_fill.note)
+            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+            log.critical(
+                "SELL %s DID NOT EXECUTE (%s: %s) — position stays open for retry",
+                symbol, _fill.status, _fill.note,
+            )
+            log_trade(trade_rec)
+            return
+
+        exec_price = _fill.price
+        shares     = _fill.qty                      # actual, possibly partial
+        trade_rec["exec_price"] = exec_price
         proceeds  = shares * exec_price
         cost      = shares * avg_cost
         pnl_gross = proceeds - cost
@@ -1384,14 +1553,25 @@ def _execute_trade(
         # equity calculation stays accurate.
         #   correct: cash += returned_margin + net_pnl
         #   broken:  cash += proceeds            ← overstates by fee_total
-        returned_margin_long = cost  # original capital spent to open the long
+        returned_margin_long = cost  # capital originally spent on the CLOSED qty
         set_cash(get_cash() + returned_margin_long + net_pnl)
         set_portfolio_stat("realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross)
         set_portfolio_stat(
             "realised_pnl_net",
             float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
         )
-        close_position(symbol)
+        if shares >= pos_shares * (1.0 - 1e-9):
+            close_position(symbol)
+        else:
+            reduce_position(symbol, shares)
+            log.warning(
+                "SELL %s PARTIAL fill %.8f of %.8f — %.8f remains open",
+                symbol, shares, pos_shares, pos_shares - shares,
+            )
+        if _journaled:
+            update_order(_coid, state=_fill.status, filled_qty=shares,
+                         avg_fill_price=exec_price,
+                         exchange_order_id=_fill.exchange_order_id, note=_fill.note)
         set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
 
         stored_entry_state = get_entry_state(symbol)
@@ -1497,12 +1677,56 @@ def _execute_trade(
             )
             return
 
+        # ── V4 DUPLICATE-ORDER GUARD + EXECUTION (short) ──────────────────
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        if not try_create_order(_coid, symbol, action, "short", _candle_ts,
+                                shares, exec_price, _exec_adapter.name):
+            trade_rec["reason"] = "duplicate_order_blocked"
+            log.warning(
+                "SHORT %s BLOCKED — duplicate order for this candle (id=%s)",
+                symbol, _coid,
+            )
+            log_trade(trade_rec)
+            return
+
+        _fill = _exec_adapter.execute(OrderIntent(
+            client_order_id=_coid, symbol=symbol, action=action, side="short",
+            qty=shares, ref_price=raw_price, limit_price=exec_price,
+            candle_ts=_candle_ts,
+        ))
+        if not _fill.executed:
+            update_order(_coid, state=_fill.status if _fill.status in
+                         ("REJECTED", "FAILED") else "FAILED", note=_fill.note)
+            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+            log.warning("SHORT %s not executed (%s: %s)", symbol, _fill.status, _fill.note)
+            log_trade(trade_rec)
+            return
+
+        if abs(_fill.price - exec_price) > exec_price * 1e-9:
+            stop_price, tp_price = brain.get_stop_take(
+                _fill.price, candles, is_yolo, side="short", regime=regime,
+                confidence_mult=confidence_multiplier,
+            )
+            stop_price, tp_price = apply_dynamic_rr(
+                entry=_fill.price, stop=stop_price, take=tp_price,
+                atr=_atr_now, side="short",
+            )
+        exec_price = _fill.price
+        shares = _fill.qty
+        trade_value = shares * exec_price
+        margin_reserved = trade_value * SHORT_MARGIN_PCT
+        trade_rec["exec_price"] = exec_price
+
         set_cash(cash - margin_reserved)
         open_short(
             symbol, shares, exec_price, strategy_name,
             stop_price, tp_price, margin_reserved, on_fire,
             entry_state=pre_state.tolist() if pre_state is not None else None,
         )
+        update_order(_coid, state=_fill.status, filled_qty=shares,
+                     avg_fill_price=exec_price,
+                     exchange_order_id=_fill.exchange_order_id, note=_fill.note)
         set_portfolio_stat("total_trades", int(
             get_portfolio_stat("total_trades", "0")) + 1)
 
@@ -1534,12 +1758,40 @@ def _execute_trade(
             log_trade(trade_rec)
             return
 
-        shares     = float(pos["shares"])
+        pos_shares = float(pos["shares"])
         avg_cost   = float(pos["avg_cost"])
+        margin_res_total = float(pos.get("margin_reserved") or 0.0)
+
+        # ── V4 EXECUTION (cover — fail-open journal, position-safe) ────────
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        _journaled = try_create_order(_coid, symbol, action, "short", _candle_ts,
+                                      pos_shares, exec_price, _exec_adapter.name)
+        _fill = _exec_adapter.execute(OrderIntent(
+            client_order_id=_coid, symbol=symbol, action=action, side="short",
+            qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
+            candle_ts=_candle_ts,
+        ))
+        if not _fill.executed:
+            if _journaled:
+                update_order(_coid, state="FAILED", note=_fill.note)
+            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+            log.critical(
+                "COVER %s DID NOT EXECUTE (%s: %s) — position stays open for retry",
+                symbol, _fill.status, _fill.note,
+            )
+            log_trade(trade_rec)
+            return
+
+        exec_price = _fill.price
+        shares     = _fill.qty                      # actual, possibly partial
+        trade_rec["exec_price"] = exec_price
         entry_cost = shares * avg_cost
         cover_cost = shares * exec_price
         pnl_gross  = entry_cost - cover_cost
-        margin_res = float(pos.get("margin_reserved") or 0.0)
+        # Release collateral proportional to the quantity actually covered.
+        _cover_frac = min(1.0, shares / pos_shares) if pos_shares > 0 else 1.0
+        margin_res = margin_res_total * _cover_frac
         hold_candles_c = pos.get("candle_count", 1)
         hh = _hold_hours_from_candles(hold_candles_c)
         fee_total, net_pnl = net_realized_pnl(pnl_gross, entry_cost, cover_cost, hh)
@@ -1557,7 +1809,18 @@ def _execute_trade(
             "realised_pnl_net",
             float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
         )
-        close_short(symbol)
+        if shares >= pos_shares * (1.0 - 1e-9):
+            close_short(symbol)
+        else:
+            reduce_position(symbol, shares, margin_released=margin_res)
+            log.warning(
+                "COVER %s PARTIAL fill %.8f of %.8f — %.8f remains open",
+                symbol, shares, pos_shares, pos_shares - shares,
+            )
+        if _journaled:
+            update_order(_coid, state=_fill.status, filled_qty=shares,
+                         avg_fill_price=exec_price,
+                         exchange_order_id=_fill.exchange_order_id, note=_fill.note)
         alert_sniper_shot(
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )
@@ -1832,12 +2095,84 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
-async def startup() -> None:
-    log.info("Startup - fetching %d candles per symbol", CANDLE_LIMIT)
-    restored = _restore_adaptive_edge_profiles()
-    if restored > 0:
-        log.info("Adaptive edge profiles restored: %d buckets", restored)
+def _reconcile_orders_on_boot() -> None:
+    """
+    V4 restart protection: resolve journal rows left non-terminal by a crash.
 
+    Paper mode: a non-terminal row means the process died between claiming the
+    intent and committing the fill — nothing was booked, so the order is
+    marked ORPHANED (never executed).
+    Testnet mode: the exchange is queried by client id; a fill that exists on
+    the exchange but not in our books is logged CRITICAL for manual review —
+    deliberately NOT auto-booked, since blind booking could double-count.
+    """
+    stuck = get_open_orders()
+    if not stuck:
+        log.info("Order journal clean — no non-terminal orders to reconcile")
+        return
+    log.warning("Reconciling %d non-terminal order(s) from previous run", len(stuck))
+    for row in stuck:
+        coid, sym = row["client_order_id"], row["symbol"]
+        try:
+            if hasattr(_exec_adapter, "reconcile_with_symbol"):
+                fill = _exec_adapter.reconcile_with_symbol(sym, coid)
+            else:
+                fill = _exec_adapter.reconcile(coid)
+            if fill is None:
+                update_order(coid, state="ORPHANED", note="reconcile: status unknown")
+                log.warning("Order %s (%s) status unknown — marked ORPHANED", coid, sym)
+            elif fill.executed:
+                update_order(coid, state=fill.status, filled_qty=fill.qty,
+                             avg_fill_price=fill.price,
+                             note="reconcile: executed on exchange but UNBOOKED — review")
+                log.critical(
+                    "⚠ RECONCILE: order %s (%s) EXECUTED on exchange (qty=%.8f @ %.8f) "
+                    "but is not in our books — manual review required",
+                    coid, sym, fill.qty, fill.price,
+                )
+            else:
+                update_order(coid, state="ORPHANED",
+                             note=f"reconcile: not executed ({fill.note})")
+                log.info("Order %s (%s) never executed — marked ORPHANED", coid, sym)
+        except Exception as exc:
+            log.error("Reconcile failed for %s (%s): %s — left for next boot", coid, sym, exc)
+
+
+def _report_cash_invariant() -> None:
+    """
+    V4 restart protection: verify the books still balance after a restart.
+
+    Invariant: cash + Σ(long cost basis) + Σ(short margin reserved)
+               == STARTING_CASH + realised_pnl_net
+    Report-only — drift is surfaced loudly, never auto-'healed' (heal_equity.py
+    exists for deliberate, backed-up repair).
+    """
+    try:
+        cash = get_cash()
+        deployed_cost = 0.0
+        for p in get_all_positions():
+            if p.get("side", "long") == "short":
+                deployed_cost += float(p.get("margin_reserved") or 0.0)
+            else:
+                deployed_cost += float(p.get("shares") or 0.0) * float(p.get("avg_cost") or 0.0)
+        realised_net = float(get_portfolio_stat("realised_pnl_net", "0.0") or 0.0)
+        expected = STARTING_CASH + realised_net - deployed_cost
+        drift = cash - expected
+        msg = (
+            f"Cash invariant: cash=${cash:,.2f} deployed=${deployed_cost:,.2f} "
+            f"realised_net=${realised_net:,.2f} -> expected cash=${expected:,.2f} "
+            f"drift=${drift:+.2f}"
+        )
+        if abs(drift) > 1.00:
+            log.warning("⚠ %s — books drifted (heal_equity.py --confirm after review)", msg)
+        else:
+            log.info("✅ %s", msg)
+    except Exception as exc:
+        log.error("Cash invariant check failed: %s", exc)
+
+
+async def _load_history_for_all_symbols() -> dict[str, list[dict]]:
+    """REST-fetch full candle history for every symbol into DB + cache."""
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_candle_history(session, sym) for sym in SYMBOLS]
         results = await asyncio.gather(*tasks)
@@ -1848,7 +2183,19 @@ async def startup() -> None:
             upsert_candles_bulk(sym, candles)
             _candles_cache[sym] = candles
             all_candles[sym] = candles
+    return all_candles
 
+
+async def startup() -> None:
+    log.info("Startup - fetching %d candles per symbol", CANDLE_LIMIT)
+    log.info("Execution mode: %s", _exec_adapter.name)
+    _reconcile_orders_on_boot()
+    _report_cash_invariant()
+    restored = _restore_adaptive_edge_profiles()
+    if restored > 0:
+        log.info("Adaptive edge profiles restored: %d buckets", restored)
+
+    all_candles = await _load_history_for_all_symbols()
     log.info("Historical candles loaded for %d symbols", len(all_candles))
 
     loop = asyncio.get_event_loop()
@@ -1904,13 +2251,12 @@ async def housekeeping_loop() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 async def main() -> None:
     global _executor
-    import subprocess
-    import sys
 
-    log.info("🚀 Booting UI Command Center...")
-    dash_proc = subprocess.Popen([sys.executable, "/home/admin/trading_bot/dashboard.py"])
-
-    log.info("Quant Bot V2 — risk engine + net accounting — booting")
+    # V4: the dashboard is managed by its own systemd unit (quant-dashboard).
+    # The old subprocess.Popen(dashboard.py) here always died on the port-8000
+    # conflict with that unit and left a zombie child on every boot.
+    log.info("Quant Bot V4 — execution adapter (%s) + order journal — booting",
+             _exec_adapter.name)
     init_db()
 
     loop = asyncio.get_event_loop()
@@ -1927,8 +2273,6 @@ async def main() -> None:
             housekeeping_loop(),
         )
     finally:
-        log.info("Shutting down Dashboard server...")
-        dash_proc.terminate()
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)
         log.info("Bot stopped cleanly.")

@@ -42,7 +42,7 @@ def clean_db():
     with db.get_db() as conn:
         for table in (
             "positions", "trades", "equity_curve", "rl_experience",
-            "ml_cache", "brain_state", "portfolio", "candles",
+            "ml_cache", "brain_state", "portfolio", "candles", "orders",
         ):
             conn.execute(f"DELETE FROM {table}")
     db._seed_portfolio()
@@ -67,14 +67,21 @@ def make_candles(
     drift: float = 0.0,
     amplitude: float = 0.5,
     volume: float = 1000.0,
-    start_time_ms: int = 1_700_000_000_000,
+    start_time_ms: int | None = None,
     interval_ms: int = 60_000,
 ) -> list[dict]:
     """
-    Deterministic synthetic OHLCV series (no RNG — reproducible assertions).
+    Deterministic synthetic OHLCV series (prices are RNG-free; reproducible).
+
+    start_time_ms=None (default) stamps the series so the LAST candle opened
+    one interval ago — i.e. FRESH data that passes the V4 stale-entry gate.
+    Pass an old fixed epoch to simulate a dead feed.
 
     drift: per-bar close-to-close delta. amplitude: high/low spread around close.
     """
+    if start_time_ms is None:
+        import time as _time
+        start_time_ms = int(_time.time() * 1000) - n * interval_ms
     candles = []
     price = start_price
     for i in range(n):

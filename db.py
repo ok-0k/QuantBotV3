@@ -490,6 +490,20 @@ def close_short(symbol: str) -> None:
     delete_position(symbol)
 
 
+def reduce_position(symbol: str, qty_closed: float, margin_released: float = 0.0) -> None:
+    """
+    Partially close a position (V4 — only reachable on testnet partial fills;
+    paper fills are always complete). Shrinks shares and, for shorts, the
+    reserved margin. Stops/targets/entry stay as they were.
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE positions SET shares = MAX(0, shares - ?),"
+            " margin_reserved = MAX(0, margin_reserved - ?) WHERE symbol=?",
+            (float(qty_closed), float(margin_released), symbol),
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # POSITIONS — MFE / MAE TRACKING
 # ─────────────────────────────────────────────────────────────────────────────

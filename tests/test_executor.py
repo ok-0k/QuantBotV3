@@ -274,21 +274,140 @@ def test_short_reserves_margin_and_cover_returns_it(fresh):
     assert row["net_pnl"] == pytest.approx(round(net, 2))
 
 
-# ── Current duplicate-entry behaviour (will change in Phase 3) ───────────────
+# ── V4 protections at the executor ───────────────────────────────────────────
+# (Replaces the pre-V4 characterization test that documented duplicate buys
+#  averaging in and doubling exposure — that behaviour is now intentionally
+#  blocked by the order journal's deterministic client-order-id claim.)
 
-def test_buy_twice_same_candle_averages_in_CURRENT_BEHAVIOUR(fresh):
-    """
-    CHARACTERIZATION: today nothing stops two identical buy signals from the
-    same candle — the second averages into the position and doubles exposure.
-    Phase 3's duplicate-order guard intentionally changes this; when it lands,
-    this test gets replaced by one asserting the second call is blocked.
-    """
+def test_buy_twice_same_candle_is_blocked_as_duplicate(fresh):
     candles = make_candles(n=120, start_price=100.0)
     ens = _entry_ensemble(ml_prob=0.97)
     bot._execute_trade(ens, "TEST", candles, 0.5, ZERO_STATE, STARTING_CASH)
-    first_value = STARTING_CASH - bot.get_cash()
+    cash_after_first = fresh.get_cash()
+    first_value = STARTING_CASH - cash_after_first
+    assert first_value > 0
+
+    bot._execute_trade(ens, "TEST", candles, 0.5, ZERO_STATE, STARTING_CASH)
+
+    # Second identical signal: no extra cash deployed, position unchanged
+    assert fresh.get_cash() == pytest.approx(cash_after_first)
+    p = fresh.get_all_positions()[0]
+    assert p["shares"] * p["avg_cost"] == pytest.approx(first_value, rel=1e-6)
+    row = _last_trade_row(fresh)
+    assert row["status"] == "skipped"
+    assert row["reason"] == "duplicate_order_blocked"
+
+
+def test_buy_on_next_candle_still_allowed(fresh):
+    candles = make_candles(n=120, start_price=100.0)
+    ens = _entry_ensemble(ml_prob=0.97)
+    bot._execute_trade(ens, "TEST", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    deployed_first = STARTING_CASH - fresh.get_cash()
+
+    next_candles = make_candles(n=121, start_price=100.0)   # newer last candle
+    assert next_candles[-1]["time"] != candles[-1]["time"]
+    bot._execute_trade(ens, "TEST", next_candles, 0.5, ZERO_STATE, STARTING_CASH)
+
+    # New candle -> new order id -> averaging-in proceeds as before
+    assert (STARTING_CASH - fresh.get_cash()) > deployed_first * 1.5
+
+
+def test_entry_blocked_on_stale_candles(fresh):
+    stale_candles = make_candles(n=120, start_time_ms=1_700_000_000_000)  # years old
+    ens = _entry_ensemble(ml_prob=0.97)
+    bot._execute_trade(ens, "TEST", stale_candles, 0.5, ZERO_STATE, STARTING_CASH)
+    assert fresh.get_all_positions() == []
+    assert fresh.get_cash() == pytest.approx(STARTING_CASH)
+    row = _last_trade_row(fresh)
+    assert row["status"] == "skipped"
+    assert "stale_data" in row["reason"]
+
+
+def test_exit_never_blocked_by_stale_candles(fresh):
+    stale_candles = make_candles(n=120, start_price=110.0,
+                                 start_time_ms=1_700_000_000_000)
+    fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
+    fresh.set_cash(STARTING_CASH - 200.0)
+    bot._execute_trade(_exit_ensemble(price=110.0), "TEST", stale_candles,
+                       None, ZERO_STATE, STARTING_CASH)
+    assert fresh.get_all_positions() == []   # closed despite dead feed
+
+
+def test_order_cap_clamps_oversized_trade(fresh, monkeypatch):
+    monkeypatch.setattr(bot, "MAX_ORDER_EQUITY_FRAC", 0.10)
+    candles = make_candles(n=120, start_price=100.0)
+    ens = _entry_ensemble(ml_prob=0.97)
+    # Sizing would produce 35% of equity; the cap must clamp it to 10%.
     bot._execute_trade(ens, "TEST", candles, 0.5, ZERO_STATE, STARTING_CASH)
     p = fresh.get_all_positions()[0]
-    total_deployed = STARTING_CASH - fresh.get_cash()
-    assert total_deployed > first_value * 1.5   # exposure roughly doubled
-    assert p["shares"] * p["avg_cost"] == pytest.approx(total_deployed, rel=1e-6)
+    assert p["shares"] * p["avg_cost"] == pytest.approx(STARTING_CASH * 0.10, rel=1e-9)
+
+
+def test_filled_entry_writes_journal_row(fresh):
+    candles = make_candles(n=120, start_price=100.0)
+    ens = _entry_ensemble(ml_prob=0.97)
+    bot._execute_trade(ens, "TEST", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    orders = fresh.get_open_orders()
+    assert orders == []                       # FILLED is terminal
+    with fresh.get_db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "FILLED"
+    assert rows[0]["mode"] == "paper"
+    assert rows[0]["filled_qty"] == pytest.approx(
+        fresh.get_all_positions()[0]["shares"])
+
+
+def test_failed_exit_keeps_position_open(fresh, monkeypatch):
+    """If the adapter cannot execute an exit, the position must survive."""
+    from execution.base import Fill
+
+    class FailingAdapter:
+        name = "paper"
+        def execute(self, intent):
+            return Fill(status="FAILED", note="synthetic outage")
+
+    monkeypatch.setattr(bot, "_exec_adapter", FailingAdapter())
+    candles = make_candles(n=120, start_price=110.0)
+    fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
+    fresh.set_cash(STARTING_CASH - 200.0)
+    bot._execute_trade(_exit_ensemble(price=110.0), "TEST", candles,
+                       None, ZERO_STATE, STARTING_CASH)
+    assert len(fresh.get_all_positions()) == 1          # still open
+    assert fresh.get_cash() == pytest.approx(STARTING_CASH - 200.0)  # no refund
+    row = _last_trade_row(fresh)
+    assert row["reason"] == "execution_failed"
+
+
+def test_partial_exit_books_actual_fill_and_keeps_remainder(fresh, monkeypatch):
+    """Testnet-style partial fill: book the filled qty, keep the rest open."""
+    from execution.base import Fill
+
+    class PartialAdapter:
+        name = "paper"
+        def execute(self, intent):
+            return Fill(status="PARTIALLY_FILLED", qty=intent.qty * 0.5,
+                        price=intent.limit_price, note="partial")
+
+    monkeypatch.setattr(bot, "_exec_adapter", PartialAdapter())
+    candles = make_candles(n=120, start_price=110.0)
+    fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
+    fresh.set_cash(STARTING_CASH - 200.0)
+
+    bot._execute_trade(_exit_ensemble(price=110.0), "TEST", candles,
+                       None, ZERO_STATE, STARTING_CASH)
+
+    positions = fresh.get_all_positions()
+    assert len(positions) == 1
+    assert positions[0]["shares"] == pytest.approx(1.0)   # half remains
+
+    exec_price = 110.0 * (1 - SLIPPAGE_PCT)
+    filled = 1.0
+    cost = filled * 100.0
+    proceeds = filled * exec_price
+    gross = proceeds - cost
+    fee = ((cost + proceeds) / 2.0) * FEE_GATE_ROUND_TRIP
+    net = gross - fee
+    # Cash refunded only for the closed half
+    assert fresh.get_cash() == pytest.approx(
+        (STARTING_CASH - 200.0) + cost + net, rel=1e-9)
