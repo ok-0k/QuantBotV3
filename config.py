@@ -24,6 +24,34 @@ SHORTING ADDITIONS:
 import os
 from pathlib import Path
 
+
+def _load_env_file() -> None:
+    """
+    Best-effort KEY=VALUE loader for local secrets/overrides that must never
+    live in the repo (e.g. DISCORD_WEBHOOK_URL, BINANCE_TESTNET_API_KEY).
+
+    Path: $TRADING_ENV_FILE, else ~/.config/quant-bot/env. Real environment
+    variables always win — values from the file never override them.
+    """
+    path = Path(os.getenv("TRADING_ENV_FILE") or Path.home() / ".config" / "quant-bot" / "env")
+    try:
+        if not path.is_file():
+            return
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception:
+        # Config must never crash the bot over an optional file.
+        pass
+
+
+_load_env_file()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
