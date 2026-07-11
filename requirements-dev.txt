@@ -1,0 +1,2 @@
+# Development / test dependencies (not needed on the live path)
+pytest>=8.0
