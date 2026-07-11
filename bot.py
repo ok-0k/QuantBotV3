@@ -2221,8 +2221,14 @@ async def housekeeping_loop() -> None:
     Each sub-task is wrapped individually so one failure cannot silently abort
     the others and cannot kill the loop.  Confirmed in asyncio.gather at startup.
     """
-    while True:
-        await asyncio.sleep(60)
+    # V4: honour the shutdown event (previously `while True` — asyncio.gather
+    # could never finish, so every systemd stop timed out into SIGKILL).
+    while not _shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=60)
+            return
+        except asyncio.TimeoutError:
+            pass
 
         # ── Edge profiles (brain long-term memory) ────────────────────────────
         try:
