@@ -12,10 +12,12 @@ Then overwrites:
 
 from __future__ import annotations
 
+import argparse
+import json
 import sqlite3
 from datetime import datetime, timezone
 
-from config import DB_PATH, STARTING_CASH
+from config import DATA_DIR, DB_PATH, STARTING_CASH
 
 
 def _utc_now_iso() -> str:
@@ -23,6 +25,14 @@ def _utc_now_iso() -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Recompute cash/equity from trade history and OVERWRITE "
+                    "portfolio.cash + latest equity_curve row.",
+    )
+    parser.add_argument("--confirm", action="store_true",
+                        help="actually overwrite (default is a dry-run report)")
+    args = parser.parse_args()
+
     conn = sqlite3.connect(str(DB_PATH), timeout=20.0)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -42,6 +52,34 @@ def main() -> None:
         n_filled = int(row["n_filled"] or 0)
         sum_net_pnl = float(row["sum_net_pnl"] or 0.0)
         healed_equity = float(STARTING_CASH) + sum_net_pnl
+
+        cur_cash_row = conn.execute(
+            "SELECT value FROM portfolio WHERE key='cash'").fetchone()
+        current_cash = float(cur_cash_row[0]) if cur_cash_row else None
+
+        print(f"Current portfolio.cash: {current_cash}")
+        print(f"Recomputed (healed) value: {healed_equity:.2f}")
+        print("NOTE: the trades table is pruned nightly; if history was pruned "
+              "this recomputation may be WRONG. Also unsafe while the bot has "
+              "open positions (cash excludes deployed capital).")
+
+        if not args.confirm:
+            print("DRY-RUN: nothing changed. Re-run with --confirm to overwrite "
+                  "(a backup of the current values will be written first).")
+            return
+
+        backup_dir = DATA_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = backup_dir / f"portfolio-pre-heal-{stamp}.json"
+        backup_path.write_text(json.dumps({
+            "cash_before": current_cash,
+            "healed_equity_written": healed_equity,
+            "n_filled": n_filled,
+            "sum_net_pnl": sum_net_pnl,
+            "ts": _utc_now_iso(),
+        }, indent=2))
+        print(f"Backup written: {backup_path}")
 
         with conn:
             # Overwrite cash to healed equity.

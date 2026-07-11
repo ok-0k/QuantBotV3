@@ -1,9 +1,7 @@
 import sqlite3
-import os
 
-# Assuming your db is stored here based on your architecture doc
-# If your db has a different name (like bot.db), change it below!
-DB_PATH = '/home/admin/trading_data/trading.db' 
+# Resolve the same DB the bot uses (honours TRADING_DATA_DIR).
+from config import DB_PATH
 
 try:
     conn = sqlite3.connect(DB_PATH)
