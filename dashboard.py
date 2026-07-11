@@ -164,6 +164,48 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Quant Bot — Execution Dashboard", lifespan=lifespan)
 
 
+# ── Optional access token ─────────────────────────────────────────────────────
+# DASHBOARD_AUTH_TOKEN unset/empty  -> open access (legacy behaviour).
+# When set, every request must present the token via one of:
+#   • Authorization: Bearer <token>
+#   • ?token=<token>  (first browser visit; sets a session cookie)
+#   • qb_auth cookie  (set automatically after a ?token= visit)
+# Read-only surface, but account state should not be LAN-readable by default.
+import hmac as _hmac
+import os as _os
+
+_AUTH_TOKEN = _os.getenv("DASHBOARD_AUTH_TOKEN", "").strip()
+_AUTH_COOKIE = "qb_auth"
+
+
+def _token_ok(candidate: str | None) -> bool:
+    return bool(candidate) and _hmac.compare_digest(candidate, _AUTH_TOKEN)
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    if not _AUTH_TOKEN:
+        return await call_next(request)
+
+    supplied = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        supplied = auth_header[7:].strip()
+    query_token = request.query_params.get("token")
+    cookie_token = request.cookies.get(_AUTH_COOKIE)
+
+    if _token_ok(supplied) or _token_ok(query_token) or _token_ok(cookie_token):
+        response = await call_next(request)
+        if query_token and _token_ok(query_token):
+            response.set_cookie(
+                _AUTH_COOKIE, _AUTH_TOKEN,
+                httponly=True, samesite="strict", max_age=30 * 24 * 3600,
+            )
+        return response
+
+    return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
+
 def _build_telemetry(equity_tf: str | None = None) -> dict:
     try:
         init_db()
@@ -2259,6 +2301,12 @@ async def dashboard():
 
 
 if __name__ == "__main__":
-    print(f"\n⚡ Dashboard  →  http://{DASHBOARD_HOST}:{DASHBOARD_PORT}\n")
-    uvicorn.run("dashboard:app", host=DASHBOARD_HOST, port=DASHBOARD_PORT,
+    # Env overrides let a sandbox instance run beside production and allow
+    # locking the bind address down (e.g. DASHBOARD_BIND=127.0.0.1) without
+    # code changes. Defaults preserve current behaviour.
+    _bind = _os.getenv("DASHBOARD_BIND", DASHBOARD_HOST).strip() or DASHBOARD_HOST
+    _port = int(_os.getenv("DASHBOARD_PORT", str(DASHBOARD_PORT)))
+    print(f"\n⚡ Dashboard  →  http://{_bind}:{_port}"
+          f"  (auth: {'token required' if _AUTH_TOKEN else 'OPEN — set DASHBOARD_AUTH_TOKEN'})\n")
+    uvicorn.run("dashboard:app", host=_bind, port=_port,
                 log_level="warning", reload=False)
