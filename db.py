@@ -175,6 +175,31 @@ def init_db() -> None:
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- V4 order-intent journal. Written BEFORE any fill is attempted so
+            -- a crash mid-order leaves an auditable non-terminal row that
+            -- startup reconciliation can resolve. client_order_id is
+            -- deterministic per (symbol, action, candle) which makes entry
+            -- submission idempotent: retries and duplicate signals collapse
+            -- onto the same row instead of creating a second order.
+            CREATE TABLE IF NOT EXISTS orders (
+                client_order_id TEXT PRIMARY KEY,
+                ts_created      TEXT NOT NULL,
+                ts_updated      TEXT NOT NULL,
+                symbol          TEXT NOT NULL,
+                action          TEXT NOT NULL,
+                side            TEXT NOT NULL,
+                candle_ts       INTEGER,
+                req_qty         REAL,
+                req_price       REAL,
+                filled_qty      REAL DEFAULT 0,
+                avg_fill_price  REAL DEFAULT 0,
+                state           TEXT NOT NULL,
+                exchange_order_id TEXT,
+                mode            TEXT NOT NULL DEFAULT 'paper',
+                note            TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_sym_state ON orders(symbol, state);
         """)
 
         # ── SAFE MIGRATIONS (idempotent — run every startup) ──────────────────
@@ -814,3 +839,83 @@ def load_brain_key(key: str, default: Any = None) -> Any:
         except Exception:
             return default
     return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER JOURNAL (V4)
+# ─────────────────────────────────────────────────────────────────────────────
+# State machine:
+#   PENDING_NEW -> FILLED | PARTIALLY_FILLED | REJECTED | FAILED | ORPHANED
+# Terminal states: FILLED, REJECTED, FAILED, ORPHANED.
+# PARTIALLY_FILLED is non-terminal (testnet reconciliation may complete it).
+
+ORDER_TERMINAL_STATES = ("FILLED", "REJECTED", "FAILED", "ORPHANED")
+
+
+def try_create_order(client_order_id: str, symbol: str, action: str, side: str,
+                     candle_ts: int | None, req_qty: float, req_price: float,
+                     mode: str) -> bool:
+    """
+    Atomically claim an order intent. Returns True if this call created the
+    row (caller owns the order), False if the client_order_id already exists —
+    i.e. a duplicate signal or a retry raced us. INSERT OR IGNORE on the
+    PRIMARY KEY makes this race-safe across threads sharing the DB.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (client_order_id, ts_created, ts_updated, symbol, action, side,
+                 candle_ts, req_qty, req_price, state, mode)
+            VALUES (?,?,?,?,?,?,?,?,?, 'PENDING_NEW', ?)
+            """,
+            (client_order_id, now, now, symbol, action, side,
+             candle_ts, req_qty, req_price, mode),
+        )
+        return cur.rowcount == 1
+
+
+def update_order(client_order_id: str, *, state: str,
+                 filled_qty: float | None = None,
+                 avg_fill_price: float | None = None,
+                 exchange_order_id: str | None = None,
+                 note: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    sets = ["state=?", "ts_updated=?"]
+    vals: list[Any] = [state, now]
+    if filled_qty is not None:
+        sets.append("filled_qty=?")
+        vals.append(float(filled_qty))
+    if avg_fill_price is not None:
+        sets.append("avg_fill_price=?")
+        vals.append(float(avg_fill_price))
+    if exchange_order_id is not None:
+        sets.append("exchange_order_id=?")
+        vals.append(str(exchange_order_id))
+    if note is not None:
+        sets.append("note=?")
+        vals.append(note)
+    vals.append(client_order_id)
+    with get_db() as conn:
+        conn.execute(f"UPDATE orders SET {', '.join(sets)} WHERE client_order_id=?", vals)
+
+
+def get_order(client_order_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_open_orders() -> list[dict]:
+    """All journal rows in non-terminal states (candidates for reconciliation)."""
+    placeholders = ",".join("?" for _ in ORDER_TERMINAL_STATES)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM orders WHERE state NOT IN ({placeholders})"
+            " ORDER BY ts_created",
+            ORDER_TERMINAL_STATES,
+        ).fetchall()
+    return [dict(r) for r in rows]

@@ -311,6 +311,40 @@ DECAY_MIN_CANDLES: int = 30
 DECAY_TP_PULL_STRENGTH: float = 0.15  # fraction of distance to entry per unit λ
 DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 
+# ═════════════════════════════════════════════════════════════════════════════
+# V4 — Execution layer & order-safety protections
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Execution backend: "paper" (default — simulated fills, current behaviour) or
+# "testnet" (Binance Spot testnet at testnet.binance.vision; requires the
+# BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET env vars). There is
+# deliberately NO "live" mode.
+EXECUTION_MODE: str = os.getenv("EXECUTION_MODE", "paper").strip().lower()
+
+BINANCE_TESTNET_REST = "https://testnet.binance.vision/api/v3"
+BINANCE_TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
+BINANCE_TESTNET_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", "").strip()
+
+# Stale-data gate: refuse NEW ENTRIES when the newest candle's open time is
+# older than this many seconds (1m bars: 180s = current bar + 2 closed bars).
+# Exits are never gated — the bot must always be able to close a position.
+STALE_ENTRY_MAX_SECS: float = float(os.getenv("STALE_ENTRY_MAX_SECS", "180"))
+
+# Executor-level hard ceiling on a single order's equity fraction — defense in
+# depth behind the SAC ceiling (0.35) × max edge multiplier (1.35) = 0.4725.
+# At 0.50 it never triggers under current sizing math; it exists to stop a
+# future sizing bug from deploying the whole account in one order.
+MAX_ORDER_EQUITY_FRAC: float = float(os.getenv("MAX_ORDER_EQUITY_FRAC", "0.50"))
+
+# WS reconnect: if the stream was down longer than this, REST-backfill candle
+# history before trading again so indicators don't run on a gapped cache.
+WS_BACKFILL_AFTER_SECS: float = float(os.getenv("WS_BACKFILL_AFTER_SECS", "90"))
+
+# Testnet adapter behaviour
+ORDER_POLL_TIMEOUT_SECS: float = float(os.getenv("ORDER_POLL_TIMEOUT_SECS", "20"))
+ORDER_MAX_RETRIES: int = int(os.getenv("ORDER_MAX_RETRIES", "2"))
+REST_WEIGHT_LIMIT_PER_MIN: int = int(os.getenv("REST_WEIGHT_LIMIT_PER_MIN", "1100"))
+
 # Anti reward-hacking guardrails:
 # - Skip entries whose projected TP edge is too small in USD terms.
 # - Penalize tiny positive exits so SAC does not farm "0.01 wins".
