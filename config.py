@@ -33,7 +33,8 @@ DATA_DIR = Path(_td) if _td else Path("/home/admin/trading_data")
 DB_PATH     = DATA_DIR / "trading.db"
 XGB_MODEL   = DATA_DIR / "xgb_model.json"
 SAC_WEIGHTS = DATA_DIR / "sac_actor.npz"
-LOG_DIR     = Path("/dev/shm/trading_logs")
+_ld = (os.getenv("TRADING_LOG_DIR") or "").strip()
+LOG_DIR     = Path(_ld) if _ld else Path("/dev/shm/trading_logs")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)

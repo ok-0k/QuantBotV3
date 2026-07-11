@@ -89,6 +89,7 @@ import asyncio
 import json
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -101,8 +102,10 @@ import numpy as np
 import websockets
 import requests
 
-# Your live Discord webhook
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1491160869512417331/4Y6Q7reg6ZhRDyB73aIMMfNColU7zVOK1QZ6xLTKcQck1TBL8q31Ih-XZ8ljlTtPOvd2"
+# Discord webhook for trade alerts. Sourced from the environment so the
+# credential never lives in the repo (systemd: EnvironmentFile=/etc/quant-bot.env).
+# Empty/unset disables alerts entirely.
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 
 def alert_sniper_shot(symbol, action, price, strategy):
