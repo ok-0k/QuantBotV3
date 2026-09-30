@@ -174,7 +174,10 @@ def test_reward_moves_edge_profile_down_on_losses(brain):
         brain.reward(pnl=-50.0, trade_value=1000.0, regime="ranging", side="long")
     p = brain._edge_profile("long", "ranging")
     assert p["size_mult"] < 1.0
-    assert p["size_mult"] >= 0.65    # EDGE_SIZE_MIN_MULT clamp
+    # EDGE_SIZE_MIN_MULT lowered from 0.65 to 0.05: a persistently bad bucket
+    # must be able to size down near zero rather than floor at a still-large
+    # 65%, so the existing $10 min-notional veto in bot.py can actually fire.
+    assert p["size_mult"] >= 0.05
 
 
 def test_edge_profile_export_import_roundtrip(brain):

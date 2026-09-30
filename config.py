@@ -390,7 +390,19 @@ MICRO_WIN_REWARD_PENALTY: float = 0.12
 ADAPTIVE_EDGE_ENABLED: bool = True
 EDGE_LEARN_RATE: float = 0.08
 EDGE_REWARD_TARGET_PCT: float = 0.0025
-EDGE_SIZE_MIN_MULT: float = 0.65
+# Fix: was 0.65 -- a persistently bad side/regime bucket (e.g. short:trend_up
+# scored score_ema=-0.97 across 51 samples, 0% win rate) could never be
+# penalised past 65% of normal size, so the bot kept sizing into a bucket its
+# own learner had already flagged as losing. bot.py reads this size_mult
+# directly (bypassing edge_position_mult()'s own floor) and multiplies it
+# straight into trade_value; bot.py already vetoes any trade whose resulting
+# trade_value falls below Binance's $10 min notional ("Trade vetoed by AI
+# penalty" path) -- so lowering this floor lets a sufficiently bad bucket ride
+# that existing veto down to an effective skip instead of bottoming out at a
+# still-substantial 65% size. Kept strictly positive (not 0.0) so the bucket
+# keeps a small trickle of live samples to reassess if conditions improve,
+# and so a stray negative multiplier can never flip trade_value's sign.
+EDGE_SIZE_MIN_MULT: float = 0.05
 EDGE_SIZE_MAX_MULT: float = 1.35
 EDGE_RR_MIN_MULT: float = 0.85
 EDGE_RR_MAX_MULT: float = 1.45
