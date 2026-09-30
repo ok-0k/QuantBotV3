@@ -46,6 +46,37 @@ def test_circuit_breaker_peak_ratchets_up(brain):
     assert brain.check_circuit_breaker(9_600.0) is True    # -20% from 12k
 
 
+def test_peak_equity_persists_and_restores_across_fresh_brain(clean_db):
+    """C2: the circuit breaker's peak-equity high-water mark must survive a
+    restart (crash, deploy, OOM) instead of silently re-arming MAX_DRAWDOWN_PCT
+    from whatever equity exists when the process comes back up."""
+    b1 = Brain()
+    b1.check_circuit_breaker(10_000.0)
+    b1.check_circuit_breaker(12_000.0)          # new peak -> persisted immediately
+    assert b1._peak_equity == pytest.approx(12_000.0)
+
+    b2 = Brain()                                # simulates a fresh process after restart
+    assert b2._peak_equity == pytest.approx(0.0)   # not auto-restored on construction
+    restored = b2.restore_peak_equity(default=0.0)
+    assert restored == pytest.approx(12_000.0)
+    assert b2._peak_equity == pytest.approx(12_000.0)
+
+    # The restored peak must actually drive circuit-breaker behaviour, not
+    # just sit there as a dead value: drawdown should be measured from the
+    # persisted historical peak, not from equity-at-restart.
+    assert b2.check_circuit_breaker(9_600.0) is True   # -20% from restored 12k peak
+
+
+def test_restore_peak_equity_never_goes_below_default(clean_db):
+    """A missing/never-persisted key must fall back to `default` (boot
+    equity), not silently leave the peak at 0.0 (which would make every
+    restart look like a 100% drawdown and trip the breaker immediately)."""
+    b = Brain()
+    restored = b.restore_peak_equity(default=8_500.0)
+    assert restored == pytest.approx(8_500.0)
+    assert b.check_circuit_breaker(8_500.0) is False
+
+
 # ── get_stop_take ────────────────────────────────────────────────────────────
 
 def test_stop_take_degenerate_fallback_long(brain):

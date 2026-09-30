@@ -461,8 +461,14 @@ def open_short(symbol: str, shares: float, entry_price: float,
                      (entry_price - N × ATR)
       - margin_reserved = cash locked as collateral (deducted from cash by bot.py)
 
-    Shorting the same symbol twice is NOT allowed here — the bot layer must
-    close the existing short before opening a new one.
+    Shorting the same symbol twice is NOT allowed — raises ValueError if an
+    active short already exists for this symbol. The bot layer must close
+    the existing short (close_short()) before opening a new one. Previously
+    this was an unenforced comment: INSERT OR REPLACE would silently
+    overwrite shares/avg_cost/stop_price/opened_ts, orphaning the original
+    short's margin_reserved from cash forever (it was deducted but never
+    tracked as refundable) and resetting candle_count/opened_ts, defeating
+    the time-based exit protections.
 
     PnL when closing:
       profit = (entry_price - cover_price) × shares
@@ -473,6 +479,16 @@ def open_short(symbol: str, shares: float, entry_price: float,
     entry_state_json = json.dumps(entry_state) if entry_state is not None else None
 
     with get_db() as conn:
+        existing = conn.execute(
+            "SELECT margin_reserved FROM positions WHERE symbol=? AND side='short'",
+            (symbol,),
+        ).fetchone()
+        if existing and float(existing["margin_reserved"] or 0.0) > 0:
+            raise ValueError(
+                f"open_short: {symbol} already has an active short "
+                f"(margin_reserved={existing['margin_reserved']}) — "
+                f"close it via close_short() before opening a new one"
+            )
         conn.execute("""
             INSERT OR REPLACE INTO positions
                 (symbol, side, shares, avg_cost, strategy, stop_price, tp_price,
@@ -724,10 +740,38 @@ def get_cash_curve_from_trades(limit: int = 200) -> list[dict]:
 # EQUITY CURVE
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_equity_rebase() -> tuple[float, str] | tuple[None, None]:
+    """
+    Return (baseline, ts) set by rebase_equity_baseline.py, or (None, None) if
+    no rebase has ever been declared. Deliberately separate from
+    STARTING_CASH: STARTING_CASH keeps meaning "what a fresh install seeds
+    cash with" and "the reference point for the cash-invariant check";
+    this is purely a dashboard display baseline for return_pct / peak-equity.
+    """
+    with get_db() as conn:
+        b = conn.execute("SELECT value FROM portfolio WHERE key='equity_rebase_baseline'").fetchone()
+        t = conn.execute("SELECT value FROM portfolio WHERE key='equity_rebase_ts'").fetchone()
+    if b is None or t is None:
+        return None, None
+    try:
+        return float(b[0]), str(t[0])
+    except (TypeError, ValueError):
+        return None, None
+
+
+def set_equity_rebase(baseline: float, ts: str) -> None:
+    """Declare a new performance-display epoch. See rebase_equity_baseline.py."""
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('equity_rebase_baseline', ?)", (str(baseline),))
+        conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('equity_rebase_ts', ?)", (ts,))
+
+
 def record_equity(equity: float) -> None:
     now = datetime.now(timezone.utc).isoformat()
     eq = float(equity)
-    ret = ((eq - float(STARTING_CASH)) / float(STARTING_CASH)) * 100.0
+    baseline, _ = get_equity_rebase()
+    ref = baseline if baseline is not None and baseline > 0 else float(STARTING_CASH)
+    ret = ((eq - ref) / ref) * 100.0
     with get_db() as conn:
         conn.execute("INSERT INTO equity_curve (ts, equity) VALUES (?,?)", (now, eq))
         conn.execute("INSERT OR REPLACE INTO portfolio VALUES ('current_equity', ?)", (str(eq),))

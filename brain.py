@@ -42,8 +42,15 @@ from config import (
     STOP_LOSS_ATR_MULT,
     TAKE_PROFIT_ATR_MULT,
 )
+# Brain is otherwise pure logic (no DB access) so it stays trivially unit-
+# testable via a bare Brain(); these two are the sole persistence primitives,
+# used only for the circuit breaker's peak-equity high-water mark below.
+from db import save_brain_key as _db_save_brain_key, load_brain_key as _db_load_brain_key
 
 log = logging.getLogger(__name__)
+
+# brain_state key for the circuit breaker's all-time peak equity (Fix #21).
+_PEAK_EQUITY_BRAIN_KEY = "circuit_breaker_peak_equity_v1"
 
 
 # ── Pure numerics (Wilder / ADX / EMA) ───────────────────────────────────────
@@ -173,7 +180,10 @@ class Brain:
         self._peak_equity: float = 0.0
         # Online adaptive edge model keyed by "side:regime" (e.g., "long:trend_up").
         self._edge_profiles: dict[str, dict[str, float]] = {}
-        # Rolling peak for drawdown — persisted only in RAM for this process
+        # Rolling peak for drawdown. Starts at 0.0 here (a bare Brain() must stay
+        # side-effect-free for unit tests); call restore_peak_equity() once at
+        # bot startup to load the persisted high-water mark (Fix #21) — without
+        # that call this is RAM-only for the life of the process, same as before.
         print(
             "BOOT: QuantBrain V2 — ML-sized shorts, BTC-king regime gate, ATR risk."
         )
@@ -217,13 +227,56 @@ class Brain:
             restored += 1
         return restored
 
+    # ── brain_state persistence primitives (Fix #21) ─────────────────────────
+    # Best-effort by design: a persistence hiccup (missing schema in a bare
+    # unit test, a transient disk error) must never break risk-engine logic,
+    # so both methods swallow and log rather than raise.
+
+    def save_brain_key(self, key: str, value: Any) -> None:
+        try:
+            _db_save_brain_key(key, value)
+        except Exception as exc:
+            log.warning("Brain.save_brain_key(%s) failed — continuing without persistence: %s", key, exc)
+
+    def load_brain_key(self, key: str, default: Any = None) -> Any:
+        try:
+            return _db_load_brain_key(key, default)
+        except Exception as exc:
+            log.warning("Brain.load_brain_key(%s) failed — using default: %s", key, exc)
+            return default
+
+    def restore_peak_equity(self, default: float) -> float:
+        """
+        Restore the circuit breaker's high-water mark from brain_state.
+
+        Call once, early in bot.py's startup() — before the exit monitor
+        starts ratcheting it via check_circuit_breaker() — so a restart
+        cannot silently re-arm MAX_DRAWDOWN_PCT from post-restart equity.
+        `default` should be the best available current-equity estimate at
+        boot (or STARTING_CASH if that isn't computable yet); the restored
+        peak never sits below it, so a stale/missing value can never imply
+        a larger drawdown than what's actually observable right now.
+        """
+        loaded = self.load_brain_key(_PEAK_EQUITY_BRAIN_KEY, None)
+        try:
+            loaded_f = float(loaded) if loaded is not None else 0.0
+        except (TypeError, ValueError):
+            loaded_f = 0.0
+        self._peak_equity = max(self._peak_equity, loaded_f, float(default))
+        return self._peak_equity
+
     def check_circuit_breaker(self, equity: float, *args: Any, **kwargs: Any) -> bool:
         """
         Trip on peak-to-trough drawdown; clear when drawdown recovers by CB_RECOVERY_PCT
         (hysteresis avoids chatter at the threshold).
         """
         eq = max(0.0, float(equity))
+        prev_peak = self._peak_equity
         self._peak_equity = max(self._peak_equity, eq)
+        if self._peak_equity > prev_peak:
+            # Fix #21: persist immediately on every new peak so a restart can
+            # never forget how high equity has actually been.
+            self.save_brain_key(_PEAK_EQUITY_BRAIN_KEY, self._peak_equity)
         peak = max(self._peak_equity, 1e-9)
         dd = (peak - eq) / peak
 

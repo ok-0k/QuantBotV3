@@ -38,6 +38,25 @@ FIXES (v3.2) — Post-telemetry autopsy hotfixes:
             a per-candle opportunity cost and a round-trip fee estimate from raw PnL. This gives
             the SAC agent non-zero reward variance on scratch trades (previously $0.00 PnL ->
             flat 0.0 reward -> reward starvation -> no learning gradient).
+
+FIXES (v4.1) — Audit-driven hardening (C1-C3):
+  Fix #19 — exit_monitor's per-position _execute_trade call is now wrapped in try/except.
+            Previously an unhandled exception there propagated straight through
+            asyncio.gather in main() and crashed the entire 24/7 process — one bad tick
+            on one symbol took down risk monitoring for all of them.
+  Fix #20 — main()'s asyncio.gather now passes return_exceptions=True as a second line of
+            defense, with any captured exception logged CRITICAL so a dead subsystem is
+            loud, never silently swallowed.
+  Fix #21 — Brain._peak_equity (the circuit breaker's drawdown high-water mark) is now
+            persisted to brain_state on every new peak and restored at startup. It was
+            previously RAM-only, so every restart (crash, deploy, OOM) silently re-armed
+            MAX_DRAWDOWN_PCT from whatever equity existed at boot, discarding all prior
+            drawdown memory.
+  Fix #22 — open_short() now rejects re-shorting a symbol that already has an active short
+            (raises ValueError) instead of silently overwriting the row via INSERT OR
+            REPLACE, which used to orphan the first short's margin_reserved/stop/opened_ts
+            tracking and permanently leak tracked cash. Guarded at both the entry-gating
+            pre-check (_evaluate_and_trade) and the executor (defense in depth).
 """
 
 from __future__ import annotations
@@ -85,7 +104,7 @@ from db import (
     open_position, open_position_count,
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
     upsert_candle, upsert_candles_bulk, open_short, close_short,
-    open_short_count, update_stop_price, update_tp_price, update_mfe_mae,
+    get_short_position, open_short_count, update_stop_price, update_tp_price, update_mfe_mae,
     get_open_orders, reduce_position, try_create_order, update_order,
 )
 
@@ -1087,6 +1106,17 @@ async def _evaluate_and_trade(
         return
     if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
         return
+    # Fix #22: a short already open on this symbol must never be re-opened —
+    # open_short()'s INSERT OR REPLACE would silently orphan the first short's
+    # margin/stop/opened_ts tracking and leak its reserved margin from cash
+    # forever. brain.get_ensemble_signal() does not consider position_side,
+    # so this gate is the only thing standing between a persistent trend and
+    # a duplicate entry.
+    if direction == "short" and get_short_position(symbol) is not None:
+        log.warning(
+            "%s SHORT blocked — a short is already open on this symbol", symbol,
+        )
+        return
 
     last = candles[-1]
     if last["low"] > 0 and (last["high"] - last["low"]) / last["low"] < 0.0005:
@@ -1123,6 +1153,14 @@ async def _evaluate_and_trade(
             if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
                 return
             if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
+                return
+            # Fix #22 (re-check): close the TOCTOU window between the early
+            # gate above and acquiring this commit frame's lock.
+            if direction == "short" and get_short_position(symbol) is not None:
+                log.warning(
+                    "%s SHORT blocked at commit frame — a short opened on this "
+                    "symbol while sizing was in flight", symbol,
+                )
                 return
 
             cash_e = get_cash()
@@ -1718,12 +1756,38 @@ def _execute_trade(
         margin_reserved = trade_value * SHORT_MARGIN_PCT
         trade_rec["exec_price"] = exec_price
 
+        # Fix #22: open_short() before set_cash(), and guarded. open_short()
+        # now raises ValueError instead of silently overwriting an already-
+        # active short (which used to orphan the first short's margin/stop
+        # tracking forever). Calling it before set_cash() means a rejection
+        # here never leaves cash debited with nothing booked against it.
+        # _evaluate_and_trade's pre-check should always catch this first —
+        # if it still fires, the fill already happened on the exchange/paper
+        # adapter, so we log it CRITICAL for manual review rather than
+        # silently booking it, mirroring _reconcile_orders_on_boot's existing
+        # policy for exchange-executed-but-unbooked fills.
+        try:
+            open_short(
+                symbol, shares, exec_price, strategy_name,
+                stop_price, tp_price, margin_reserved, on_fire,
+                entry_state=pre_state.tolist() if pre_state is not None else None,
+            )
+        except ValueError as _dup_short_exc:
+            trade_rec["reason"] = "short_already_open"
+            log.critical(
+                "⚠ SHORT %s FILLED but BLOCKED from booking — %s — "
+                "no cash moved, manual review required",
+                symbol, _dup_short_exc,
+            )
+            update_order(
+                _coid, state=_fill.status, filled_qty=shares,
+                avg_fill_price=exec_price, exchange_order_id=_fill.exchange_order_id,
+                note=f"BLOCKED: {_dup_short_exc}",
+            )
+            log_trade(trade_rec)
+            return
+
         set_cash(cash - margin_reserved)
-        open_short(
-            symbol, shares, exec_price, strategy_name,
-            stop_price, tp_price, margin_reserved, on_fire,
-            entry_state=pre_state.tolist() if pre_state is not None else None,
-        )
         update_order(_coid, state=_fill.status, filled_qty=shares,
                      avg_fill_price=exec_price,
                      exchange_order_id=_fill.exchange_order_id, note=_fill.note)
@@ -2069,21 +2133,34 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                     "time":               _now(),
                 }
                 # Fix #5: strict commit ordering + cash lock (matches tick exit / evaluate).
-                async with _strict_execution_lock:
-                    async with _trade_lock(sym):
-                        async with _cash_lock:
-                            cash = get_cash()
-                            open_pos = get_all_positions()
-                            total_eq = _compute_total_equity(cash, open_pos)
-                            await loop.run_in_executor(
-                                None, _execute_trade, fake_ensemble,
-                                pos.get("strategy", "EXIT"), candles,
-                                # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
-                                None,
-                                np.zeros(13, dtype=np.float32),
-                                total_eq,
-                                None,
-                            )
+                # Fix #19: one bad exit must never take down the whole 24/7 process.
+                # exit_monitor is awaited directly inside main()'s asyncio.gather (not
+                # via create_task like the tick/evaluate paths), so an uncaught exception
+                # here previously propagated all the way out and killed every symbol's
+                # risk monitoring, not just this one.
+                try:
+                    async with _strict_execution_lock:
+                        async with _trade_lock(sym):
+                            async with _cash_lock:
+                                cash = get_cash()
+                                open_pos = get_all_positions()
+                                total_eq = _compute_total_equity(cash, open_pos)
+                                await loop.run_in_executor(
+                                    None, _execute_trade, fake_ensemble,
+                                    pos.get("strategy", "EXIT"), candles,
+                                    # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
+                                    None,
+                                    np.zeros(13, dtype=np.float32),
+                                    total_eq,
+                                    None,
+                                )
+                except Exception:
+                    log.error(
+                        "exit_monitor: _execute_trade failed for %s (%s) — "
+                        "position left open, will retry next cycle",
+                        sym, reason, exc_info=True,
+                    )
+                    continue
 
         # Fix #6: use shared helper for equity snapshot
         cash = get_cash()
@@ -2195,6 +2272,18 @@ async def startup() -> None:
     if restored > 0:
         log.info("Adaptive edge profiles restored: %d buckets", restored)
 
+    # Fix #21: restore the circuit breaker's peak-equity high-water mark so a
+    # restart (crash, deploy, OOM) cannot silently re-arm MAX_DRAWDOWN_PCT from
+    # whatever equity happens to exist at boot. Defaults to boot-time equity
+    # when nothing was ever persisted (fresh install / wiped DB).
+    _boot_cash = get_cash()
+    _boot_equity = _compute_total_equity(_boot_cash, get_all_positions())
+    _restored_peak = brain.restore_peak_equity(default=_boot_equity)
+    log.info(
+        "Circuit breaker peak-equity restored: $%.2f (boot equity $%.2f)",
+        _restored_peak, _boot_equity,
+    )
+
     all_candles = await _load_history_for_all_symbols()
     log.info("Historical candles loaded for %d symbols", len(all_candles))
 
@@ -2273,11 +2362,26 @@ async def main() -> None:
 
     try:
         await startup()
-        await asyncio.gather(
+        # Fix #20: return_exceptions=True is a second line of defense behind Fix #19
+        # — even an exception nobody anticipated in one of these three coroutines can
+        # no longer cancel its siblings and crash the process. It CAN still leave that
+        # one subsystem dead for the rest of the run, so a captured exception is
+        # always logged CRITICAL below rather than silently discarded.
+        _results = await asyncio.gather(
             websocket_listener(loop),
             exit_monitor(loop),
             housekeeping_loop(),
+            return_exceptions=True,
         )
+        for _name, _result in zip(
+            ("websocket_listener", "exit_monitor", "housekeeping_loop"), _results
+        ):
+            if isinstance(_result, BaseException):
+                log.critical(
+                    "⚠ %s terminated with an unhandled exception — this subsystem "
+                    "is DEAD until the next restart: %r",
+                    _name, _result, exc_info=_result,
+                )
     finally:
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)

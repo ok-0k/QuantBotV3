@@ -274,6 +274,44 @@ def test_short_reserves_margin_and_cover_returns_it(fresh):
     assert row["net_pnl"] == pytest.approx(round(net, 2))
 
 
+def test_short_twice_same_symbol_rejected_no_capital_leak(fresh):
+    """C3: re-shorting an already-open short must not overwrite margin/stop
+    tracking or double-debit cash. Previously open_short()'s INSERT OR REPLACE
+    silently destroyed the first short's tracked margin_reserved (deducted
+    from cash but never refundable again) while a second margin_reserved was
+    also deducted -- a permanent, invisible capital leak."""
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    raw_price = candles[-1]["close"]
+    ens = _entry_ensemble(action="short", price=raw_price, ml_prob=0.03)
+
+    bot._execute_trade(ens, "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    p1 = fresh.get_all_positions()[0]
+    cash_after_first = fresh.get_cash()
+    assert p1["margin_reserved"] > 0
+
+    # A second short signal on the SAME symbol, one candle later -> a new
+    # candle_ts -> a new client_order_id -> bypasses the duplicate-order
+    # journal guard, so this genuinely exercises the existing-position guard
+    # rather than order-journal idempotency.
+    next_candles = make_candles(n=121, start_price=100.0, drift=-0.05, amplitude=0.4)
+    assert next_candles[-1]["time"] != candles[-1]["time"]
+    ens2 = _entry_ensemble(action="short", price=next_candles[-1]["close"], ml_prob=0.03)
+    bot._execute_trade(ens2, "QF", next_candles, 0.5, ZERO_STATE, STARTING_CASH)
+
+    # Rejected: no second margin debit, original position completely untouched.
+    assert fresh.get_cash() == pytest.approx(cash_after_first)
+    positions = fresh.get_all_positions()
+    assert len(positions) == 1
+    p2 = positions[0]
+    assert p2["avg_cost"] == pytest.approx(p1["avg_cost"])
+    assert p2["margin_reserved"] == pytest.approx(p1["margin_reserved"])
+    assert p2["shares"] == pytest.approx(p1["shares"])
+
+    row = _last_trade_row(fresh)
+    assert row["status"] == "skipped"
+    assert row["reason"] == "short_already_open"
+
+
 # ── V4 protections at the executor ───────────────────────────────────────────
 # (Replaces the pre-V4 characterization test that documented duplicate buys
 #  averaging in and doubling exposure — that behaviour is now intentionally

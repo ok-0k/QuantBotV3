@@ -55,6 +55,21 @@ def test_open_short_uses_margin_not_shares_for_count(clean_db):
     assert clean_db.get_short_position("BBBUSDT") is None
 
 
+def test_open_short_twice_rejected(clean_db):
+    """C3: re-shorting an already-open symbol must be rejected, not silently
+    overwrite the row (which used to orphan the first short's margin_reserved
+    from cash forever and reset its stop/opened_ts tracking)."""
+    clean_db.open_short("BBBUSDT", 3.0, 50.0, "QF", 55.0, 45.0, margin_reserved=30.0)
+    with pytest.raises(ValueError):
+        clean_db.open_short("BBBUSDT", 2.0, 60.0, "QF", 66.0, 54.0, margin_reserved=24.0)
+    # Original short must be completely untouched.
+    p = clean_db.get_short_position("BBBUSDT")
+    assert p["shares"] == pytest.approx(3.0)
+    assert p["avg_cost"] == pytest.approx(50.0)
+    assert p["margin_reserved"] == pytest.approx(30.0)
+    assert clean_db.open_short_count() == 1
+
+
 def test_entry_state_json_roundtrip(clean_db):
     state = [0.1, 0.2, 0.3]
     clean_db.open_position("AAAUSDT", 1.0, 100.0, "TEST", 95.0, 110.0, entry_state=state)
@@ -103,6 +118,30 @@ def test_brain_key_roundtrip_and_default(clean_db):
     clean_db.save_brain_key("k1", {"a": [1, 2], "b": "x"})
     assert clean_db.load_brain_key("k1") == {"a": [1, 2], "b": "x"}
     assert clean_db.load_brain_key("missing", default="fallback") == "fallback"
+
+
+def test_equity_rebase_roundtrip_and_default(clean_db):
+    assert clean_db.get_equity_rebase() == (None, None)
+    clean_db.set_equity_rebase(500.0, "2026-09-30T00:00:00+00:00")
+    baseline, ts = clean_db.get_equity_rebase()
+    assert baseline == pytest.approx(500.0)
+    assert ts == "2026-09-30T00:00:00+00:00"
+
+
+def test_record_equity_uses_rebase_baseline_when_set(clean_db):
+    """record_equity()'s return_pct must use STARTING_CASH until a rebase is
+    declared, then switch to the rebase baseline -- without a rebase being
+    present, existing behaviour must stay byte-for-byte identical."""
+    clean_db.record_equity(9_000.0)
+    assert float(clean_db.get_portfolio_stat("return_pct")) == pytest.approx(
+        (9_000.0 - STARTING_CASH) / STARTING_CASH * 100
+    )
+
+    clean_db.set_equity_rebase(50.0, "2026-09-30T00:00:00+00:00")
+    clean_db.record_equity(55.0)
+    assert float(clean_db.get_portfolio_stat("return_pct")) == pytest.approx(
+        (55.0 - 50.0) / 50.0 * 100
+    )
 
 
 def test_candle_upsert_replaces_same_ts(clean_db):
