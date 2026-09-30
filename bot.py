@@ -61,6 +61,7 @@ FIXES (v4.1) — Audit-driven hardening (C1-C3):
 
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 
 from config import (
     BINANCE_REST, BINANCE_WS_BASE, CANDLE_LIMIT, CHECK_EVERY_SECS,
@@ -893,34 +894,46 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         }
 
         # Fix #2 + #10: strict global commit ordering, then per-symbol + cash.
-        async with _strict_execution_lock:
-            async with _trade_lock(sym):
+        # Fix C4: _trade_lock(sym) is now the OUTERMOST lock, spanning the
+        # whole prepare -> network -> commit sequence, so a same-symbol
+        # operation can't sneak in during the network call. _strict_execution_lock
+        # is only held for the two local bookkeeping phases and is released
+        # while the exchange call is in flight, so one slow order never blocks
+        # the other 46 symbols' exit checks.
+        async with _trade_lock(sym):
+            prepared = None
+            async with _strict_execution_lock:
+                pos_list2 = get_all_positions()
+                still_open = next(
+                    (p for p in pos_list2 if p["symbol"] == sym), None)
+                if not still_open:
+                    return
+                if is_short and still_open.get("margin_reserved", 0) <= 0:
+                    return
+                if not is_short and still_open.get("shares", 0) <= 0:
+                    return
+
+                cash = get_cash()
+                open_pos = get_all_positions()
+                total_eq = _compute_total_equity(cash, open_pos)
+
+                prepared = await loop.run_in_executor(
+                    None,
+                    _prepare_trade,
+                    fake_ensemble,
+                    pos.get("strategy", "TICK_EXIT"),
+                    candles,
+                    None,   # sac_fraction=None -> conservative 2% fallback
+                    np.zeros(13, dtype=np.float32),
+                    total_eq,
+                    None,
+                )
+            if prepared is None:
+                return
+            fill = await loop.run_in_executor(None, _exec_adapter.execute, prepared.order_intent)
+            async with _strict_execution_lock:
                 async with _cash_lock:
-                    pos_list2 = get_all_positions()
-                    still_open = next(
-                        (p for p in pos_list2 if p["symbol"] == sym), None)
-                    if not still_open:
-                        return
-                    if is_short and still_open.get("margin_reserved", 0) <= 0:
-                        return
-                    if not is_short and still_open.get("shares", 0) <= 0:
-                        return
-
-                    cash = get_cash()
-                    open_pos = get_all_positions()
-                    total_eq = _compute_total_equity(cash, open_pos)
-
-                    await loop.run_in_executor(
-                        None,
-                        _execute_trade,
-                        fake_ensemble,
-                        pos.get("strategy", "TICK_EXIT"),
-                        candles,
-                        None,   # sac_fraction=None -> conservative 2% fallback
-                        np.zeros(13, dtype=np.float32),
-                        total_eq,
-                        None,
-                    )
+                    await loop.run_in_executor(None, _commit_trade, prepared, fill)
     finally:
         _exit_in_flight.discard(sym)
 
@@ -953,9 +966,12 @@ async def _handle_ws_message(raw_msg: str, loop: asyncio.AbstractEventLoop) -> N
         log.warning("Malformed kline for %s: %s", sym, exc)
         return
 
-    upsert_candle(sym, candle)
-
-    set_portfolio_stat(f"last_price_{sym}", candle["close"])
+    # Fix #23 (W8): every tick used to hit SQLite twice here (upsert_candle +
+    # set_portfolio_stat last_price) for up to 47 symbols -- ~90 writes/sec on
+    # the event-loop thread for data already held in _candles_cache. The
+    # in-memory cache still updates on every tick (that's the whole point of
+    # tick-level reactivity for stops); SQLite is now only touched once per
+    # symbol per closed candle, below.
     if sym in _candles_cache:
         cache = _candles_cache[sym]
         if cache and cache[-1]["time"] == candle["time"]:
@@ -970,6 +986,9 @@ async def _handle_ws_message(raw_msg: str, loop: asyncio.AbstractEventLoop) -> N
     is_closed = bool(kline.get("x", False))
     if not is_closed:
         return
+
+    upsert_candle(sym, candle)
+    set_portfolio_stat(f"last_price_{sym}", candle["close"])
 
     _closed_candle_counts[sym] = _closed_candle_counts.get(sym, 0) + 1
     count = _closed_candle_counts[sym]
@@ -1147,102 +1166,162 @@ async def _evaluate_and_trade(
     strategy_name = _top_strategy(ensemble, direction)
 
     # V2 — entries: one global commit frame (ρ / exposure / DB) at a time; SAC stays outside.
+    # Fix C4: _trade_lock(symbol) now spans the whole sequence (outermost),
+    # while _strict_execution_lock is released around the exchange call so a
+    # slow order on this symbol can't block the other 46 symbols' exit checks
+    # or entries. Margin-health/correlation/exposure checks below are network-
+    # and CPU-bound but NOT the exchange order call itself, so they stay under
+    # the global lock as before (out of scope for this pass — see summary).
     if direction in ("buy", "short"):
-        async with _strict_execution_lock:
-            open_positions = get_all_positions()
-            if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
-                return
-            if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
-                return
-            # Fix #22 (re-check): close the TOCTOU window between the early
-            # gate above and acquiring this commit frame's lock.
-            if direction == "short" and get_short_position(symbol) is not None:
-                log.warning(
-                    "%s SHORT blocked at commit frame — a short opened on this "
-                    "symbol while sizing was in flight", symbol,
-                )
-                return
-
-            cash_e = get_cash()
-            unrealised_e = 0.0
-            for p in open_positions:
-                c_price = _candles_cache.get(
-                    p["symbol"], [{"close": p["avg_cost"]}])[-1]["close"]
-                if p.get("side", "long") == "long":
-                    unrealised_e += (c_price - p["avg_cost"]) * p["shares"]
-                else:
-                    unrealised_e += (p["avg_cost"] - c_price) * p["shares"]
-            total_equity = _compute_total_equity(cash_e, open_positions)
-
-            async with aiohttp.ClientSession() as _sess:
-                await _refresh_margin_health(_sess, cash_e, total_equity)
-            if _margin_health_cache.get("halt_new_entries"):
-                log.info(
-                    "%s entry blocked — margin %s",
-                    symbol, _margin_health_cache.get("halt_reason"),
-                )
-                return
-            peer_syms = [p["symbol"] for p in open_positions if p["symbol"] != symbol]
-            if peer_syms:
-                blocked_corr, worst_rho = correlation_blocks_entry(
-                    candles,
-                    peer_syms,
-                    _candles_cache,
-                    rho_threshold=CORRELATION_THRESHOLD,
-                    max_high_corr_peers=MAX_CORRELATED_OPEN_PEERS,
-                )
-                if blocked_corr:
-                    log.info("%s entry blocked — ρ-cluster (worst |ρ|=%.3f)", symbol, worst_rho)
+        prepared = None
+        async with _trade_lock(symbol):
+            async with _strict_execution_lock:
+                open_positions = get_all_positions()
+                if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
                     return
-            sf = sac_fraction if sac_fraction is not None else _SAC_FALLBACK_PCT
-            proposed_frac = _entry_proposed_equity_frac(float(sf), cm_authoritative)
-            marks = {
-                p["symbol"]: float(
-                    (_candles_cache.get(p["symbol"]) or [{"close": p["avg_cost"]}])[-1]["close"]
-                )
-                for p in open_positions
-            }
-            blocked_exp, cur_exp = exposure_blocked(
-                open_positions,
-                marks,
-                total_equity,
-                proposed_frac,
-                global_cap=GLOBAL_POSITION_NOTIONAL_CAP,
-            )
-            if blocked_exp:
-                log.info(
-                    "%s entry blocked — exposure %.1f%% + proposed %.1f%% > cap %.0f%%",
-                    symbol,
-                    cur_exp * 100,
-                    proposed_frac * 100,
-                    GLOBAL_POSITION_NOTIONAL_CAP * 100,
-                )
-                return
-
-            async with _trade_lock(symbol):
-                async with _cash_lock:
-                    await loop.run_in_executor(
-                        None,
-                        _execute_trade,
-                        ensemble, strategy_name, candles, sac_fraction, state_vec, total_equity,
-                        cm_authoritative,
+                if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
+                    return
+                # Fix #22 (re-check): close the TOCTOU window between the early
+                # gate above and acquiring this commit frame's lock.
+                if direction == "short" and get_short_position(symbol) is not None:
+                    log.warning(
+                        "%s SHORT blocked at commit frame — a short opened on this "
+                        "symbol while sizing was in flight", symbol,
                     )
+                    return
+
+                cash_e = get_cash()
+                unrealised_e = 0.0
+                for p in open_positions:
+                    c_price = _candles_cache.get(
+                        p["symbol"], [{"close": p["avg_cost"]}])[-1]["close"]
+                    if p.get("side", "long") == "long":
+                        unrealised_e += (c_price - p["avg_cost"]) * p["shares"]
+                    else:
+                        unrealised_e += (p["avg_cost"] - c_price) * p["shares"]
+                total_equity = _compute_total_equity(cash_e, open_positions)
+
+                async with aiohttp.ClientSession() as _sess:
+                    await _refresh_margin_health(_sess, cash_e, total_equity)
+                if _margin_health_cache.get("halt_new_entries"):
+                    log.info(
+                        "%s entry blocked — margin %s",
+                        symbol, _margin_health_cache.get("halt_reason"),
+                    )
+                    return
+                peer_syms = [p["symbol"] for p in open_positions if p["symbol"] != symbol]
+                if peer_syms:
+                    blocked_corr, worst_rho = correlation_blocks_entry(
+                        candles,
+                        peer_syms,
+                        _candles_cache,
+                        rho_threshold=CORRELATION_THRESHOLD,
+                        max_high_corr_peers=MAX_CORRELATED_OPEN_PEERS,
+                    )
+                    if blocked_corr:
+                        log.info("%s entry blocked — ρ-cluster (worst |ρ|=%.3f)", symbol, worst_rho)
+                        return
+                sf = sac_fraction if sac_fraction is not None else _SAC_FALLBACK_PCT
+                proposed_frac = _entry_proposed_equity_frac(float(sf), cm_authoritative)
+                marks = {
+                    p["symbol"]: float(
+                        (_candles_cache.get(p["symbol"]) or [{"close": p["avg_cost"]}])[-1]["close"]
+                    )
+                    for p in open_positions
+                }
+                blocked_exp, cur_exp = exposure_blocked(
+                    open_positions,
+                    marks,
+                    total_equity,
+                    proposed_frac,
+                    global_cap=GLOBAL_POSITION_NOTIONAL_CAP,
+                )
+                if blocked_exp:
+                    log.info(
+                        "%s entry blocked — exposure %.1f%% + proposed %.1f%% > cap %.0f%%",
+                        symbol,
+                        cur_exp * 100,
+                        proposed_frac * 100,
+                        GLOBAL_POSITION_NOTIONAL_CAP * 100,
+                    )
+                    return
+
+                prepared = await loop.run_in_executor(
+                    None,
+                    _prepare_trade,
+                    ensemble, strategy_name, candles, sac_fraction, state_vec, total_equity,
+                    cm_authoritative,
+                )
+            if prepared is None:
+                return
+            fill = await loop.run_in_executor(None, _exec_adapter.execute, prepared.order_intent)
+            async with _strict_execution_lock:
+                async with _cash_lock:
+                    await loop.run_in_executor(None, _commit_trade, prepared, fill)
         return
 
-    async with _strict_execution_lock:
-        async with _trade_lock(symbol):
+    prepared = None
+    async with _trade_lock(symbol):
+        async with _strict_execution_lock:
+            prepared = await loop.run_in_executor(
+                None,
+                _prepare_trade,
+                ensemble, strategy_name, candles, sac_fraction, state_vec, total_equity,
+                None,
+            )
+        if prepared is None:
+            return
+        fill = await loop.run_in_executor(None, _exec_adapter.execute, prepared.order_intent)
+        async with _strict_execution_lock:
             async with _cash_lock:
-                await loop.run_in_executor(
-                    None,
-                    _execute_trade,
-                    ensemble, strategy_name, candles, sac_fraction, state_vec, total_equity,
-                    None,
-                )
+                await loop.run_in_executor(None, _commit_trade, prepared, fill)
 
 
 # ── Core trade executor ───────────────────────────────────────────────────────
+#
+# Fix C4: split into _prepare_trade (gates/sizing/order-journal claim) and
+# _commit_trade (booking) around the exchange network call. Previously the
+# whole thing ran as one function under the caller's global lock, so a slow
+# testnet order for one symbol held _strict_execution_lock for the entire
+# round-trip, blocking every other symbol's stop-loss/take-profit evaluation.
+# Async callers now: acquire the global lock -> _prepare_trade -> release ->
+# call the adapter unlocked (still under that symbol's _trade_lock) ->
+# reacquire the global lock -> _commit_trade. _execute_trade itself remains a
+# synchronous wrapper around all three steps, preserving the original direct-
+# call interface so existing callers/tests are unaffected.
 
-def _execute_trade(
+@dataclass
+class _PreparedTrade:
+    """Carries state from _prepare_trade to _commit_trade across the
+    (now-unlocked) network call. Fields not relevant to a given action stay
+    at their defaults."""
+    action: str
+    symbol: str
+    order_intent: OrderIntent
+    trade_rec: dict
+    candles: list
+    regime: str
+    strategy_name: str
+    on_fire: bool
+    pre_state: Optional[np.ndarray]
+    sac_fraction: Optional[float]
+    total_equity: float
+    # buy / short only
+    is_yolo: bool = False
+    stop_price: float = 0.0
+    tp_price: float = 0.0
+    atr_now: float = 0.0
+    trade_pct: float = 0.0
+    confidence_multiplier: float = 1.0
+    # sell / cover only
+    pos: Optional[dict] = None
+    pos_shares: float = 0.0
+    avg_cost: float = 0.0
+    journaled: bool = True
+    margin_res_total: float = 0.0  # cover only
+
+
+def _prepare_trade(
     ensemble:      dict,
     strategy_name: str,
     candles:       list[dict],
@@ -1251,7 +1330,14 @@ def _execute_trade(
     pre_state:     np.ndarray,
     total_equity:  float,            # Fix #7: passed in, not re-fetched from DB
     conviction_mult: Optional[float] = None,
-) -> None:
+) -> Optional[_PreparedTrade]:
+    """
+    Phase 1 of 2 (Fix C4): every gate, the sizing decision, and the
+    order-journal claim -- everything that must happen before any money
+    moves. Runs under _strict_execution_lock. Returns None if the trade is
+    rejected (already logged via log_trade); otherwise a _PreparedTrade ready
+    for the exchange call in _commit_trade.
+    """
     action = ensemble["signal"]
     symbol = ensemble["symbol"]
     raw_price = ensemble["price"]
@@ -1303,7 +1389,7 @@ def _execute_trade(
                 symbol, action.upper(),
             )
             log_trade(trade_rec)
-            return
+            return None
         ml_conf = (1.0 - _ml_prob) if action == "short" else _ml_prob
         if ml_conf < MIN_ML_CONFIDENCE:
             trade_rec["reason"] = (
@@ -1315,7 +1401,7 @@ def _execute_trade(
                 symbol, action.upper(), ml_conf, MIN_ML_CONFIDENCE, _ml_prob,
             )
             log_trade(trade_rec)
-            return
+            return None
 
         # ── V4 STALE-DATA GATE (entries only) ─────────────────────────────
         # A stalled feed (WS outage, reconnect gap) must never open a new
@@ -1326,7 +1412,7 @@ def _execute_trade(
             trade_rec["reason"] = _stale
             log.warning("%s %s BLOCKED at executor — %s", symbol, action.upper(), _stale)
             log_trade(trade_rec)
-            return
+            return None
 
     # ── Shared SAC-driven sizing (used by BUY and SHORT) ──────────────────────
     def _calc_trade_value() -> tuple[float, float, float]:
@@ -1438,7 +1524,7 @@ def _execute_trade(
         if cash < trade_value or trade_value < 1.0:
             trade_rec["reason"] = "insufficient_funds"
             log_trade(trade_rec)
-            return
+            return None
 
         shares = trade_value / exec_price
         is_yolo = strategy_name == "YOLO_FIRE"
@@ -1446,10 +1532,10 @@ def _execute_trade(
             exec_price, candles, is_yolo, side="long", regime=regime,
             confidence_mult=confidence_multiplier,
         )
-        _atr_now = _wilder_atr(candles) if candles else 0.0
+        atr_now = _wilder_atr(candles) if candles else 0.0
         stop_price, tp_price = apply_dynamic_rr(
             entry=exec_price, stop=stop_price, take=tp_price,
-            atr=_atr_now, side="long",
+            atr=atr_now, side="long",
         )
         tp_gross = max(0.0, shares * max(0.0, tp_price - exec_price))
         tp_friction = entry_exit_fees_notional(trade_value, trade_value)
@@ -1461,9 +1547,9 @@ def _execute_trade(
                 "BUY %s blocked — projected TP net edge $%.4f < min $%.2f",
                 symbol, tp_net_est, MIN_EXPECTED_TP_NET_USD,
             )
-            return
+            return None
 
-        # ── V4 DUPLICATE-ORDER GUARD + EXECUTION ──────────────────────────
+        # ── V4 DUPLICATE-ORDER GUARD ───────────────────────────────────────
         # Claim the deterministic (symbol, action, candle) order id BEFORE any
         # money moves. A second identical signal — retry, WS replay, racing
         # task — fails the claim and cannot double the position.
@@ -1477,45 +1563,221 @@ def _execute_trade(
                 symbol, _coid,
             )
             log_trade(trade_rec)
-            return
+            return None
 
-        _fill = _exec_adapter.execute(OrderIntent(
-            client_order_id=_coid, symbol=symbol, action=action, side="long",
-            qty=shares, ref_price=raw_price, limit_price=exec_price,
-            candle_ts=_candle_ts,
-        ))
-        if not _fill.executed:
-            update_order(_coid, state=_fill.status if _fill.status in
-                         ("REJECTED", "FAILED") else "FAILED", note=_fill.note)
-            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
-            log.warning("BUY %s not executed (%s: %s)", symbol, _fill.status, _fill.note)
+        return _PreparedTrade(
+            action=action, symbol=symbol,
+            order_intent=OrderIntent(
+                client_order_id=_coid, symbol=symbol, action=action, side="long",
+                qty=shares, ref_price=raw_price, limit_price=exec_price,
+                candle_ts=_candle_ts,
+            ),
+            trade_rec=trade_rec, candles=candles, regime=regime,
+            strategy_name=strategy_name, on_fire=on_fire, pre_state=pre_state,
+            sac_fraction=sac_fraction, total_equity=total_equity,
+            is_yolo=is_yolo, stop_price=stop_price, tp_price=tp_price,
+            atr_now=atr_now, trade_pct=trade_pct,
+            confidence_multiplier=confidence_multiplier,
+        )
+
+    elif action == "sell":
+        pos = next((p for p in get_all_positions() if p["symbol"] == symbol), None)
+        if not pos or pos.get("shares", 0) <= 0:
+            trade_rec["reason"] = "no_position"
+            log_trade(trade_rec)
+            return None
+
+        pos_shares = float(pos["shares"])
+        avg_cost   = float(pos["avg_cost"])
+
+        # ── V4 EXECUTION (exit — fail-open on the journal, position-safe) ──
+        # Exits must never be blocked by bookkeeping: if the journal claim
+        # fails (e.g. a crashed prior attempt already holds the id for this
+        # candle) we proceed anyway.
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        _journaled = try_create_order(_coid, symbol, action, "long", _candle_ts,
+                                      pos_shares, exec_price, _exec_adapter.name)
+
+        return _PreparedTrade(
+            action=action, symbol=symbol,
+            order_intent=OrderIntent(
+                client_order_id=_coid, symbol=symbol, action=action, side="long",
+                qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
+                candle_ts=_candle_ts,
+            ),
+            trade_rec=trade_rec, candles=candles, regime=regime,
+            strategy_name=strategy_name, on_fire=on_fire, pre_state=pre_state,
+            sac_fraction=sac_fraction, total_equity=total_equity,
+            pos=pos, pos_shares=pos_shares, avg_cost=avg_cost, journaled=_journaled,
+        )
+
+    elif action == "short":
+        cash = get_cash()
+        trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
+        margin_reserved = trade_value * SHORT_MARGIN_PCT
+
+        if cash < margin_reserved or margin_reserved < 1.0:
+            trade_rec["reason"] = "insufficient_margin"
+            log_trade(trade_rec)
+            return None
+
+        shares = trade_value / exec_price
+        is_yolo = strategy_name == "YOLO_FIRE"
+        stop_price, tp_price = brain.get_stop_take(
+            exec_price, candles, is_yolo, side="short", regime=regime,
+            confidence_mult=confidence_multiplier,
+        )
+        atr_now = _wilder_atr(candles) if candles else 0.0
+        stop_price, tp_price = apply_dynamic_rr(
+            entry=exec_price, stop=stop_price, take=tp_price,
+            atr=atr_now, side="short",
+        )
+        tp_gross = max(0.0, shares * max(0.0, exec_price - tp_price))
+        tp_friction = entry_exit_fees_notional(trade_value, trade_value)
+        tp_net_est = tp_gross - tp_friction
+        if tp_net_est < MIN_EXPECTED_TP_NET_USD:
+            trade_rec["reason"] = "edge_too_small"
+            log_trade(trade_rec)
+            log.info(
+                "SHORT %s blocked — projected TP net edge $%.4f < min $%.2f",
+                symbol, tp_net_est, MIN_EXPECTED_TP_NET_USD,
+            )
+            return None
+
+        # ── V4 DUPLICATE-ORDER GUARD (short) ───────────────────────────────
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        if not try_create_order(_coid, symbol, action, "short", _candle_ts,
+                                shares, exec_price, _exec_adapter.name):
+            trade_rec["reason"] = "duplicate_order_blocked"
+            log.warning(
+                "SHORT %s BLOCKED — duplicate order for this candle (id=%s)",
+                symbol, _coid,
+            )
+            log_trade(trade_rec)
+            return None
+
+        return _PreparedTrade(
+            action=action, symbol=symbol,
+            order_intent=OrderIntent(
+                client_order_id=_coid, symbol=symbol, action=action, side="short",
+                qty=shares, ref_price=raw_price, limit_price=exec_price,
+                candle_ts=_candle_ts,
+            ),
+            trade_rec=trade_rec, candles=candles, regime=regime,
+            strategy_name=strategy_name, on_fire=on_fire, pre_state=pre_state,
+            sac_fraction=sac_fraction, total_equity=total_equity,
+            is_yolo=is_yolo, stop_price=stop_price, tp_price=tp_price,
+            atr_now=atr_now, trade_pct=trade_pct,
+            confidence_multiplier=confidence_multiplier,
+        )
+
+    elif action == "cover":
+        pos = next((p for p in get_all_positions()
+                    if p["symbol"] == symbol), None)
+        if not pos or pos.get("shares", 0) <= 0:
+            trade_rec["reason"] = "no_position"
+            log_trade(trade_rec)
+            return None
+
+        pos_shares = float(pos["shares"])
+        avg_cost   = float(pos["avg_cost"])
+        margin_res_total = float(pos.get("margin_reserved") or 0.0)
+
+        # ── V4 EXECUTION (cover — fail-open journal, position-safe) ────────
+        _candle_ts = _last_candle_ts(candles)
+        _coid = make_client_order_id(symbol, action, _candle_ts)
+        _journaled = try_create_order(_coid, symbol, action, "short", _candle_ts,
+                                      pos_shares, exec_price, _exec_adapter.name)
+
+        return _PreparedTrade(
+            action=action, symbol=symbol,
+            order_intent=OrderIntent(
+                client_order_id=_coid, symbol=symbol, action=action, side="short",
+                qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
+                candle_ts=_candle_ts,
+            ),
+            trade_rec=trade_rec, candles=candles, regime=regime,
+            strategy_name=strategy_name, on_fire=on_fire, pre_state=pre_state,
+            sac_fraction=sac_fraction, total_equity=total_equity,
+            pos=pos, pos_shares=pos_shares, avg_cost=avg_cost, journaled=_journaled,
+            margin_res_total=margin_res_total,
+        )
+
+    # Unreachable in practice — callers only ever pass buy/sell/short/cover.
+    trade_rec["reason"] = f"unknown_action:{action}"
+    log_trade(trade_rec)
+    return None
+
+
+def _commit_trade(prepared: _PreparedTrade, fill) -> None:
+    """
+    Phase 2 of 2 (Fix C4): booking. Runs under _strict_execution_lock again,
+    AFTER the exchange call has already completed with the global lock
+    released. Cash is re-read fresh here (not carried over from the prepare
+    phase) for buy/short specifically — sell/cover already did this in the
+    original code — since another symbol's trade may have moved it during
+    this order's network round-trip.
+    """
+    action        = prepared.action
+    symbol        = prepared.symbol
+    trade_rec     = prepared.trade_rec
+    candles       = prepared.candles
+    regime        = prepared.regime
+    strategy_name = prepared.strategy_name
+    on_fire       = prepared.on_fire
+    pre_state     = prepared.pre_state
+    sac_fraction  = prepared.sac_fraction
+    total_equity  = prepared.total_equity
+    _coid         = prepared.order_intent.client_order_id
+    raw_price     = prepared.order_intent.ref_price
+    exec_price    = prepared.order_intent.limit_price
+
+    if action == "buy":
+        if not fill.executed:
+            update_order(_coid, state=fill.status if fill.status in
+                         ("REJECTED", "FAILED") else "FAILED", note=fill.note)
+            trade_rec["reason"] = f"execution_{fill.status.lower()}"
+            log.warning("BUY %s not executed (%s: %s)", symbol, fill.status, fill.note)
             log_trade(trade_rec)
             return
 
-        # Book what actually happened (paper: identical to the request).
-        if abs(_fill.price - exec_price) > exec_price * 1e-9:
+        stop_price, tp_price = prepared.stop_price, prepared.tp_price
+        if abs(fill.price - exec_price) > exec_price * 1e-9:
             stop_price, tp_price = brain.get_stop_take(
-                _fill.price, candles, is_yolo, side="long", regime=regime,
-                confidence_mult=confidence_multiplier,
+                fill.price, candles, prepared.is_yolo, side="long", regime=regime,
+                confidence_mult=prepared.confidence_multiplier,
             )
             stop_price, tp_price = apply_dynamic_rr(
-                entry=_fill.price, stop=stop_price, take=tp_price,
-                atr=_atr_now, side="long",
+                entry=fill.price, stop=stop_price, take=tp_price,
+                atr=prepared.atr_now, side="long",
             )
-        exec_price = _fill.price
-        shares = _fill.qty
+        exec_price = fill.price
+        shares = fill.qty
         trade_value = shares * exec_price
         trade_rec["exec_price"] = exec_price
 
+        # Fix C4: fresh cash read at commit time, not a prepare-phase
+        # snapshot — the network call above ran with the global lock
+        # released, so other symbols' trades may have already spent cash.
+        cash = get_cash()
+        if cash < trade_value:
+            log.warning(
+                "BUY %s committing with cash=$%.2f < trade_value=$%.2f — the "
+                "fill already executed and cannot be undone; other symbols' "
+                "trades likely consumed cash during this order's round-trip",
+                symbol, cash, trade_value,
+            )
         set_cash(cash - trade_value)
         open_position(
             symbol, shares, exec_price, strategy_name,
             stop_price, tp_price, on_fire,
             entry_state=pre_state.tolist() if pre_state is not None else None,
         )
-        update_order(_coid, state=_fill.status, filled_qty=shares,
+        update_order(_coid, state=fill.status, filled_qty=shares,
                      avg_fill_price=exec_price,
-                     exchange_order_id=_fill.exchange_order_id, note=_fill.note)
+                     exchange_order_id=fill.exchange_order_id, note=fill.note)
         set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
 
         trade_rec.update({
@@ -1531,51 +1793,33 @@ def _execute_trade(
 
         log.info(
             "BUY %s @ $%.4f val=$%.0f (%.1f%% of eq=$%.0f) [%s] sac=%s cm=%.2f stop=$%.4f tp=$%.4f",
-            symbol, exec_price, trade_value, trade_pct * 100, get_cash(),
+            symbol, exec_price, trade_value, prepared.trade_pct * 100, get_cash(),
             strategy_name,
             f"{sac_fraction:.3f}" if sac_fraction is not None else "FALLBACK",
-            confidence_multiplier, stop_price, tp_price
+            prepared.confidence_multiplier, stop_price, tp_price
         )
         log_trade(trade_rec)
         return
 
-    elif action == "sell":
-        pos = next((p for p in get_all_positions() if p["symbol"] == symbol), None)
-        if not pos or pos.get("shares", 0) <= 0:
-            trade_rec["reason"] = "no_position"
-            log_trade(trade_rec)
-            return
+    if action == "sell":
+        pos = prepared.pos
+        pos_shares = prepared.pos_shares
+        avg_cost = prepared.avg_cost
+        _journaled = prepared.journaled
 
-        pos_shares = float(pos["shares"])
-        avg_cost   = float(pos["avg_cost"])
-
-        # ── V4 EXECUTION (exit — fail-open on the journal, position-safe) ──
-        # Exits must never be blocked by bookkeeping: if the journal claim
-        # fails (e.g. a crashed prior attempt already holds the id for this
-        # candle) we proceed anyway. But if the adapter reports the order did
-        # NOT execute, the position must stay open for the monitor to retry.
-        _candle_ts = _last_candle_ts(candles)
-        _coid = make_client_order_id(symbol, action, _candle_ts)
-        _journaled = try_create_order(_coid, symbol, action, "long", _candle_ts,
-                                      pos_shares, exec_price, _exec_adapter.name)
-        _fill = _exec_adapter.execute(OrderIntent(
-            client_order_id=_coid, symbol=symbol, action=action, side="long",
-            qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
-            candle_ts=_candle_ts,
-        ))
-        if not _fill.executed:
+        if not fill.executed:
             if _journaled:
-                update_order(_coid, state="FAILED", note=_fill.note)
-            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+                update_order(_coid, state="FAILED", note=fill.note)
+            trade_rec["reason"] = f"execution_{fill.status.lower()}"
             log.critical(
                 "SELL %s DID NOT EXECUTE (%s: %s) — position stays open for retry",
-                symbol, _fill.status, _fill.note,
+                symbol, fill.status, fill.note,
             )
             log_trade(trade_rec)
             return
 
-        exec_price = _fill.price
-        shares     = _fill.qty                      # actual, possibly partial
+        exec_price = fill.price
+        shares     = fill.qty                      # actual, possibly partial
         trade_rec["exec_price"] = exec_price
         proceeds  = shares * exec_price
         cost      = shares * avg_cost
@@ -1584,14 +1828,9 @@ def _execute_trade(
         hh = _hold_hours_from_candles(hold_candles)
         fee_total, net_pnl = net_realized_pnl(pnl_gross, cost, proceeds, hh)
 
-        # Fix 1 — DYNAMIC MARGIN REFUND (long side):
-        # Return the original capital outlay (shares × avg_cost) plus the net
-        # realised PnL (after fees).  Using net_pnl instead of pnl_gross means
-        # the fee_total is actually deducted from the live cash balance so the
-        # equity calculation stays accurate.
-        #   correct: cash += returned_margin + net_pnl
-        #   broken:  cash += proceeds            ← overstates by fee_total
-        returned_margin_long = cost  # capital originally spent on the CLOSED qty
+        # Fix 1 — DYNAMIC MARGIN REFUND (long side): already read cash fresh
+        # here in the original code — unaffected by the C4 split.
+        returned_margin_long = cost
         set_cash(get_cash() + returned_margin_long + net_pnl)
         set_portfolio_stat("realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross)
         set_portfolio_stat(
@@ -1607,9 +1846,9 @@ def _execute_trade(
                 symbol, shares, pos_shares, pos_shares - shares,
             )
         if _journaled:
-            update_order(_coid, state=_fill.status, filled_qty=shares,
+            update_order(_coid, state=fill.status, filled_qty=shares,
                          avg_fill_price=exec_price,
-                         exchange_order_id=_fill.exchange_order_id, note=_fill.note)
+                         exchange_order_id=fill.exchange_order_id, note=fill.note)
         set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
 
         stored_entry_state = get_entry_state(symbol)
@@ -1630,7 +1869,6 @@ def _execute_trade(
         )
         _persist_adaptive_edge_profiles()
 
-        # ── MFE / MAE → USD conversion for the trade record ──────────────
         _avg_cost_s  = float(pos.get("avg_cost", 0.0))
         _mfe_price_s = float(pos.get("mfe_price") or _avg_cost_s)
         _mae_price_s = float(pos.get("mae_price") or _avg_cost_s)
@@ -1640,7 +1878,6 @@ def _execute_trade(
         trade_rec.update({
             "status":              "filled",
             "shares":              round(float(shares or 0.0), 8),
-            # trade_value for a sell = the original cost basis (capital returned)
             "trade_value":         round(float(cost or 0.0), 2),
             "proceeds":            round(float(proceeds or 0.0), 2),
             "pnl":                 round(float(net_pnl or 0.0), 2),
@@ -1661,13 +1898,6 @@ def _execute_trade(
         )
         log_trade(trade_rec)
 
-        # ── SAC ONLINE LEARNING PIPELINE (Upgrade 4) ──────────────────────────
-        # Persist the complete (s, a, r, s', done) transition so offline_trainer.py
-        # can pull real live experience from rl_experience on the next training run.
-        # entry_state_arr = SAC state at position open (loaded from positions.entry_state)
-        # action          = SAC fraction used at entry; None on crashes/exits → 0.0
-        # reward          = shaped net PnL (already includes candle opportunity cost)
-        # exit_state      = SAC state computed immediately after position closes
         try:
             log_rl_experience(
                 symbol=symbol,
@@ -1679,93 +1909,37 @@ def _execute_trade(
             )
         except Exception as _rl_exc:
             log.warning("log_rl_experience failed for SELL %s: %s", symbol, _rl_exc)
-        # ── END SAC PIPELINE ──────────────────────────────────────────────────
         return
 
-    elif action == "short":
-        cash = get_cash()
-        trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
-        margin_reserved = trade_value * SHORT_MARGIN_PCT
-
-        if cash < margin_reserved or margin_reserved < 1.0:
-            trade_rec["reason"] = "insufficient_margin"
+    if action == "short":
+        if not fill.executed:
+            update_order(_coid, state=fill.status if fill.status in
+                         ("REJECTED", "FAILED") else "FAILED", note=fill.note)
+            trade_rec["reason"] = f"execution_{fill.status.lower()}"
+            log.warning("SHORT %s not executed (%s: %s)", symbol, fill.status, fill.note)
             log_trade(trade_rec)
             return
 
-        shares = trade_value / exec_price
-        is_yolo = strategy_name == "YOLO_FIRE"
-        stop_price, tp_price = brain.get_stop_take(
-            exec_price, candles, is_yolo, side="short", regime=regime,
-            confidence_mult=confidence_multiplier,
-        )
-        _atr_now = _wilder_atr(candles) if candles else 0.0
-        stop_price, tp_price = apply_dynamic_rr(
-            entry=exec_price, stop=stop_price, take=tp_price,
-            atr=_atr_now, side="short",
-        )
-        tp_gross = max(0.0, shares * max(0.0, exec_price - tp_price))
-        tp_friction = entry_exit_fees_notional(trade_value, trade_value)
-        tp_net_est = tp_gross - tp_friction
-        if tp_net_est < MIN_EXPECTED_TP_NET_USD:
-            trade_rec["reason"] = "edge_too_small"
-            log_trade(trade_rec)
-            log.info(
-                "SHORT %s blocked — projected TP net edge $%.4f < min $%.2f",
-                symbol, tp_net_est, MIN_EXPECTED_TP_NET_USD,
-            )
-            return
-
-        # ── V4 DUPLICATE-ORDER GUARD + EXECUTION (short) ──────────────────
-        _candle_ts = _last_candle_ts(candles)
-        _coid = make_client_order_id(symbol, action, _candle_ts)
-        if not try_create_order(_coid, symbol, action, "short", _candle_ts,
-                                shares, exec_price, _exec_adapter.name):
-            trade_rec["reason"] = "duplicate_order_blocked"
-            log.warning(
-                "SHORT %s BLOCKED — duplicate order for this candle (id=%s)",
-                symbol, _coid,
-            )
-            log_trade(trade_rec)
-            return
-
-        _fill = _exec_adapter.execute(OrderIntent(
-            client_order_id=_coid, symbol=symbol, action=action, side="short",
-            qty=shares, ref_price=raw_price, limit_price=exec_price,
-            candle_ts=_candle_ts,
-        ))
-        if not _fill.executed:
-            update_order(_coid, state=_fill.status if _fill.status in
-                         ("REJECTED", "FAILED") else "FAILED", note=_fill.note)
-            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
-            log.warning("SHORT %s not executed (%s: %s)", symbol, _fill.status, _fill.note)
-            log_trade(trade_rec)
-            return
-
-        if abs(_fill.price - exec_price) > exec_price * 1e-9:
+        stop_price, tp_price = prepared.stop_price, prepared.tp_price
+        if abs(fill.price - exec_price) > exec_price * 1e-9:
             stop_price, tp_price = brain.get_stop_take(
-                _fill.price, candles, is_yolo, side="short", regime=regime,
-                confidence_mult=confidence_multiplier,
+                fill.price, candles, prepared.is_yolo, side="short", regime=regime,
+                confidence_mult=prepared.confidence_multiplier,
             )
             stop_price, tp_price = apply_dynamic_rr(
-                entry=_fill.price, stop=stop_price, take=tp_price,
-                atr=_atr_now, side="short",
+                entry=fill.price, stop=stop_price, take=tp_price,
+                atr=prepared.atr_now, side="short",
             )
-        exec_price = _fill.price
-        shares = _fill.qty
+        exec_price = fill.price
+        shares = fill.qty
         trade_value = shares * exec_price
         margin_reserved = trade_value * SHORT_MARGIN_PCT
         trade_rec["exec_price"] = exec_price
 
         # Fix #22: open_short() before set_cash(), and guarded. open_short()
-        # now raises ValueError instead of silently overwriting an already-
-        # active short (which used to orphan the first short's margin/stop
-        # tracking forever). Calling it before set_cash() means a rejection
-        # here never leaves cash debited with nothing booked against it.
-        # _evaluate_and_trade's pre-check should always catch this first —
-        # if it still fires, the fill already happened on the exchange/paper
-        # adapter, so we log it CRITICAL for manual review rather than
-        # silently booking it, mirroring _reconcile_orders_on_boot's existing
-        # policy for exchange-executed-but-unbooked fills.
+        # raises ValueError instead of silently overwriting an already-active
+        # short. Calling it before set_cash() means a rejection here never
+        # leaves cash debited with nothing booked against it.
         try:
             open_short(
                 symbol, shares, exec_price, strategy_name,
@@ -1780,17 +1954,26 @@ def _execute_trade(
                 symbol, _dup_short_exc,
             )
             update_order(
-                _coid, state=_fill.status, filled_qty=shares,
-                avg_fill_price=exec_price, exchange_order_id=_fill.exchange_order_id,
+                _coid, state=fill.status, filled_qty=shares,
+                avg_fill_price=exec_price, exchange_order_id=fill.exchange_order_id,
                 note=f"BLOCKED: {_dup_short_exc}",
             )
             log_trade(trade_rec)
             return
 
+        # Fix C4: fresh cash read at commit time (see BUY above).
+        cash = get_cash()
+        if cash < margin_reserved:
+            log.warning(
+                "SHORT %s committing with cash=$%.2f < margin=$%.2f — the "
+                "fill already executed and cannot be undone; other symbols' "
+                "trades likely consumed cash during this order's round-trip",
+                symbol, cash, margin_reserved,
+            )
         set_cash(cash - margin_reserved)
-        update_order(_coid, state=_fill.status, filled_qty=shares,
+        update_order(_coid, state=fill.status, filled_qty=shares,
                      avg_fill_price=exec_price,
-                     exchange_order_id=_fill.exchange_order_id, note=_fill.note)
+                     exchange_order_id=fill.exchange_order_id, note=fill.note)
         set_portfolio_stat("total_trades", int(
             get_portfolio_stat("total_trades", "0")) + 1)
 
@@ -1806,65 +1989,46 @@ def _execute_trade(
         alert_sniper_shot(symbol, "short", exec_price, strategy_name)
         log.info(
             "SHORT %s @ $%.4f  val=$%.0f (%.1f%% of eq=$%.0f) (margin=$%.0f) [%s]  sac=%s  cm=%.2f  stop=$%.4f  tp=$%.4f",
-            symbol, exec_price, trade_value, trade_pct * 100, total_equity,
+            symbol, exec_price, trade_value, prepared.trade_pct * 100, total_equity,
             margin_reserved, strategy_name,
             f"{sac_fraction:.3f}" if sac_fraction is not None else "FALLBACK",
-            confidence_multiplier, stop_price, tp_price,
+            prepared.confidence_multiplier, stop_price, tp_price,
         )
         log_trade(trade_rec)
         return
 
-    elif action == "cover":
-        pos = next((p for p in get_all_positions()
-                    if p["symbol"] == symbol), None)
-        if not pos or pos.get("shares", 0) <= 0:
-            trade_rec["reason"] = "no_position"
-            log_trade(trade_rec)
-            return
+    if action == "cover":
+        pos = prepared.pos
+        pos_shares = prepared.pos_shares
+        avg_cost = prepared.avg_cost
+        margin_res_total = prepared.margin_res_total
+        _journaled = prepared.journaled
 
-        pos_shares = float(pos["shares"])
-        avg_cost   = float(pos["avg_cost"])
-        margin_res_total = float(pos.get("margin_reserved") or 0.0)
-
-        # ── V4 EXECUTION (cover — fail-open journal, position-safe) ────────
-        _candle_ts = _last_candle_ts(candles)
-        _coid = make_client_order_id(symbol, action, _candle_ts)
-        _journaled = try_create_order(_coid, symbol, action, "short", _candle_ts,
-                                      pos_shares, exec_price, _exec_adapter.name)
-        _fill = _exec_adapter.execute(OrderIntent(
-            client_order_id=_coid, symbol=symbol, action=action, side="short",
-            qty=pos_shares, ref_price=raw_price, limit_price=exec_price,
-            candle_ts=_candle_ts,
-        ))
-        if not _fill.executed:
+        if not fill.executed:
             if _journaled:
-                update_order(_coid, state="FAILED", note=_fill.note)
-            trade_rec["reason"] = f"execution_{_fill.status.lower()}"
+                update_order(_coid, state="FAILED", note=fill.note)
+            trade_rec["reason"] = f"execution_{fill.status.lower()}"
             log.critical(
                 "COVER %s DID NOT EXECUTE (%s: %s) — position stays open for retry",
-                symbol, _fill.status, _fill.note,
+                symbol, fill.status, fill.note,
             )
             log_trade(trade_rec)
             return
 
-        exec_price = _fill.price
-        shares     = _fill.qty                      # actual, possibly partial
+        exec_price = fill.price
+        shares     = fill.qty                      # actual, possibly partial
         trade_rec["exec_price"] = exec_price
         entry_cost = shares * avg_cost
         cover_cost = shares * exec_price
         pnl_gross  = entry_cost - cover_cost
-        # Release collateral proportional to the quantity actually covered.
         _cover_frac = min(1.0, shares / pos_shares) if pos_shares > 0 else 1.0
         margin_res = margin_res_total * _cover_frac
         hold_candles_c = pos.get("candle_count", 1)
         hh = _hold_hours_from_candles(hold_candles_c)
         fee_total, net_pnl = net_realized_pnl(pnl_gross, entry_cost, cover_cost, hh)
 
-        # Fix 1 — DYNAMIC MARGIN REFUND (short side):
-        # Return the collateral (margin_reserved) plus net_pnl (after fees).
-        # Using pnl_gross here overstated cash by fee_total on every cover.
-        #   correct: cash += margin_reserved + net_pnl
-        #   broken:  cash += margin_reserved + pnl_gross
+        # Fix 1 — DYNAMIC MARGIN REFUND (short side): already read cash fresh
+        # here in the original code — unaffected by the C4 split.
         set_cash(get_cash() + margin_res + net_pnl)
         set_portfolio_stat(
             "realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross
@@ -1882,89 +2046,99 @@ def _execute_trade(
                 symbol, shares, pos_shares, pos_shares - shares,
             )
         if _journaled:
-            update_order(_coid, state=_fill.status, filled_qty=shares,
+            update_order(_coid, state=fill.status, filled_qty=shares,
                          avg_fill_price=exec_price,
-                         exchange_order_id=_fill.exchange_order_id, note=_fill.note)
+                         exchange_order_id=fill.exchange_order_id, note=fill.note)
         alert_sniper_shot(
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )
 
-    stored_entry_state = get_entry_state(symbol)
-    entry_state_arr: Optional[np.ndarray] = (
-        np.array(stored_entry_state, dtype=np.float32)
-        if stored_entry_state is not None else pre_state
-    )
-    new_cash = get_cash()
-    exit_state = brain.compute_sac_state(
-        symbol, candles, new_cash, 0.0, new_cash)
-
-    if "pos" not in locals() or pos is None:
-        pos = {}
-    if "pnl_gross" not in locals():
-        pnl_gross = locals().get("pnl", 0.0)
-    if "entry_cost" not in locals():
-        entry_cost = 0.0
-    if "fee_total" not in locals():
-        fee_total = 0.0
-    if "net_pnl" not in locals():
-        net_pnl = pnl_gross
-    hold_candles = pos.get("candle_count", 1)
-    shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
-    if 0.0 < net_pnl < MICRO_WIN_USD:
-        shaped_reward -= MICRO_WIN_REWARD_PENALTY
-
-    brain.reward(
-        strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
-        state=entry_state_arr,
-        action=sac_fraction if sac_fraction is not None else 0.0,
-        next_state=exit_state, trade_value=entry_cost, side="short",
-    )
-    _persist_adaptive_edge_profiles()
-
-    # ── MFE / MAE → USD conversion for the cover trade record ────────────
-    # For shorts: mfe_price is the LOWEST low seen (favourable); mae_price is
-    # the HIGHEST high seen (adverse squeeze).  Convert to USD PnL sign.
-    _avg_cost_c  = float(pos.get("avg_cost", 0.0))
-    _mfe_price_c = float(pos.get("mfe_price") or _avg_cost_c)
-    _mae_price_c = float(pos.get("mae_price") or _avg_cost_c)
-    _max_unreal  = round((_avg_cost_c - _mfe_price_c) * shares, 4)  # short profit
-    _min_unreal  = round((_avg_cost_c - _mae_price_c) * shares, 4)  # short loss
-
-    _cover_cost_val = float(locals().get("cover_cost") or locals().get("sell_value") or 0.0)
-    _entry_cost_val = float(locals().get("entry_cost") or 0.0)
-    trade_rec.update({
-        "status":              "filled",
-        "shares":              round(float(shares or 0.0), 8),
-        # trade_value for a cover = the entry notional (margin collateral basis)
-        "trade_value":         round(_entry_cost_val, 2),
-        "proceeds":            round(_cover_cost_val, 2),
-        "pnl":                 round(float(net_pnl or 0.0), 2),
-        "gross_pnl":           round(float(pnl_gross or 0.0), 2),
-        "fee_total":           round(float(fee_total or 0.0), 6),
-        "net_pnl":             round(float(net_pnl or 0.0), 2),
-        "max_unrealized_pnl":  _max_unreal,
-        "min_unrealized_pnl":  _min_unreal,
-    })
-    log.info(
-        "COVER %s @ $%.4f  gross=$%+.2f net=$%+.2f fees=$%.4f shaped=$%+.4f  [%s]",
-        symbol, exec_price, pnl_gross, net_pnl, fee_total, shaped_reward, pos.get("strategy", "?")
-    )
-
-    log_trade(trade_rec)
-
-    # ── SAC ONLINE LEARNING PIPELINE (Upgrade 4) ──────────────────────────────
-    try:
-        log_rl_experience(
-            symbol=symbol,
-            state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
-            action=float(sac_fraction) if sac_fraction is not None else 0.0,
-            reward=float(shaped_reward),
-            next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
-            done=True,
+        stored_entry_state = get_entry_state(symbol)
+        entry_state_arr = (
+            np.array(stored_entry_state, dtype=np.float32)
+            if stored_entry_state is not None else pre_state
         )
-    except Exception as _rl_exc:
-        log.warning("log_rl_experience failed for COVER %s: %s", symbol, _rl_exc)
-    # ── END SAC PIPELINE ──────────────────────────────────────────────────────
+        new_cash = get_cash()
+        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+
+        hold_candles = pos.get("candle_count", 1)
+        shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
+        if 0.0 < net_pnl < MICRO_WIN_USD:
+            shaped_reward -= MICRO_WIN_REWARD_PENALTY
+
+        brain.reward(
+            strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
+            state=entry_state_arr,
+            action=sac_fraction if sac_fraction is not None else 0.0,
+            next_state=exit_state, trade_value=entry_cost, side="short",
+        )
+        _persist_adaptive_edge_profiles()
+
+        # For shorts: mfe_price is the LOWEST low seen (favourable); mae_price
+        # is the HIGHEST high seen (adverse squeeze). Convert to USD PnL sign.
+        _avg_cost_c  = float(pos.get("avg_cost", 0.0))
+        _mfe_price_c = float(pos.get("mfe_price") or _avg_cost_c)
+        _mae_price_c = float(pos.get("mae_price") or _avg_cost_c)
+        _max_unreal  = round((_avg_cost_c - _mfe_price_c) * shares, 4)  # short profit
+        _min_unreal  = round((_avg_cost_c - _mae_price_c) * shares, 4)  # short loss
+
+        trade_rec.update({
+            "status":              "filled",
+            "shares":              round(float(shares or 0.0), 8),
+            "trade_value":         round(float(entry_cost or 0.0), 2),
+            "proceeds":            round(float(cover_cost or 0.0), 2),
+            "pnl":                 round(float(net_pnl or 0.0), 2),
+            "gross_pnl":           round(float(pnl_gross or 0.0), 2),
+            "fee_total":           round(float(fee_total or 0.0), 6),
+            "net_pnl":             round(float(net_pnl or 0.0), 2),
+            "max_unrealized_pnl":  _max_unreal,
+            "min_unrealized_pnl":  _min_unreal,
+        })
+        log.info(
+            "COVER %s @ $%.4f  gross=$%+.2f net=$%+.2f fees=$%.4f shaped=$%+.4f  [%s]",
+            symbol, exec_price, pnl_gross, net_pnl, fee_total, shaped_reward, pos.get("strategy", "?")
+        )
+        log_trade(trade_rec)
+
+        try:
+            log_rl_experience(
+                symbol=symbol,
+                state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
+                action=float(sac_fraction) if sac_fraction is not None else 0.0,
+                reward=float(shaped_reward),
+                next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
+                done=True,
+            )
+        except Exception as _rl_exc:
+            log.warning("log_rl_experience failed for COVER %s: %s", symbol, _rl_exc)
+        return
+
+
+def _execute_trade(
+    ensemble:      dict,
+    strategy_name: str,
+    candles:       list[dict],
+    sac_fraction:  Optional[float],
+    pre_state:     np.ndarray,
+    total_equity:  float,
+    conviction_mult: Optional[float] = None,
+) -> None:
+    """
+    Synchronous convenience wrapper preserving the original single-call
+    interface (used directly by tests/test_executor.py, and by any caller
+    that doesn't need the async lock-scope split). Async callers use
+    _prepare_trade / _exec_adapter.execute / _commit_trade directly so the
+    exchange call can run with the global lock released (Fix C4) — see
+    _tick_exit_check, _evaluate_and_trade, and exit_monitor.
+    """
+    prepared = _prepare_trade(
+        ensemble, strategy_name, candles, sac_fraction, pre_state,
+        total_equity, conviction_mult,
+    )
+    if prepared is None:
+        return
+    fill = _exec_adapter.execute(prepared.order_intent)
+    _commit_trade(prepared, fill)
 
 
 # ── Periodic exit monitor ─────────────────────────────────────────────────────
@@ -2138,25 +2312,34 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                 # via create_task like the tick/evaluate paths), so an uncaught exception
                 # here previously propagated all the way out and killed every symbol's
                 # risk monitoring, not just this one.
+                # Fix C4: _trade_lock(sym) outermost, _strict_execution_lock released
+                # around the exchange call — see _tick_exit_check for the full rationale.
                 try:
-                    async with _strict_execution_lock:
-                        async with _trade_lock(sym):
-                            async with _cash_lock:
-                                cash = get_cash()
-                                open_pos = get_all_positions()
-                                total_eq = _compute_total_equity(cash, open_pos)
-                                await loop.run_in_executor(
-                                    None, _execute_trade, fake_ensemble,
-                                    pos.get("strategy", "EXIT"), candles,
-                                    # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
-                                    None,
-                                    np.zeros(13, dtype=np.float32),
-                                    total_eq,
-                                    None,
-                                )
+                    prepared = None
+                    async with _trade_lock(sym):
+                        async with _strict_execution_lock:
+                            cash = get_cash()
+                            open_pos = get_all_positions()
+                            total_eq = _compute_total_equity(cash, open_pos)
+                            prepared = await loop.run_in_executor(
+                                None, _prepare_trade, fake_ensemble,
+                                pos.get("strategy", "EXIT"), candles,
+                                # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
+                                None,
+                                np.zeros(13, dtype=np.float32),
+                                total_eq,
+                                None,
+                            )
+                        if prepared is not None:
+                            fill = await loop.run_in_executor(
+                                None, _exec_adapter.execute, prepared.order_intent,
+                            )
+                            async with _strict_execution_lock:
+                                async with _cash_lock:
+                                    await loop.run_in_executor(None, _commit_trade, prepared, fill)
                 except Exception:
                     log.error(
-                        "exit_monitor: _execute_trade failed for %s (%s) — "
+                        "exit_monitor: trade execution failed for %s (%s) — "
                         "position left open, will retry next cycle",
                         sym, reason, exc_info=True,
                     )

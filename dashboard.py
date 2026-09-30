@@ -28,18 +28,27 @@ from db import (
     get_cash,
     get_cash_curve_from_trades,
     get_equity_curve,
+    get_equity_rebase,
     get_filled_trade_count,
     get_portfolio_stat,
     get_recent_trades,
     get_trades_last_7_days,
     init_db,
     load_brain_key,
-    set_portfolio_stat,
 )
 from accounting_v2 import position_equity_components
 
 # ── Vancouver timezone ─────────────────────────────────────────────────────────
 VAN_TZ = zoneinfo.ZoneInfo("America/Vancouver")
+
+# Fix W4: the dashboard is strictly read-only -- bot.py is the sole writer of
+# persisted equity/PnL state. Peak equity used to be re-derived AND written
+# back to portfolio.peak_equity_all_time on every telemetry build, racing
+# bot.py's own writes to current_equity/return_pct. It now ratchets up in
+# this process's memory only; a dashboard restart re-seeds it (harmlessly)
+# from the read-only equity_curve/portfolio history the next call already
+# fetches, so no information is actually lost by not persisting it.
+_dashboard_peak_equity: float = 0.0
 
 
 def _utc_to_van(ts_str: str | None) -> str:
@@ -207,6 +216,7 @@ async def _require_token(request: Request, call_next):
 
 
 def _build_telemetry(equity_tf: str | None = None) -> dict:
+    global _dashboard_peak_equity
     try:
         init_db()
     except Exception:
@@ -295,19 +305,39 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
         inv = float(row.get("total_invested") or 0.0)
         row["deployed_equity_pct"] = round(100.0 * inv / max(total_eq, 1e-9), 3)
 
-    total_net_pnl = round(total_eq - STARTING_CASH, 2)
-    return_pct    = round(total_net_pnl / STARTING_CASH * 100, 3)
+    # equity_rebase_baseline/ts (set by rebase_equity_baseline.py) take over
+    # as the reference point for return_pct / peak-equity when present,
+    # instead of always using STARTING_CASH. STARTING_CASH keeps its original
+    # meaning everywhere else (fresh-install seed amount, bot.py's
+    # cash-invariant check) -- this only changes what the dashboard displays.
+    rebase_baseline, rebase_ts = get_equity_rebase()
+    ref_equity = rebase_baseline if rebase_baseline and rebase_baseline > 0 else STARTING_CASH
+
+    total_net_pnl = round(total_eq - ref_equity, 2)
+    return_pct    = round(total_net_pnl / ref_equity * 100, 3)
 
     # ── Peak equity ────────────────────────────────────────────────────────────
-    stored_peak      = float(get_portfolio_stat("peak_equity_all_time", str(STARTING_CASH)) or STARTING_CASH)
-    curve_equity_vals = [float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw]
-    peak_equity      = max(stored_peak, total_eq, STARTING_CASH, *curve_equity_vals)
-    if peak_equity > stored_peak:
-        set_portfolio_stat("peak_equity_all_time", round(peak_equity, 6))
+    # When a rebase is active, only equity observed AFTER the rebase counts
+    # toward the peak -- otherwise pre-rebase curve history (inflated by the
+    # since-fixed C3 capital leak) would immediately drag "peak since rebase"
+    # straight back up.
+    rebase_dt = _parse_equity_ts(rebase_ts) if rebase_ts else None
+    if rebase_dt is not None:
+        curve_equity_vals = [
+            float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw
+            if _parse_equity_ts(str(pt.get("time", ""))) >= rebase_dt
+        ]
+    else:
+        curve_equity_vals = [float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw]
+    # Fix W4: read the last-known persisted peak (harmless -- a read, not a
+    # write) as a floor, but hold the ratcheted result in process memory only.
+    # bot.py never writes this key, and neither do we anymore -- the previous
+    # set_portfolio_stat call here was racing bot.py's own current_equity /
+    # return_pct writes every ~2s.
+    stored_peak         = float(get_portfolio_stat("peak_equity_all_time", str(ref_equity)) or ref_equity)
+    _dashboard_peak_equity = max(_dashboard_peak_equity, stored_peak, total_eq, ref_equity, *curve_equity_vals)
+    peak_equity          = _dashboard_peak_equity
     drawdown_pct = round((total_eq - peak_equity) / peak_equity * 100, 3) if peak_equity > 0 else 0.0
-
-    set_portfolio_stat("current_equity", round(total_eq, 6))
-    set_portfolio_stat("return_pct",     round(return_pct, 6))
 
     # ── Prices ─────────────────────────────────────────────────────────────────
     prices = []
@@ -529,7 +559,12 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "fee_efficiency":        fee_efficiency,
             "gross_pnl":             gross_pnl,
             "profit_factor":         profit_factor,
-            "starting_cash":         round(STARTING_CASH, 2),
+            # ref_equity (not the raw STARTING_CASH constant): the frontend's
+            # balance self-check (starting_cash + total_net_pnl == total_equity)
+            # and the "vs $X" / today's-%% widgets all key off this field, so it
+            # must match whatever return_pct/total_net_pnl were computed against
+            # above, or a rebase would manufacture a brand new false "drift".
+            "starting_cash":         round(ref_equity, 2),
         },
         "margin_health": margin_health,
         "positions":    pos_list,
