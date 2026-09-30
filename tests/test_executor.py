@@ -14,6 +14,7 @@ import pytest
 import bot
 from config import (
     FEE_GATE_ROUND_TRIP,
+    MAX_ORDER_EQUITY_FRAC,
     SHORT_MARGIN_PCT,
     SLIPPAGE_PCT,
     STARTING_CASH,
@@ -146,9 +147,15 @@ def test_buy_full_pipeline_numbers(fresh):
     assert p["avg_cost"] == pytest.approx(expected_exec, rel=1e-9)
 
     # Sizing: dyn mult at ml=0.97 -> 1.0 + ((0.97-0.80)/0.19)*1.5 = 2.342105...
-    # cm = 1.0 * dyn = 2.342105; raw = sac*cm = 1.171 -> clamped to ceiling 0.35
-    # edge size_mult = 1.0 (fresh) -> trade_value = 3500
-    expected_value = STARTING_CASH * 0.35
+    # cm = 1.0 * dyn = 2.342105; raw = sac*cm = 1.171 -> clamped to SAC ceiling
+    # 0.35; edge size_mult = 1.0 (fresh) -> pre-cap trade_pct = 3500/10000.
+    # Wave 3 (W1): MAX_ORDER_EQUITY_FRAC dropped from 0.50 (never binding) to
+    # 0.15 (a real, always-binding per-symbol cap for any conviction this
+    # high) -- so the actual booked size is now the cap itself, not the SAC
+    # ceiling. 0.35 > MAX_ORDER_EQUITY_FRAC confirms the cap is what's active
+    # here, not a coincidentally-equal value.
+    assert 0.35 > MAX_ORDER_EQUITY_FRAC
+    expected_value = STARTING_CASH * MAX_ORDER_EQUITY_FRAC
     assert p["shares"] * p["avg_cost"] == pytest.approx(expected_value, rel=1e-9)
 
     # Cash conservation: cash + position cost = starting cash
@@ -272,6 +279,23 @@ def test_short_reserves_margin_and_cover_returns_it(fresh):
     row = _last_trade_row(fresh)
     assert row["action"] == "cover"
     assert row["net_pnl"] == pytest.approx(round(net, 2))
+
+
+def test_total_trades_increments_for_every_action_type(fresh):
+    """Wave 3 fix: cover used to fall through _commit_trade without
+    incrementing total_trades, unlike buy/sell/short -- undercounting the
+    lifetime trade stat for every closed short."""
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    raw_price = candles[-1]["close"]
+    assert int(fresh.get_portfolio_stat("total_trades", "0")) == 0
+
+    ens_short = _entry_ensemble(action="short", price=raw_price, ml_prob=0.03)
+    bot._execute_trade(ens_short, "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    assert int(fresh.get_portfolio_stat("total_trades", "0")) == 1
+
+    cov = _exit_ensemble(action="cover", price=raw_price * 0.95)
+    bot._execute_trade(cov, "QF", candles, None, ZERO_STATE, STARTING_CASH)
+    assert int(fresh.get_portfolio_stat("total_trades", "0")) == 2
 
 
 def test_short_twice_same_symbol_rejected_no_capital_leak(fresh):

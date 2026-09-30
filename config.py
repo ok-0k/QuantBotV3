@@ -99,7 +99,13 @@ CANDLE_LIMIT = 300
 # PORTFOLIO
 # ─────────────────────────────────────────────────────────────────────────────
 STARTING_CASH       = 10_000.0
-SLIPPAGE_PCT        = 0.00015
+# Fix W2: a flat 1.5bps was applied identically to BTC and to the thinnest
+# alt in SYMBOLS (e.g. AGIXUSDT, BLURUSDT, GALAUSDT) — unrealistic for the
+# less liquid names at the position sizes this bot uses. 8bps (middle of a
+# conservative 5-10bps range) is still a flat approximation, not a per-symbol
+# liquidity model, but it no longer systematically understates cost across
+# the board the way 1.5bps did.
+SLIPPAGE_PCT        = 0.0008
 TRADE_SIZE_PCT      = 0.2       # base per trade (SAC scales this up/down)
 YOLO_TRADE_SIZE_PCT = 0.8
 MAX_TRADE_SIZE_PCT  = 0.50       # SAC ceiling per position
@@ -233,18 +239,29 @@ SYMBOL_COOLDOWN_SECS = 300
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
-# ── FEE ARCHITECTURE (V2.3) ───────────────────────────────────────────────────
-# Binance spot taker fee: 0.10 % per fill (VIP 0 without BNB discount).
-# Round-trip (entry + exit): 2 × 0.06 % = 0.12 % = 0.0012 of notional.
+# ── FEE ARCHITECTURE (V2.4 — Wave 3 fix) ──────────────────────────────────────
+# Fix W3: the previous version of this comment claimed "0.10% per fill" and
+# then computed the round-trip using an unexplained 0.06%/leg — a silent BNB/
+# VIP-discount assumption that was never gated on the account actually having
+# that discount enabled, understating real trading costs by roughly 2x.
 #
-# Real-world drag example (typical $1,358 trade):
-#   Entry fee  = $1,358 × 0.0006 = $0.8148
-#   Exit fee   = $1,358 × 0.0006 = $0.8148   (exit notional ≈ entry notional)
-#   Total drag = $1.63  ← matches the ~$1.63 observed average per-trade cost
+# Binance spot STANDARD taker fee: 0.10% per fill (VIP 0, no BNB discount).
+# Standard round-trip (entry + exit): 2 × 0.10% = 0.20% = 0.0020 of notional.
+# This is now the default — paper/testnet economics can no longer look
+# rosier than an undiscounted live account would.
 #
-# Slippage (SLIPPAGE_PCT = 0.015 % per leg) is applied to exec_price in
-# _execute_trade and is already baked into the gross PnL before fee deduction,
-# so it is NOT double-counted here.
+# Real-world drag example at the standard rate (typical $1,358 trade):
+#   Entry fee  = $1,358 × 0.0010 = $1.358
+#   Exit fee   = $1,358 × 0.0010 = $1.358   (exit notional ≈ entry notional)
+#   Total drag = $2.72
+#
+# The discounted rate (0.06%/leg = 0.12% round-trip) is only used if
+# USE_BNB_FEE_DISCOUNT is explicitly set True below — confirm BNB fee payment
+# is actually enabled and funded on the account before turning this on.
+#
+# Slippage (SLIPPAGE_PCT) is applied to exec_price in _prepare_trade and is
+# already baked into the gross PnL before fee deduction, so it is NOT
+# double-counted here.
 #
 # TAKER_FEE_BPS / MAKER_FEE_BPS are legacy V2.2 zero-fee alpha-isolation
 # constants kept for module compatibility.  All live fee accounting now flows
@@ -253,12 +270,20 @@ TAKER_FEE_BPS: float = 0.0   # legacy — DO NOT use for PnL accounting
 MAKER_FEE_BPS: float = 0.0   # legacy — DO NOT use for PnL accounting
 TAKER_FEE: float = 0.0        # legacy decimal alias
 MAKER_FEE: float = 0.0        # legacy decimal alias
+
+# Explicit opt-in only — defaults to False (the honest, undiscounted rate).
+# Do not flip this on without confirming BNB fee payment is actually enabled
+# and funded on the real account; it silently halves the fee-gate/PnL cost
+# assumption used throughout accounting_v2 and the executor's fee-bleed gate.
+USE_BNB_FEE_DISCOUNT: bool = os.getenv("USE_BNB_FEE_DISCOUNT", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+
 # Active round-trip fee constant used by accounting_v2 and the fee gate:
 #   fee = (entry_notional + exit_notional) / 2  × FEE_GATE_ROUND_TRIP
-# This is mathematically identical to:
-#   entry_notional × 0.0006  +  exit_notional × 0.0006
-# No hidden multipliers; FEE_GATE_ROUND_TRIP = 0.0012 is the single source of truth.
-FEE_GATE_ROUND_TRIP: float = 0.0012
+# Standard (default): 2 × 0.10%/leg = 0.0020.
+# BNB-discount (opt-in, see USE_BNB_FEE_DISCOUNT above): 2 × 0.06%/leg = 0.0012.
+FEE_GATE_ROUND_TRIP: float = 0.0012 if USE_BNB_FEE_DISCOUNT else 0.0020
 
 # ── EMERGENCY HARD STOPS ──────────────────────────────────────────────────────
 # Instant market exit when open PnL drops below this USD amount.
@@ -330,11 +355,20 @@ BINANCE_TESTNET_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", "").strip()
 # Exits are never gated — the bot must always be able to close a position.
 STALE_ENTRY_MAX_SECS: float = float(os.getenv("STALE_ENTRY_MAX_SECS", "180"))
 
-# Executor-level hard ceiling on a single order's equity fraction — defense in
-# depth behind the SAC ceiling (0.35) × max edge multiplier (1.35) = 0.4725.
-# At 0.50 it never triggers under current sizing math; it exists to stop a
-# future sizing bug from deploying the whole account in one order.
-MAX_ORDER_EQUITY_FRAC: float = float(os.getenv("MAX_ORDER_EQUITY_FRAC", "0.50"))
+# Fix W1: this used to be 0.50 — pure "defense in depth" that never actually
+# triggered, since the SAC ceiling (0.35) × max edge multiplier (1.35) tops
+# out at 0.4725. That meant a single altcoin could legitimately reach ~47%
+# of total equity in one position with no combination of upstream multipliers
+# ever hitting this floor. 0.15 makes this a REAL, actively-binding per-symbol
+# concentration cap, not just a bug backstop: it now binds on most
+# high-conviction entries (which would otherwise size toward the 35% SAC
+# ceiling), not only the rare edge-multiplier-boosted tail case. That is a
+# deliberate risk-policy change, not just a bugfix — 47 symbols, many of them
+# thin-liquidity alts with correlated crypto-wide drawdowns, plus the
+# "unlimited loss" asymmetry the SHORT_* comments elsewhere already call out,
+# argue for capping single-name exposure well below what the sizing model
+# alone would otherwise permit.
+MAX_ORDER_EQUITY_FRAC: float = float(os.getenv("MAX_ORDER_EQUITY_FRAC", "0.15"))
 
 # WS reconnect: if the stream was down longer than this, REST-backfill candle
 # history before trading again so indicators don't run on a gapped cache.

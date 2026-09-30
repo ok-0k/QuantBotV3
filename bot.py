@@ -2049,6 +2049,10 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             update_order(_coid, state=fill.status, filled_qty=shares,
                          avg_fill_price=exec_price,
                          exchange_order_id=fill.exchange_order_id, note=fill.note)
+        # Fix (Wave 3): cover previously fell through without incrementing
+        # total_trades, unlike buy/sell/short -- undercounting the lifetime
+        # trade stat for every closed short.
+        set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
         alert_sniper_shot(
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )
