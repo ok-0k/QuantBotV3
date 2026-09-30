@@ -47,6 +47,14 @@ from config import (
 # used only for the circuit breaker's peak-equity high-water mark below.
 from db import save_brain_key as _db_save_brain_key, load_brain_key as _db_load_brain_key
 
+# Fix O1: _wilder_atr used to be a standalone implementation here that had
+# already drifted from bot.py's copy once (see bot.py's Fix #9 changelog)
+# before being manually re-aligned by hand. Now the single shared
+# implementation lives in indicators.py; imported under the original local
+# name so every call site below (compute_sac_state, get_stop_take,
+# get_ensemble_signal) is unchanged.
+from indicators import wilder_atr as _wilder_atr
+
 log = logging.getLogger(__name__)
 
 # brain_state key for the circuit breaker's all-time peak equity (Fix #21).
@@ -78,22 +86,6 @@ def _ohlcv_arrays(candles: Sequence[dict]) -> tuple[np.ndarray, ...]:
         c[i] = _safe_float(bar.get("close"))
         v[i] = _safe_float(bar.get("volume"))
     return o, h, l, c, v
-
-
-def _wilder_atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int = 14) -> float:
-    """
-    Average True Range (Wilder smoothing). ATR scales with volatility; stops as k·ATR
-    keep risk comparable across quiet vs hectic regimes (fixed % stops do not).
-    """
-    if len(c) < period + 1:
-        return 0.0
-    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    seed = tr[:period].mean()
-    atr = seed
-    for i in range(period, len(tr)):
-        atr = (atr * (period - 1) + tr[i]) / period
-    return float(atr)
-
 
 def _ema(x: np.ndarray, span: int) -> np.ndarray:
     """EMA: more weight on recent prices — standard trend proxy."""

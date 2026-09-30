@@ -85,6 +85,11 @@ from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
 from ml_engine import predict_signal, incremental_train, initial_train
 from brain import Brain
+# Fix O1: was a standalone implementation that had already drifted from
+# brain.py's copy once (see Fix #9 below) before being manually re-aligned.
+# Now the single shared implementation in indicators.py, imported under the
+# original local name so every call site below is unchanged.
+from indicators import wilder_atr_from_candles as _wilder_atr
 from accounting_v2 import (
     entry_exit_fees_notional,
     net_realized_pnl,
@@ -444,41 +449,6 @@ def _compute_total_equity(cash: float, open_positions: list[dict]) -> float:
         )
         total_eq += contrib
     return total_eq
-
-
-def _wilder_atr(candles: list[dict], window: int = 14) -> float:
-    """
-    Fix #9: proper Wilder's smoothed ATR.
-    The previous simple-mean approximation produced a different volatility
-    estimate than brain.py, causing trailing/BE stops to use inconsistent
-    distances from entry stops/TPs.
-
-    Seeds from the mean of the first `window` true ranges, then applies
-    Wilder's exponential smoothing: ATR = (prev * (n-1) + TR) / n
-    """
-    if len(candles) < 2:
-        return 0.0
-
-    seed_end = min(window + 1, len(candles))
-    true_ranges = [
-        max(
-            candles[i]["high"] - candles[i]["low"],
-            abs(candles[i]["high"] - candles[i - 1]["close"]),
-            abs(candles[i]["low"] - candles[i - 1]["close"]),
-        )
-        for i in range(1, seed_end)
-    ]
-    atr = sum(true_ranges) / len(true_ranges)
-
-    for i in range(seed_end, len(candles)):
-        tr = max(
-            candles[i]["high"] - candles[i]["low"],
-            abs(candles[i]["high"] - candles[i - 1]["close"]),
-            abs(candles[i]["low"] - candles[i - 1]["close"]),
-        )
-        atr = (atr * (window - 1) + tr) / window
-
-    return atr
 
 
 def _top_strategy(ensemble: dict, direction: str) -> str:
