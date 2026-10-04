@@ -656,6 +656,10 @@ class Brain:
             short_score=short_score,
             atr_pct=atr / max(price, 1e-12),
             adx=adx,
+            # Raw decision inputs, journaled with each entry (trade journal).
+            pdi=pdi, mdi=mdi, rvol=rvol, ret5=ret5, ret20=ret20,
+            ema_spread=(ef - es) / max(price, 1e-12),
+            ml_component=ml_component, struct_component=struct_component,
         )
 
     def _pack(
@@ -687,5 +691,12 @@ class Brain:
             "breakdown": breakdown,
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "block_reason": block_reason,
-            "meta": {k: extra[k] for k in ("atr_pct", "adx", "short_score") if k in extra},
+            "meta": {
+                k: (round(float(extra[k]), 6) if isinstance(extra[k], (int, float)) else extra[k])
+                for k in (
+                    "atr_pct", "adx", "short_score", "pdi", "mdi", "rvol",
+                    "ret5", "ret20", "ema_spread", "ml_component", "struct_component",
+                )
+                if k in extra
+            },
         }

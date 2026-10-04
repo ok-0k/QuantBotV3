@@ -608,6 +608,80 @@ def _is_profitable_stop(avg_cost: float, stop: float, is_short: bool) -> bool:
     return (stop >= avg_cost) if not is_short else (stop <= avg_cost)
 
 
+def _classify_exit_reason(
+    reason: Optional[str], avg_cost: float, stop: float, is_short: bool,
+) -> str:
+    """
+    Map the free-text exit trigger onto a canonical code for the trade journal
+    (so exits can be GROUP BY'd instead of regex'd).
+
+    Codes: TAKE_PROFIT, STOP_LOSS (initial protective stop), BREAKEVEN_STOP
+    (stop ratcheted to entry), TRAILING_STOP (stop ratcheted into profit),
+    HARD_STOP (USD survival kill-switch), TIME_HOLD_EXIT, MAX_HOLD,
+    CIRCUIT_BREAKER, OTHER.
+
+    A stop-triggered exit is split by where the stop sat relative to entry at
+    the moment it fired: the free-text reason alone cannot tell an initial
+    stop from a trailed one.
+    """
+    r = (reason or "").lower()
+    if "circuit" in r:
+        return "CIRCUIT_BREAKER"
+    if "hard_stop" in r:
+        return "HARD_STOP"
+    if "time_hold" in r:
+        return "TIME_HOLD_EXIT"
+    if "max_hold" in r:
+        return "MAX_HOLD"
+    if "take_profit" in r:
+        return "TAKE_PROFIT"
+    if "stop_loss" in r:
+        if avg_cost > 0 and stop > 0:
+            if abs(stop - avg_cost) <= avg_cost * 1e-9:
+                return "BREAKEVEN_STOP"
+            in_profit = (stop < avg_cost) if is_short else (stop > avg_cost)
+            return "TRAILING_STOP" if in_profit else "STOP_LOSS"
+        return "STOP_LOSS"
+    return "OTHER"
+
+
+def _exit_journal_fields(pos: dict, is_short: bool, trade_rec: dict) -> dict:
+    """
+    Trade-journal columns for a closing leg, derived from the position row
+    (opened_ts, entry_features, mfe/mae marks) plus the exit_reason/exit_detail
+    that the exit path attached to trade_rec.
+
+    peak_profit_pct is clamped >= 0 and max_drawdown_pct <= 0 (a loss is
+    negative, same sign as min_unrealized_pnl). Excursions are candle-extreme
+    based (update_mfe_mae), seeded at the entry price. Fields that cannot be
+    determined are None, never a fabricated 0.
+    """
+    out: dict = {
+        "exit_reason": trade_rec.get("exit_reason"),
+        "exit_detail": trade_rec.get("exit_detail"),
+        "entry_features": pos.get("entry_features"),
+        "peak_profit_pct": None,
+        "max_drawdown_pct": None,
+        "hold_time_seconds": None,
+    }
+    avg = float(pos.get("avg_cost") or 0.0)
+    mfe, mae = pos.get("mfe_price"), pos.get("mae_price")
+    if avg > 0 and mfe is not None and mae is not None:
+        sign = 1.0 if is_short else -1.0          # short profits when price falls
+        out["peak_profit_pct"] = round(max(0.0, sign * (avg - float(mfe)) / avg * 100.0), 4)
+        out["max_drawdown_pct"] = round(min(0.0, sign * (avg - float(mae)) / avg * 100.0), 4)
+    opened = pos.get("opened_ts")
+    if opened:
+        try:
+            _dt = datetime.fromisoformat(str(opened).replace("Z", "+00:00"))
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            out["hold_time_seconds"] = max(0, int(time.time() - _dt.timestamp()))
+        except (ValueError, TypeError):
+            pass
+    return out
+
+
 def _profit_clears_fees(
     avg_cost: float, shares: float, exit_price: float, is_short: bool
 ) -> bool:
@@ -852,6 +926,8 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         candles = _candles_cache.get(sym, [])
         fake_ensemble = {
             "signal":             "cover" if is_short else "sell",
+            "exit_reason":        _classify_exit_reason(reason, float(avg_cost), float(stop or 0.0), is_short),
+            "exit_detail":        reason,
             "symbol":             sym,
             "price":              exit_price,
             "regime":             brain.current_regime,
@@ -1283,6 +1359,7 @@ class _PreparedTrade:
     atr_now: float = 0.0
     trade_pct: float = 0.0
     confidence_multiplier: float = 1.0
+    entry_features: Optional[dict] = None   # short entry: decision snapshot for the trade journal
     # sell / cover only
     pos: Optional[dict] = None
     pos_shares: float = 0.0
@@ -1334,6 +1411,10 @@ def _prepare_trade(
         "shares":      0.0,
         "trade_value": 0.0,
     }
+    # Trade journal: the exit path stamps the canonical trigger on the ensemble.
+    if ensemble.get("exit_reason"):
+        trade_rec["exit_reason"] = ensemble["exit_reason"]
+        trade_rec["exit_detail"] = ensemble.get("exit_detail")
 
     # ── HARD ML CONFIDENCE GATE (defense-in-depth) ────────────────────────────
     # Single source of truth for entries. brain.get_ensemble_signal already
@@ -1628,8 +1709,37 @@ def _prepare_trade(
             log_trade(trade_rec)
             return None
 
+        _meta = ensemble.get("meta") or {}
+        _ml_p = float(ensemble.get("ml_prob", 0.5))
+        _ml_down = 1.0 - _ml_p
+        _ep_snap = brain._edge_profile("short", regime)
+        _entry_features = {
+            "ml_prob": round(_ml_p, 6),
+            "ml_down": round(_ml_down, 6),
+            "ml_tier": int(_ml_down * 100) // 5 * 5,   # 80, 85, ... 100
+            "regime": regime,
+            "strategy": strategy_name,
+            "short_score": _meta.get("short_score"),
+            "adx": _meta.get("adx"), "pdi": _meta.get("pdi"), "mdi": _meta.get("mdi"),
+            "rvol": _meta.get("rvol"), "ret5": _meta.get("ret5"), "ret20": _meta.get("ret20"),
+            "ema_spread": _meta.get("ema_spread"),
+            "ml_component": _meta.get("ml_component"),
+            "struct_component": _meta.get("struct_component"),
+            "atr_pct": round(atr_now / exec_price, 6) if exec_price else None,
+            "stop_pct": round((stop_price - exec_price) / exec_price * 100.0, 4),
+            "tp_pct": round((exec_price - tp_price) / exec_price * 100.0, 4),
+            "sac_fraction": None if sac_fraction is None else round(float(sac_fraction), 6),
+            "conviction_mult": round(float(confidence_multiplier), 4),
+            "trade_pct": round(float(trade_pct), 6),
+            "edge_size_mult": round(float(_ep_snap.get("size_mult", 1.0)), 4),
+            "edge_rr_mult": round(float(_ep_snap.get("rr_mult", 1.0)), 4),
+            "equity": round(float(total_equity), 2),
+            "is_yolo": bool(is_yolo),
+        }
+
         return _PreparedTrade(
             action=action, symbol=symbol,
+            entry_features=_entry_features,
             order_intent=OrderIntent(
                 client_order_id=_coid, symbol=symbol, action=action, side="short",
                 qty=shares, ref_price=raw_price, limit_price=exec_price,
@@ -1856,6 +1966,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             "net_pnl":             round(float(net_pnl or 0.0), 2),
             "max_unrealized_pnl":  _max_unreal,
             "min_unrealized_pnl":  _min_unreal,
+            **_exit_journal_fields(pos, False, trade_rec),
         })
 
         alert_sniper_shot(
@@ -1915,6 +2026,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
                 symbol, shares, exec_price, strategy_name,
                 stop_price, tp_price, margin_reserved, on_fire,
                 entry_state=pre_state.tolist() if pre_state is not None else None,
+                entry_features=prepared.entry_features,
             )
         except ValueError as _dup_short_exc:
             trade_rec["reason"] = "short_already_open"
@@ -1955,6 +2067,10 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             "stop_price":  stop_price,
             "tp_price":    tp_price,
             "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
+            "entry_features": (
+                json.dumps(prepared.entry_features, default=str, sort_keys=True)
+                if prepared.entry_features is not None else None
+            ),
         })
         alert_sniper_shot(symbol, "short", exec_price, strategy_name)
         log.info(
@@ -2067,6 +2183,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             "net_pnl":             round(float(net_pnl or 0.0), 2),
             "max_unrealized_pnl":  _max_unreal,
             "min_unrealized_pnl":  _min_unreal,
+            **_exit_journal_fields(pos, True, trade_rec),
         })
         log.info(
             "COVER %s @ $%.4f  gross=$%+.2f net=$%+.2f fees=$%.4f shaped=$%+.4f  [%s]",
@@ -2270,6 +2387,9 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                 log.info("EXIT %s - %s", sym, reason)
                 fake_ensemble = {
                     "signal":             "cover" if is_short else "sell",
+                    "exit_reason":        _classify_exit_reason(
+                        reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short),
+                    "exit_detail":        reason,
                     "symbol":             sym,
                     "price":              current_price,
                     "regime":             brain.current_regime,

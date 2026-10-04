@@ -126,7 +126,13 @@ def init_db() -> None:
                 slippage    REAL,
                 on_fire     INTEGER DEFAULT 0,
                 status      TEXT    NOT NULL,
-                reason      TEXT
+                reason      TEXT,
+                entry_features     TEXT,
+                exit_reason        TEXT,
+                exit_detail        TEXT,
+                peak_profit_pct    REAL,
+                max_drawdown_pct   REAL,
+                hold_time_seconds  INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_trades_sym ON trades(symbol, ts DESC);
 
@@ -144,7 +150,8 @@ def init_db() -> None:
                 entry_state     TEXT    DEFAULT NULL,
                 margin_reserved REAL    DEFAULT 0,
                 mfe_price       REAL    DEFAULT NULL,
-                mae_price       REAL    DEFAULT NULL
+                mae_price       REAL    DEFAULT NULL,
+                entry_features  TEXT    DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS equity_curve (
@@ -219,6 +226,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE positions ADD COLUMN mfe_price REAL DEFAULT NULL")
         if "mae_price" not in existing_pos:
             conn.execute("ALTER TABLE positions ADD COLUMN mae_price REAL DEFAULT NULL")
+        if "entry_features" not in existing_pos:
+            conn.execute("ALTER TABLE positions ADD COLUMN entry_features TEXT DEFAULT NULL")
 
         # trades table migrations
         if "side" not in existing_trd:
@@ -235,6 +244,18 @@ def init_db() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN max_unrealized_pnl REAL")
         if "min_unrealized_pnl" not in existing_trd:
             conn.execute("ALTER TABLE trades ADD COLUMN min_unrealized_pnl REAL")
+        # Trade journal (2026-10-04). Old rows keep NULL = "not recorded"; no
+        # backfill is attempted because the data was never captured.
+        for _col, _ddl in (
+            ("entry_features",    "TEXT"),     # JSON snapshot of the entry decision
+            ("exit_reason",       "TEXT"),     # canonical code, see bot._classify_exit_reason
+            ("exit_detail",       "TEXT"),     # raw trigger string (prices, thresholds)
+            ("peak_profit_pct",   "REAL"),     # best unrealised % while open (>= 0)
+            ("max_drawdown_pct",  "REAL"),     # worst unrealised % while open (<= 0)
+            ("hold_time_seconds", "INTEGER"),
+        ):
+            if _col not in existing_trd:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {_col} {_ddl}")
 
     _seed_portfolio()
 
@@ -448,7 +469,8 @@ def open_short(symbol: str, shares: float, entry_price: float,
                strategy: str, stop_price: float, tp_price: float,
                margin_reserved: float,
                on_fire: bool = False,
-               entry_state: list | None = None) -> None:
+               entry_state: list | None = None,
+               entry_features: dict | None = None) -> None:
     """
     Open a SHORT position.
 
@@ -477,6 +499,10 @@ def open_short(symbol: str, shares: float, entry_price: float,
     """
     now = datetime.now(timezone.utc).isoformat()
     entry_state_json = json.dumps(entry_state) if entry_state is not None else None
+    entry_features_json = (
+        json.dumps(entry_features, default=str, sort_keys=True)
+        if entry_features is not None else None
+    )
 
     with get_db() as conn:
         existing = conn.execute(
@@ -492,10 +518,16 @@ def open_short(symbol: str, shares: float, entry_price: float,
         conn.execute("""
             INSERT OR REPLACE INTO positions
                 (symbol, side, shares, avg_cost, strategy, stop_price, tp_price,
-                 candle_count, on_fire, opened_ts, entry_state, margin_reserved)
-            VALUES (?,?,?,?,?,?,?,0,?,?,?,?)
+                 candle_count, on_fire, opened_ts, entry_state, margin_reserved,
+                 mfe_price, mae_price, entry_features)
+            VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)
         """, (symbol, "short", shares, entry_price, strategy, stop_price, tp_price,
-              int(on_fire), now, entry_state_json, margin_reserved))
+              int(on_fire), now, entry_state_json, margin_reserved,
+              # Seed both excursion marks AT the entry price so peak profit can
+              # never read negative and drawdown never positive (the old
+              # None-seed took the first candle's low/high, which may sit on
+              # the wrong side of entry).
+              entry_price, entry_price, entry_features_json))
 
 
 def close_short(symbol: str) -> None:
@@ -658,8 +690,10 @@ def log_trade(trade: dict) -> None:
                 (ts,symbol,action,side,strategy,regime,price,exec_price,
                  shares,trade_value,pnl,slippage,on_fire,status,reason,
                  fee_total,net_pnl,gross_pnl,allocated_equity_pct,
-                 max_unrealized_pnl,min_unrealized_pnl)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 max_unrealized_pnl,min_unrealized_pnl,
+                 entry_features,exit_reason,exit_detail,
+                 peak_profit_pct,max_drawdown_pct,hold_time_seconds)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("timestamp", now),
             trade.get("symbol"),
@@ -682,6 +716,12 @@ def log_trade(trade: dict) -> None:
             trade.get("allocated_equity_pct"),
             trade.get("max_unrealized_pnl"),
             trade.get("min_unrealized_pnl"),
+            trade.get("entry_features"),
+            trade.get("exit_reason"),
+            trade.get("exit_detail"),
+            trade.get("peak_profit_pct"),
+            trade.get("max_drawdown_pct"),
+            trade.get("hold_time_seconds"),
         ))
 
 
