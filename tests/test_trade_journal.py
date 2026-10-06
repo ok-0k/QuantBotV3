@@ -396,3 +396,31 @@ def test_log_trade_serializes_dict_features(fresh):
     fresh.log_trade({"symbol": "X", "action": "short", "status": "skipped",
                      "entry_features": {"b": 2, "a": 1}})
     assert _skip_rows(fresh)[-1]["entry_features"] == '{"a": 1, "b": 2}'
+
+
+# ── Stop fills: at market when price is already beyond the stop ──────────────
+
+def test_stop_gapped_through_fills_at_market_not_stop(fresh):
+    """A stop that sat disabled (old fee gate) while price ran 5% past it must
+    book the real loss, not a fill at the stale stop level."""
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    _set_levels(fresh, "AAAUSDT", stop=avg)                      # break-even stop
+    _tick(fresh, "AAAUSDT", candles, high=avg * 1.06, low=avg * 1.04, close=avg * 1.05)
+    row = _trades(fresh, "cover")[0]
+    from config import SLIPPAGE_PCT
+    assert row["exec_price"] == pytest.approx(avg * 1.05 * (1 + SLIPPAGE_PCT), rel=1e-9)
+    assert row["gross_pnl"] < -0.04 * row["trade_value"]         # ~-5% booked, not ~0
+
+
+def test_stop_touched_then_reverted_fills_at_stop(fresh):
+    """Price wicked through the stop but is back below it: the stop-market
+    filled near the stop when it crossed, so book the stop level."""
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    stop = avg * 1.003
+    _set_levels(fresh, "AAAUSDT", stop=stop)
+    _tick(fresh, "AAAUSDT", candles, high=avg * 1.004, low=avg * 0.9995, close=avg * 1.001)
+    row = _trades(fresh, "cover")[0]
+    from config import SLIPPAGE_PCT
+    assert row["exec_price"] == pytest.approx(stop * (1 + SLIPPAGE_PCT), rel=1e-9)

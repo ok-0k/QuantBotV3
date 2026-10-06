@@ -1000,20 +1000,26 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         _apply_ml_time_decay(sym, pos, _recent)
     # ── END BREAK-EVEN / DECAY ────────────────────────────────────────────────
 
+    # Fill model: a take-profit is a resting limit -> fills AT tp. A stop is a
+    # stop-market -> fills at the stop only if price is still near it; if the
+    # market is already beyond the stop (gap, fast tape, or a stop that sat
+    # disabled), it fills at the current price. Filling every stop at its
+    # trigger level understated losses, e.g. a stop 5.7% under market booked ~$0.
+    _mark_now = float(candle.get("close", 0.0) or 0.0)
     if not is_short:
         if tp > 0 and candle_high >= tp:
             reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${tp:,.4f})"
             exit_price = tp
         elif stop > 0 and candle_low <= stop:
             reason = f"stop_loss_tick (low=${candle_low:,.4f} <= stop=${stop:,.4f})"
-            exit_price = stop
+            exit_price = min(stop, _mark_now) if _mark_now > 0 else stop
     else:
         if tp > 0 and candle_low <= tp:
             reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${tp:,.4f})"
             exit_price = tp
         elif stop > 0 and candle_high >= stop:
             reason = f"stop_loss_tick_short (high=${candle_high:,.4f} >= stop=${stop:,.4f})"
-            exit_price = stop
+            exit_price = max(stop, _mark_now)
 
     # Survival override: no standard SL/TP triggered yet but hard floor crossed.
     # Force an immediate market exit at the current close price.
