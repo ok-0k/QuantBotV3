@@ -112,7 +112,7 @@ def test_sac_veto_aborts_buy_without_cash_change(fresh):
     bot._execute_trade(ens, "TEST", candles, -0.5, ZERO_STATE, STARTING_CASH)
     assert fresh.get_all_positions() == []
     assert fresh.get_cash() == pytest.approx(STARTING_CASH)
-    # Veto path returns trade_value=0 -> logged as insufficient_funds skip
+    # Veto path returns trade_value=0 -> logged as a sac_veto skip
     row = _last_trade_row(fresh)
     assert row["status"] == "skipped"
 
@@ -473,3 +473,31 @@ def test_partial_exit_books_actual_fill_and_keeps_remainder(fresh, monkeypatch):
     # Cash refunded only for the closed half
     assert fresh.get_cash() == pytest.approx(
         (STARTING_CASH - 200.0) + cost + net, rel=1e-9)
+
+
+# ── Skip-reason labels for zero-size sizing outcomes ─────────────────────────
+
+def test_sac_veto_short_logged_as_sac_veto_not_margin(fresh):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    ens = _entry_ensemble(action="short", price=candles[-1]["close"], ml_prob=0.03)
+    bot._execute_trade(ens, "QF", candles, -0.5, ZERO_STATE, STARTING_CASH)
+    assert fresh.get_all_positions() == []
+    assert fresh.get_cash() == pytest.approx(STARTING_CASH)
+    row = _last_trade_row(fresh)
+    assert row["status"] == "skipped" and row["reason"] == "sac_veto"
+
+
+def test_sac_veto_buy_logged_as_sac_veto(fresh):
+    ens = _entry_ensemble(ml_prob=0.97)
+    bot._execute_trade(ens, "TEST", make_candles(n=120), -0.5, ZERO_STATE, STARTING_CASH)
+    assert _last_trade_row(fresh)["reason"] == "sac_veto"
+
+
+def test_edge_penalty_below_min_notional_labelled(fresh):
+    """size_mult small enough to push the order under $10 -> dedicated label."""
+    bot.brain._edge_profile("short", "trend_down")["size_mult"] = 1e-5
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    ens = _entry_ensemble(action="short", price=candles[-1]["close"], ml_prob=0.03)
+    bot._execute_trade(ens, "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    assert fresh.get_all_positions() == []
+    assert _last_trade_row(fresh)["reason"] == "size_below_min_notional"

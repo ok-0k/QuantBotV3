@@ -135,6 +135,9 @@ def init_db() -> None:
                 hold_time_seconds  INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_trades_sym ON trades(symbol, ts DESC);
+            -- trades is never pruned (it is the learning record), so time-range
+            -- reads (dashboard 7-day view, journal analysis) need their own index.
+            CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 
             CREATE TABLE IF NOT EXISTS positions (
                 symbol          TEXT PRIMARY KEY,

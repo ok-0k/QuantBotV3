@@ -1468,7 +1468,12 @@ def _prepare_trade(
             return None
 
     # ── Shared SAC-driven sizing (used by BUY and SHORT) ──────────────────────
+    # Set when sizing deliberately returns zero, so the skip row records the
+    # real cause instead of a misleading insufficient_funds/margin.
+    size_veto_reason: Optional[str] = None
+
     def _calc_trade_value() -> tuple[float, float, float]:
+        nonlocal size_veto_reason
         """
         Returns (trade_value, trade_pct, confidence_multiplier).
 
@@ -1521,6 +1526,7 @@ def _prepare_trade(
                 "SAC agent VETOED trade on %s (sac_fraction=%.4f, regime=%s)",
                 symbol, sac_fraction, ensemble.get("regime", "unknown"),
             )
+            size_veto_reason = "sac_veto"
             return 0.0, 0.0, confidence_multiplier
 
         else:
@@ -1565,6 +1571,7 @@ def _prepare_trade(
                 symbol, edge_side, regime, raw_size_mult,
                 trade_value, _BINANCE_MIN_NOTIONAL,
             )
+            size_veto_reason = "size_below_min_notional"
             return 0.0, 0.0, confidence_multiplier
 
         return trade_value, trade_pct, confidence_multiplier
@@ -1574,6 +1581,10 @@ def _prepare_trade(
         cash = get_cash()
         trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
 
+        if size_veto_reason:
+            trade_rec["reason"] = size_veto_reason
+            log_trade(trade_rec)
+            return None
         if cash < trade_value or trade_value < 1.0:
             trade_rec["reason"] = "insufficient_funds"
             log_trade(trade_rec)
@@ -1670,6 +1681,10 @@ def _prepare_trade(
         trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
         margin_reserved = trade_value * SHORT_MARGIN_PCT
 
+        if size_veto_reason:
+            trade_rec["reason"] = size_veto_reason
+            log_trade(trade_rec)
+            return None
         if cash < margin_reserved or margin_reserved < 1.0:
             trade_rec["reason"] = "insufficient_margin"
             log_trade(trade_rec)
