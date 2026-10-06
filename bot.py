@@ -591,38 +591,25 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
 
 # ── Fee-gate helpers (pure, no I/O, safe to call from async context) ─────────
 
-def _is_profitable_stop(avg_cost: float, stop: float, is_short: bool) -> bool:
-    """
-    Returns True if the current stop price represents a locked-profit level
-    (i.e. it has been trailed to break-even or better), meaning the fee-bleed
-    gate must be applied before allowing it to fire.
-
-    Long : stop >= avg_cost  (BE or above)
-    Short: stop <= avg_cost  (BE or below)
-
-    Protective loss stops (stop < entry for longs, stop > entry for shorts)
-    return False — they bypass the fee gate unconditionally.
-    """
-    if avg_cost <= 0 or stop <= 0:
-        return False
-    return (stop >= avg_cost) if not is_short else (stop <= avg_cost)
-
-
 def _classify_exit_reason(
     reason: Optional[str], avg_cost: float, stop: float, is_short: bool,
+    initial_stop: Optional[float] = None,
 ) -> str:
     """
     Map the free-text exit trigger onto a canonical code for the trade journal
     (so exits can be GROUP BY'd instead of regex'd).
 
-    Codes: TAKE_PROFIT, STOP_LOSS (initial protective stop), BREAKEVEN_STOP
-    (stop ratcheted to entry), TRAILING_STOP (stop ratcheted into profit),
-    HARD_STOP (USD survival kill-switch), TIME_HOLD_EXIT, MAX_HOLD,
-    CIRCUIT_BREAKER, OTHER.
+    Codes: TAKE_PROFIT, STOP_LOSS (initial protective stop, never moved),
+    TIGHTENED_STOP (still on the loss side of entry but pulled in from the
+    initial stop by time decay or the trail), BREAKEVEN_STOP (stop ratcheted
+    to entry), TRAILING_STOP (stop ratcheted into profit), HARD_STOP (USD
+    survival kill-switch), TIME_HOLD_EXIT, MAX_HOLD, CIRCUIT_BREAKER, OTHER.
 
-    A stop-triggered exit is split by where the stop sat relative to entry at
-    the moment it fired: the free-text reason alone cannot tell an initial
-    stop from a trailed one.
+    A stop-triggered exit is split by where the stop sat relative to entry —
+    and to the initial stop, when known — at the moment it fired: the
+    free-text reason alone cannot tell an initial stop from a moved one.
+    Without initial_stop (positions opened before it was recorded) a moved
+    loss-side stop is indistinguishable from the original: STOP_LOSS.
     """
     r = (reason or "").lower()
     if "circuit" in r:
@@ -640,9 +627,21 @@ def _classify_exit_reason(
             if abs(stop - avg_cost) <= avg_cost * 1e-9:
                 return "BREAKEVEN_STOP"
             in_profit = (stop < avg_cost) if is_short else (stop > avg_cost)
-            return "TRAILING_STOP" if in_profit else "STOP_LOSS"
+            if in_profit:
+                return "TRAILING_STOP"
+            if initial_stop and abs(stop - float(initial_stop)) > avg_cost * 1e-6:
+                return "TIGHTENED_STOP"
         return "STOP_LOSS"
     return "OTHER"
+
+
+def _initial_stop(pos: dict) -> Optional[float]:
+    """Initial stop recorded in the position's entry_features, or None."""
+    try:
+        v = json.loads(pos.get("entry_features") or "{}").get("initial_stop")
+        return float(v) if v else None
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _exit_journal_fields(pos: dict, is_short: bool, trade_rec: dict) -> dict:
@@ -686,24 +685,26 @@ def _profit_clears_fees(
     avg_cost: float, shares: float, exit_price: float, is_short: bool
 ) -> bool:
     """
-    Returns True if the unrealised profit at exit_price strictly exceeds the
-    Binance round-trip taker fee (FEE_GATE_ROUND_TRIP × position notional).
+    Returns True if closing at exit_price would BOOK a positive net PnL —
+    projected exactly as _prepare_trade/_commit_trade will book it: exit fill
+    slipped by SLIPPAGE_PCT against us, then net_realized_pnl()'s round-trip
+    fee. (The old check compared raw profit to the fee alone and ignored the
+    exit slippage, so ~half of all take-profit exits booked a net LOSS.)
 
-    This gates take_profit and profitable trailing-stop exits so the bot cannot
-    systematically close positions for less than the cost of two fills.
-    Hard stop_loss exits must bypass this function entirely.
+    Gates take_profit exits only. Stop exits of every kind must never be
+    routed through here — a stop is risk control, not a profit decision.
 
     Returns True (allow) on degenerate inputs so a missing field never blocks
     a legitimate exit.
     """
-    if avg_cost <= 0 or shares <= 0:
+    if avg_cost <= 0 or shares <= 0 or exit_price <= 0:
         return True
-    notional = shares * avg_cost
-    profit = (
-        shares * (avg_cost - exit_price) if is_short
-        else shares * (exit_price - avg_cost)
-    )
-    return profit > notional * FEE_GATE_ROUND_TRIP
+    fill = exit_price * (1 + SLIPPAGE_PCT) if is_short else exit_price * (1 - SLIPPAGE_PCT)
+    entry_notional = shares * avg_cost
+    exit_notional = shares * fill
+    gross = entry_notional - exit_notional if is_short else exit_notional - entry_notional
+    _, net = net_realized_pnl(gross, entry_notional, exit_notional)
+    return net > 0.0
 
 
 def _hard_stop_open_pnl(pos: dict, mark_price: float) -> float:
@@ -904,17 +905,17 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         return
 
     # ── FEE-BLEED GATE (tick path) ────────────────────────────────────────────
-    # Block take_profit and profitable trailing-stop (BE or better) exits whose
-    # unrealised profit does not yet clear the Binance round-trip taker fee
-    # (≈ 0.12% of notional).  Hard stop_loss exits that are still below entry
-    # bypass this gate unconditionally — never delay a loss-protection exit.
-    # Survival kill-switch exits ALSO bypass: a $-15 loss must close regardless.
+    # Hold a take_profit exit until it would book a positive NET (after exit
+    # slippage + round-trip fee). Take-profit only: stop exits of every kind —
+    # including trailed / break-even stops — always fire. Gating trailed stops
+    # used to disable them outright once price crossed back through entry
+    # (profit can never clear fees there), leaving only the $ hard stop.
     _shares_tick = float(pos.get("shares", 0.0))
-    if not _is_survival and ("take_profit" in reason or _is_profitable_stop(avg_cost, stop, is_short)):
+    if not _is_survival and "take_profit" in reason:
         if not _profit_clears_fees(avg_cost, _shares_tick, exit_price, is_short):
             log.info(
-                "FEE GATE blocked %s for %s — profit does not clear %.2f%% round-trip fees",
-                reason, sym, FEE_GATE_ROUND_TRIP * 100,
+                "FEE GATE blocked %s for %s — net after %.2f%% fees + %.2f%% exit slippage would be <= 0",
+                reason, sym, FEE_GATE_ROUND_TRIP * 100, SLIPPAGE_PCT * 100,
             )
             return
     # ── END FEE-BLEED GATE ────────────────────────────────────────────────────
@@ -926,7 +927,8 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         candles = _candles_cache.get(sym, [])
         fake_ensemble = {
             "signal":             "cover" if is_short else "sell",
-            "exit_reason":        _classify_exit_reason(reason, float(avg_cost), float(stop or 0.0), is_short),
+            "exit_reason":        _classify_exit_reason(
+                reason, float(avg_cost), float(stop or 0.0), is_short, _initial_stop(pos)),
             "exit_detail":        reason,
             "symbol":             sym,
             "price":              exit_price,
@@ -2016,6 +2018,15 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         trade_value = shares * exec_price
         margin_reserved = trade_value * SHORT_MARGIN_PCT
         trade_rec["exec_price"] = exec_price
+        if prepared.entry_features is not None and exec_price > 0:
+            # Final levels as booked (re-derived above if the fill moved), so
+            # the exit classifier can tell a moved stop from the original.
+            prepared.entry_features.update({
+                "initial_stop": stop_price,
+                "initial_tp": tp_price,
+                "stop_pct": round((stop_price - exec_price) / exec_price * 100.0, 4),
+                "tp_pct": round((exec_price - tp_price) / exec_price * 100.0, 4),
+            })
 
         # Fix #22: open_short() before set_cash(), and guarded. open_short()
         # raises ValueError instead of silently overwriting an already-active
@@ -2362,10 +2373,9 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                     reason = f"max_hold_time ({count} candles)"
 
             # ── FEE-BLEED GATE (monitor path) ─────────────────────────────────
-            # Take-profit and profitable trailing-stop exits are held until
-            # unrealised profit clears round-trip fees.
-            # Bypassed for: hard_stop_survival, time_hold_exit, max_hold_time,
-            # and all raw stop_loss exits (loss-protection must never be delayed).
+            # Take-profit exits are held until they would book a positive net
+            # (exit slippage + round-trip fee). Stops of every kind always fire
+            # — see the tick-path gate for why trailed stops are not gated.
             _fee_gate_applies = reason and not any(
                 k in reason for k in (
                     "hard_stop_survival", "time_hold_exit", "max_hold_time",
@@ -2374,11 +2384,11 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
             if _fee_gate_applies:
                 _avg_cost_m = float(pos.get("avg_cost", 0.0))
                 _shares_m   = float(pos.get("shares", 0.0))
-                if "take_profit" in reason or _is_profitable_stop(_avg_cost_m, stop, is_short):
+                if "take_profit" in reason:
                     if not _profit_clears_fees(_avg_cost_m, _shares_m, current_price, is_short):
                         log.info(
-                            "FEE GATE blocked %s for %s — profit does not clear %.2f%% round-trip fees",
-                            reason, sym, FEE_GATE_ROUND_TRIP * 100,
+                            "FEE GATE blocked %s for %s — net after %.2f%% fees + %.2f%% exit slippage would be <= 0",
+                            reason, sym, FEE_GATE_ROUND_TRIP * 100, SLIPPAGE_PCT * 100,
                         )
                         reason = None
             # ── END FEE-BLEED GATE ────────────────────────────────────────────
@@ -2388,7 +2398,8 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                 fake_ensemble = {
                     "signal":             "cover" if is_short else "sell",
                     "exit_reason":        _classify_exit_reason(
-                        reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short),
+                        reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short,
+                        _initial_stop(pos)),
                     "exit_detail":        reason,
                     "symbol":             sym,
                     "price":              current_price,

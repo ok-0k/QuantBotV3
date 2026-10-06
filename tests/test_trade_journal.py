@@ -124,6 +124,30 @@ def test_classify_exit_reason(reason, avg, stop, short, expected):
     assert bot._classify_exit_reason(reason, avg, stop, short) == expected
 
 
+@pytest.mark.parametrize("stop,initial,short,expected", [
+    (100.2, 100.55, True, "TIGHTENED_STOP"),   # short stop pulled in, still above entry
+    (100.55, 100.55, True, "STOP_LOSS"),       # never moved
+    (100.2, None, True, "STOP_LOSS"),          # pre-initial_stop position: can't tell
+    (99.8, 100.55, True, "TRAILING_STOP"),     # moved into profit
+    (100.0, 100.55, True, "BREAKEVEN_STOP"),
+    (99.8, 99.45, False, "TIGHTENED_STOP"),    # long stop pulled up, still below entry
+    (99.45, 99.45, False, "STOP_LOSS"),
+])
+def test_classify_with_initial_stop(stop, initial, short, expected):
+    got = bot._classify_exit_reason("stop_loss_tick (x)", 100.0, stop, short, initial)
+    assert got == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('{"initial_stop": 3.41, "ml_tier": 80}', 3.41),
+    ('{"ml_tier": 80}', None),
+    (None, None),
+    ("not json", None),
+])
+def test_initial_stop_parse(raw, expected):
+    assert bot._initial_stop({"entry_features": raw}) == expected
+
+
 # ── Excursion / hold-time math ───────────────────────────────────────────────
 
 def _opened(seconds_ago):
@@ -176,6 +200,11 @@ def test_short_entry_captures_features_and_seeds_excursions(fresh):
     assert feats["short_score"] == 0.71 and feats["adx"] == 27.5
     assert feats["stop_pct"] > 0 and feats["tp_pct"] > 0
     assert feats["equity"] == STARTING_CASH
+    # booked levels are recorded so a later stop move can be detected
+    assert feats["initial_stop"] == pytest.approx(pos["stop_price"])
+    assert feats["initial_tp"] == pytest.approx(pos["tp_price"])
+    assert feats["stop_pct"] == pytest.approx(
+        (pos["stop_price"] - pos["avg_cost"]) / pos["avg_cost"] * 100, abs=1e-3)
     # the entry row carries the same snapshot
     entry = _trades(fresh, "short")[0]
     assert json.loads(entry["entry_features"]) == feats
@@ -234,3 +263,88 @@ def test_tick_exit_path_stamps_canonical_reason(fresh):
     assert row["max_drawdown_pct"] == 0.0
     assert row["hold_time_seconds"] is not None and row["hold_time_seconds"] < 30
     assert json.loads(row["entry_features"])["regime"] == "trend_down"
+
+
+# ── Exit gates: stops always fire; take-profit only when net-positive ────────
+
+def _set_levels(db, symbol, stop=None, tp=None):
+    with db.get_db() as conn:
+        if stop is not None:
+            conn.execute("UPDATE positions SET stop_price=? WHERE symbol=?", (stop, symbol))
+        if tp is not None:
+            conn.execute("UPDATE positions SET tp_price=? WHERE symbol=?", (tp, symbol))
+
+
+def _tick(db, symbol, candles, high, low, close):
+    bot._candles_cache[symbol] = candles
+    candle = {"open": close, "high": high, "low": low, "close": close,
+              "volume": 1.0, "time": candles[-1]["time"] + 60_000}
+
+    async def run():
+        await bot._tick_exit_check(symbol, candle, asyncio.get_running_loop())
+    asyncio.run(run())
+
+
+def test_trailed_stop_fires_after_price_reverses_through_entry(fresh):
+    """Regression: the fee gate used to block a profit-side stop forever once
+    price crossed back above entry, leaving the short with no stop at all."""
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    _set_levels(fresh, "AAAUSDT", stop=avg * 0.999)          # trailed into profit
+    _tick(fresh, "AAAUSDT", candles, high=avg * 1.004, low=avg * 1.001, close=avg * 1.003)
+    assert fresh.get_all_positions() == []
+    row = _trades(fresh, "cover")[0]
+    assert row["exit_reason"] == "TRAILING_STOP"
+
+
+def test_tightened_stop_labelled_end_to_end(fresh):
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    _set_levels(fresh, "AAAUSDT", stop=avg * 1.002)          # pulled in, still a loss stop
+    _tick(fresh, "AAAUSDT", candles, high=avg * 1.003, low=avg * 1.0005, close=avg * 1.0025)
+    assert fresh.get_all_positions() == []
+    assert _trades(fresh, "cover")[0]["exit_reason"] == "TIGHTENED_STOP"
+
+
+def test_take_profit_held_when_it_would_book_a_net_loss(fresh):
+    """A TP 0.21% below entry clears the 0.20% fee on raw profit (old check
+    passed) but loses after exit slippage — it must be held, not booked."""
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    tp = avg * (1 - 0.0021)
+    _set_levels(fresh, "AAAUSDT", tp=tp)
+    _tick(fresh, "AAAUSDT", candles, high=avg, low=tp, close=avg * 0.999)
+    assert len(fresh.get_all_positions()) == 1
+    assert _trades(fresh, "cover") == []
+
+
+def test_take_profit_books_positive_net_when_allowed(fresh):
+    candles, _ = _open_short(fresh)
+    avg = fresh.get_all_positions()[0]["avg_cost"]
+    tp = avg * (1 - 0.005)
+    _set_levels(fresh, "AAAUSDT", tp=tp)
+    _tick(fresh, "AAAUSDT", candles, high=avg, low=tp, close=tp)
+    assert fresh.get_all_positions() == []
+    row = _trades(fresh, "cover")[0]
+    assert row["exit_reason"] == "TAKE_PROFIT" and row["net_pnl"] > 0
+
+
+@pytest.mark.parametrize("is_short", [True, False])
+def test_fee_gate_projection_matches_booked_net(is_short):
+    """The gate's go/no-go flips exactly where the booked net crosses zero."""
+    from accounting_v2 import net_realized_pnl
+    from config import SLIPPAGE_PCT
+    avg, shares = 100.0, 3.0
+
+    def booked_net(px):   # mirrors _prepare_trade slippage + _commit_trade booking
+        fill = px * (1 + SLIPPAGE_PCT) if is_short else px * (1 - SLIPPAGE_PCT)
+        e, x = shares * avg, shares * fill
+        return net_realized_pnl((e - x) if is_short else (x - e), e, x)[1]
+
+    favour = -1.0 if is_short else 1.0
+    for move_bp in range(0, 80):                    # 0 .. 0.79% in our favour
+        px = avg * (1 + favour * move_bp / 10_000)
+        assert bot._profit_clears_fees(avg, shares, px, is_short) == (booked_net(px) > 0), move_bp
+    # and the old raw-profit rule really did pass a net-losing exit
+    px = avg * (1 + favour * 0.0021)
+    assert booked_net(px) < 0 and not bot._profit_clears_fees(avg, shares, px, is_short)
