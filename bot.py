@@ -635,6 +635,46 @@ def _classify_exit_reason(
     return "OTHER"
 
 
+def _entry_snapshot(
+    ensemble: dict, action: str, regime: str, strategy_name: str,
+    sac_fraction: Optional[float], total_equity: float,
+) -> dict:
+    """
+    Signal-time decision snapshot for the trade journal, taken BEFORE any
+    entry gate runs so skipped entries (ML gate, stale data, SAC veto, sizing,
+    margin, duplicates) are journaled with the same features as fills.
+    Sizing and stop/target levels are added by _prepare_trade as computed.
+
+    Telemetry only: read-only (no edge-profile side effects) and never raises
+    into the money path.
+    """
+    try:
+        meta = ensemble.get("meta") or {}
+        side = "short" if action == "short" else "long"
+        raw_p = ensemble.get("ml_prob")
+        ml_p = None if raw_p is None else float(raw_p)
+        conviction = None if ml_p is None else ((1.0 - ml_p) if side == "short" else ml_p)
+        ep = brain._edge_profiles.get(brain._edge_key(side, regime)) or {}
+        snap: dict = {
+            "ml_prob": None if ml_p is None else round(ml_p, 6),
+            "ml_down": None if ml_p is None else round(1.0 - ml_p, 6),
+            "ml_tier": None if conviction is None else int(conviction * 100) // 5 * 5,
+            "regime": regime,
+            "strategy": strategy_name,
+            "sac_fraction": None if sac_fraction is None else round(float(sac_fraction), 6),
+            "edge_size_mult": round(float(ep.get("size_mult", 1.0)), 4),
+            "edge_rr_mult": round(float(ep.get("rr_mult", 1.0)), 4),
+            "equity": round(float(total_equity), 2),
+        }
+        for k in ("short_score", "adx", "pdi", "mdi", "rvol", "ret5", "ret20",
+                  "ema_spread", "ml_component", "struct_component"):
+            snap[k] = meta.get(k)
+        return snap
+    except Exception as exc:   # pragma: no cover - defensive
+        log.debug("entry snapshot failed (%s) — journaling without features", exc)
+        return {"snapshot_error": str(exc)}
+
+
 def _initial_stop(pos: dict) -> Optional[float]:
     """Initial stop recorded in the position's entry_features, or None."""
     try:
@@ -1417,6 +1457,11 @@ def _prepare_trade(
     if ensemble.get("exit_reason"):
         trade_rec["exit_reason"] = ensemble["exit_reason"]
         trade_rec["exit_detail"] = ensemble.get("exit_detail")
+    # Entries: journal the decision snapshot on every outcome, skips included.
+    if action in ("buy", "short"):
+        trade_rec["entry_features"] = _entry_snapshot(
+            ensemble, action, regime, strategy_name, sac_fraction, total_equity,
+        )
 
     # ── HARD ML CONFIDENCE GATE (defense-in-depth) ────────────────────────────
     # Single source of truth for entries. brain.get_ensemble_signal already
@@ -1580,6 +1625,10 @@ def _prepare_trade(
     if action == "buy":
         cash = get_cash()
         trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
+        trade_rec["entry_features"].update({
+            "conviction_mult": round(float(confidence_multiplier), 4),
+            "trade_pct": round(float(trade_pct), 6),
+        })
 
         if size_veto_reason:
             trade_rec["reason"] = size_veto_reason
@@ -1679,6 +1728,10 @@ def _prepare_trade(
     elif action == "short":
         cash = get_cash()
         trade_value, trade_pct, confidence_multiplier = _calc_trade_value()
+        trade_rec["entry_features"].update({
+            "conviction_mult": round(float(confidence_multiplier), 4),
+            "trade_pct": round(float(trade_pct), 6),
+        })
         margin_reserved = trade_value * SHORT_MARGIN_PCT
 
         if size_veto_reason:
@@ -1726,33 +1779,13 @@ def _prepare_trade(
             log_trade(trade_rec)
             return None
 
-        _meta = ensemble.get("meta") or {}
-        _ml_p = float(ensemble.get("ml_prob", 0.5))
-        _ml_down = 1.0 - _ml_p
-        _ep_snap = brain._edge_profile("short", regime)
-        _entry_features = {
-            "ml_prob": round(_ml_p, 6),
-            "ml_down": round(_ml_down, 6),
-            "ml_tier": int(_ml_down * 100) // 5 * 5,   # 80, 85, ... 100
-            "regime": regime,
-            "strategy": strategy_name,
-            "short_score": _meta.get("short_score"),
-            "adx": _meta.get("adx"), "pdi": _meta.get("pdi"), "mdi": _meta.get("mdi"),
-            "rvol": _meta.get("rvol"), "ret5": _meta.get("ret5"), "ret20": _meta.get("ret20"),
-            "ema_spread": _meta.get("ema_spread"),
-            "ml_component": _meta.get("ml_component"),
-            "struct_component": _meta.get("struct_component"),
+        _entry_features = trade_rec["entry_features"]
+        _entry_features.update({
             "atr_pct": round(atr_now / exec_price, 6) if exec_price else None,
             "stop_pct": round((stop_price - exec_price) / exec_price * 100.0, 4),
             "tp_pct": round((exec_price - tp_price) / exec_price * 100.0, 4),
-            "sac_fraction": None if sac_fraction is None else round(float(sac_fraction), 6),
-            "conviction_mult": round(float(confidence_multiplier), 4),
-            "trade_pct": round(float(trade_pct), 6),
-            "edge_size_mult": round(float(_ep_snap.get("size_mult", 1.0)), 4),
-            "edge_rr_mult": round(float(_ep_snap.get("rr_mult", 1.0)), 4),
-            "equity": round(float(total_equity), 2),
             "is_yolo": bool(is_yolo),
-        }
+        })
 
         return _PreparedTrade(
             action=action, symbol=symbol,

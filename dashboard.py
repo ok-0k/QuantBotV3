@@ -28,6 +28,7 @@ from db import (
     get_cash,
     get_cash_curve_from_trades,
     get_equity_curve,
+    get_equity_curve_since,
     get_equity_rebase,
     get_filled_trade_count,
     get_portfolio_stat,
@@ -100,16 +101,30 @@ def _van_week_day_prefixes() -> list[tuple[str, str]]:
 
 
 def _downsample_equity(curve: list[dict], max_points: int) -> list[dict]:
-    """LTTB-inspired uniform downsampler: keep at most max_points from the curve."""
+    """
+    Keep at most max_points, evenly spaced in TIME (first point of each equal
+    time bucket; the final bucket is represented by the latest point).
+
+    Index-uniform thinning distorted mixed-density history — 30 s points for
+    the last 2 days, 5-minute points before that (prune_db.sh) — by giving the
+    dense recent stretch most of the chart width.
+    """
     n = len(curve)
-    if n <= max_points:
+    if n <= max_points or max_points < 2:
         return curve
-    step = n / max_points
-    out = [curve[0]]
-    for i in range(1, max_points - 1):
-        idx = int(i * step)
-        out.append(curve[idx])
-    out.append(curve[-1])
+    times = [_parse_equity_ts(str(pt.get("time", ""))) for pt in curve]
+    span = (times[-1] - times[0]).total_seconds()
+    if span <= 0:
+        return [curve[0], curve[-1]]
+    width = span / (max_points - 1)
+    out: list[dict] = []
+    last_bucket = -1
+    for pt, t in zip(curve, times):
+        bucket = int((t - times[0]).total_seconds() // width)
+        if bucket != last_bucket:
+            out.append(pt)
+            last_bucket = bucket
+    out[-1] = curve[-1]
     return out
 
 
@@ -468,8 +483,9 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cutoff_utc = now_utc - datetime.timedelta(minutes=tf_minutes)
     if tf in ("1W", "1M"):
-        # Use all available data but downsample heavily
-        equity_window = equity_curve_raw
+        # Long windows read their exact time range (history beyond 2 days is
+        # retained at 5-minute resolution) rather than the row-capped raw curve.
+        equity_window = get_equity_curve_since(cutoff_utc.isoformat()) or equity_curve_raw[-max_pts:]
     else:
         equity_window = [
             pt for pt in equity_curve_raw

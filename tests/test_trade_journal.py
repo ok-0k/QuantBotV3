@@ -348,3 +348,51 @@ def test_fee_gate_projection_matches_booked_net(is_short):
     # and the old raw-profit rule really did pass a net-losing exit
     px = avg * (1 + favour * 0.0021)
     assert booked_net(px) < 0 and not bot._profit_clears_fees(avg, shares, px, is_short)
+
+
+# ── Skipped entries carry the decision snapshot ──────────────────────────────
+
+def _skip_rows(db):
+    with db.get_db() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM trades WHERE status='skipped' ORDER BY id")]
+
+
+def test_sac_veto_skip_is_journaled_with_features(fresh):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    bot._execute_trade(_short_ensemble("AAAUSDT", candles[-1]["close"]), "QF_TR_S7_M95",
+                       candles, -0.5, ZERO_STATE, STARTING_CASH)
+    row = _skip_rows(fresh)[-1]
+    assert row["reason"] == "sac_veto"
+    f = json.loads(row["entry_features"])
+    assert f["ml_tier"] == 95 and f["regime"] == "trend_down" and f["adx"] == 27.5
+    assert f["sac_fraction"] == -0.5 and f["trade_pct"] == 0.0
+    assert "stop_pct" not in f            # never got as far as pricing levels
+
+
+def test_ml_gate_skip_journaled_without_side_effects(fresh):
+    """A gate skip records the snapshot but must not create edge-profile state."""
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    bot._execute_trade(_short_ensemble("AAAUSDT", candles[-1]["close"], ml_prob=0.5),
+                       "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    row = _skip_rows(fresh)[-1]
+    f = json.loads(row["entry_features"])
+    assert f["ml_tier"] == 50 and "conviction_mult" not in f   # gated before sizing
+    assert bot.brain._edge_profiles == {}
+
+
+def test_missing_ml_prob_skip_does_not_crash(fresh):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    ens = _short_ensemble("AAAUSDT", candles[-1]["close"])
+    ens.pop("ml_prob")
+    bot._execute_trade(ens, "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    row = _skip_rows(fresh)[-1]
+    assert row["reason"] == "ml_gate_missing_prob"
+    f = json.loads(row["entry_features"])
+    assert f["ml_prob"] is None and f["ml_tier"] is None and f["regime"] == "trend_down"
+
+
+def test_log_trade_serializes_dict_features(fresh):
+    fresh.log_trade({"symbol": "X", "action": "short", "status": "skipped",
+                     "entry_features": {"b": 2, "a": 1}})
+    assert _skip_rows(fresh)[-1]["entry_features"] == '{"a": 1, "b": 2}'

@@ -687,6 +687,9 @@ def log_trade(trade: dict) -> None:
     with all existing log_trade() call sites in bot.py.
     """
     now = datetime.now(timezone.utc).isoformat()
+    entry_features = trade.get("entry_features")
+    if entry_features is not None and not isinstance(entry_features, str):
+        entry_features = json.dumps(entry_features, default=str, sort_keys=True)
     with get_db() as conn:
         conn.execute("""
             INSERT INTO trades
@@ -719,7 +722,7 @@ def log_trade(trade: dict) -> None:
             trade.get("allocated_equity_pct"),
             trade.get("max_unrealized_pnl"),
             trade.get("min_unrealized_pnl"),
-            trade.get("entry_features"),
+            entry_features,
             trade.get("exit_reason"),
             trade.get("exit_detail"),
             trade.get("peak_profit_pct"),
@@ -832,6 +835,22 @@ def get_equity_curve(limit: int = 500) -> list[dict]:
     # raw UTC strings (all its format strings require %H:%M:%S).
     return [{"time": r["ts"][:19].replace("T", " "), "equity": r["equity"]}
             for r in reversed(rows)]
+
+
+def get_equity_curve_since(cutoff_iso: str) -> list[dict]:
+    """Equity points at or after cutoff_iso (UTC ISO-8601), oldest first.
+
+    For long chart windows (1W/1M): history past 2 days is kept at 5-minute
+    resolution by prune_db.sh, so a time-bounded read is both complete and
+    cheaper than over-fetching by row count.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, equity FROM equity_curve WHERE ts >= ? ORDER BY ts",
+            (cutoff_iso,),
+        ).fetchall()
+    return [{"time": r["ts"][:19].replace("T", " "), "equity": r["equity"]}
+            for r in rows]
 
 
 def get_trades_last_7_days() -> list[dict]:
