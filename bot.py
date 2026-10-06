@@ -74,7 +74,7 @@ from config import (
     SLIPPAGE_PCT, SYMBOLS,
     SHORT_MARGIN_PCT, SHORT_MAX_OPEN, SYMBOL_COOLDOWN_SECS,
     DECAY_HALFLIFE_CANDLES, DECAY_MIN_CANDLES,
-    DECAY_SL_TIGHTEN_STRENGTH, DECAY_TP_PULL_STRENGTH,
+    DECAY_SL_TIGHTEN_STRENGTH, DECAY_TP_PULL_STRENGTH, EXPERIMENT_NAME,
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
@@ -110,7 +110,7 @@ from db import (
     open_position, open_position_count,
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
     upsert_candle, upsert_candles_bulk, open_short, close_short,
-    get_short_position, open_short_count, update_stop_price, update_tp_price, update_mfe_mae,
+    get_short_position, get_all_short_positions, open_short_count, update_stop_price, update_tp_price, update_mfe_mae,
     get_open_orders, reduce_position, try_create_order, update_order,
 )
 
@@ -348,13 +348,89 @@ async def _refresh_margin_health(
     return _margin_health_cache
 
 
+def _experiment_arm(symbol: str) -> Optional[str]:
+    """Arm ("A"/"B") of the active experiment for a symbol, or None if off.
+
+    Alternates in SYMBOLS order: balanced, deterministic, splits the majors.
+    """
+    if not EXPERIMENT_NAME:
+        return None
+    try:
+        idx = SYMBOLS.index(symbol)
+    except ValueError:
+        idx = sum(symbol.encode())        # stable fallback for unknown symbols
+    return "A" if idx % 2 == 0 else "B"
+
+
+def _short_slots_full(symbol: str) -> bool:
+    """SHORT_MAX_OPEN check; split evenly per arm while an experiment runs."""
+    arm = _experiment_arm(symbol)
+    if arm is None:
+        return open_short_count() >= SHORT_MAX_OPEN
+    per_arm = math.ceil(SHORT_MAX_OPEN / 2)
+    same_arm = sum(1 for p in get_all_short_positions() if _experiment_arm(p["symbol"]) == arm)
+    return same_arm >= per_arm
+
+
+def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
+    """
+    Time decay as designed (experiment decay_v2, arm B): λ = 1 − e^(−t/τ) with
+    t = wall-clock minutes since entry (INTERVAL is 1m, so τ in candles == τ
+    in minutes), applied to the INITIAL stop/target recorded at entry. Being a
+    pure function of age it is idempotent however often it is called; it only
+    ever tightens, never loosens a level the trail / break-even already moved.
+    """
+    try:
+        entry = float(pos.get("avg_cost") or 0.0)
+        tp0 = float(feats["initial_tp"])
+        sl0 = float(feats["initial_stop"])
+        opened = datetime.fromisoformat(str(pos.get("opened_ts")).replace("Z", "+00:00"))
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return
+    age_min = (time.time() - opened.timestamp()) / 60.0
+    if entry <= 0 or tp0 <= 0 or sl0 <= 0 or age_min < DECAY_MIN_CANDLES:
+        return
+    lam = 1.0 - math.exp(-age_min / max(DECAY_HALFLIFE_CANDLES, 1e-6))
+    if lam < 0.03:
+        return
+    stop = float(pos.get("stop_price", 0.0) or 0.0)
+    tp = float(pos.get("tp_price", 0.0) or 0.0)
+    target_tp = entry + (tp0 - entry) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
+    target_sl = sl0 + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - sl0)
+    if pos.get("side", "long") == "short":
+        if tp < target_tp < entry - 1e-9:
+            update_tp_price(sym, target_tp)
+        if entry + 1e-9 < target_sl < stop:
+            update_stop_price(sym, target_sl)
+    else:
+        if entry + 1e-9 < target_tp < tp:
+            update_tp_price(sym, target_tp)
+        if stop < target_sl < entry - 1e-9:
+            update_stop_price(sym, target_sl)
+
+
 def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
     """
     Exponential time-decay on stagnant risk targets: λ = 1 − e^(−t/τ).
 
     Pulls TP toward entry (sooner monetisation) and tightens stop — variance
     collapses when edge does not materialise (optional stopping / real-options view).
+
+    Positions entered in arm B of experiment decay_v2 use the as-designed
+    implementation; everything else (arm A, pre-experiment positions) keeps
+    the legacy path below, which compounds on every call — see config.py.
     """
+    try:
+        feats = json.loads(pos.get("entry_features") or "{}")
+    except (TypeError, ValueError):
+        feats = {}
+    if (feats.get("experiment") == "decay_v2" and feats.get("arm") == "B"
+            and feats.get("initial_tp") and feats.get("initial_stop")):
+        _apply_designed_time_decay(sym, pos, feats)
+        return
+
     count = int(pos.get("candle_count", 0))
     # Do not apply any decay until the trade has had DECAY_MIN_CANDLES bars to
     # develop.  Without this guard, decay starts within ~8 candles (λ≥0.03 at
@@ -666,6 +742,10 @@ def _entry_snapshot(
             "edge_rr_mult": round(float(ep.get("rr_mult", 1.0)), 4),
             "equity": round(float(total_equity), 2),
         }
+        arm = _experiment_arm(str(ensemble.get("symbol", "")))
+        if arm is not None:
+            snap["experiment"] = EXPERIMENT_NAME
+            snap["arm"] = arm
         for k in ("short_score", "adx", "pdi", "mdi", "rvol", "ret5", "ret20",
                   "ema_spread", "ml_component", "struct_component"):
             snap[k] = meta.get(k)
@@ -1211,7 +1291,7 @@ async def _evaluate_and_trade(
 
     if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
         return
-    if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
+    if direction == "short" and _short_slots_full(symbol):
         return
     # Fix #22: a short already open on this symbol must never be re-opened —
     # open_short()'s INSERT OR REPLACE would silently orphan the first short's
@@ -1267,7 +1347,7 @@ async def _evaluate_and_trade(
                 open_positions = get_all_positions()
                 if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
                     return
-                if direction == "short" and open_short_count() >= SHORT_MAX_OPEN:
+                if direction == "short" and _short_slots_full(symbol):
                     return
                 # Fix #22 (re-check): close the TOCTOU window between the early
                 # gate above and acquiring this commit frame's lock.

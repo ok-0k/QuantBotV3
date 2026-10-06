@@ -336,6 +336,20 @@ DECAY_MIN_CANDLES: int = 30
 DECAY_TP_PULL_STRENGTH: float = 0.15  # fraction of distance to entry per unit λ
 DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 
+# ── CONTROLLED EXPERIMENT (symbol-split A/B, paper) ──────────────────────────
+# Symbols alternate between arm A and arm B in SYMBOLS order (balanced, majors
+# split). The arm is recorded in every entry's entry_features, and each arm
+# gets its own share of SHORT_MAX_OPEN slots so a slow-exiting arm cannot
+# starve the other. Set EXPERIMENT_NAME="" (env) to switch off.
+#
+# decay_v2 (started 2026-10-06):
+#   A = legacy time decay: re-applied to the CURRENT stop/target on every
+#       websocket update (~every 2 s), with a "candle" clock that ticks every
+#       30 s — compounding collapses TP and SL onto entry ~15-20 min in.
+#   B = decay as designed: lambda = 1 - exp(-age_min / DECAY_HALFLIFE_CANDLES)
+#       from wall-clock age, applied to the INITIAL levels (idempotent).
+EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "decay_v2").strip()
+
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
 # ═════════════════════════════════════════════════════════════════════════════
