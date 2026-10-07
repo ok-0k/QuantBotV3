@@ -103,7 +103,7 @@ def zscore_mr(p, mask, window: int, z_in: float = 2.5, z_out: float = 0.5):
 
 def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
                   switch_cost: float = 0.0031, capital_eff: float = 1 / 1.2,
-                  premium: pd.DataFrame | None = None) -> pd.DataFrame:
+                  premium: pd.DataFrame | None = None, return_state: bool = False):
     """Delta-neutral cash-and-carry on perps: hold long spot + short perp while
     trailing mean funding (per 8h) > theta_on; exit below theta_on / 2.
 
@@ -130,4 +130,5 @@ def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
         basis = -(prem.shift(-1) - prem)
         income = income + (on * basis.fillna(0.0)) * capital_eff
     switches = on.diff().abs().fillna(on.abs())
-    return (income - switches * switch_cost * capital_eff).where(funding.notna())
+    out = (income - switches * switch_cost * capital_eff).where(funding.notna())
+    return (out, on) if return_state else out
