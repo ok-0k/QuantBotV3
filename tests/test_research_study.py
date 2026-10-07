@@ -38,7 +38,7 @@ def test_study_runs_end_to_end_on_synthetic_data(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(study, "build_panel", _synthetic_panel)
     monkeypatch.setattr(study, "load_funding", _synthetic_funding)
     monkeypatch.setattr(study, "ROOT", tmp_path)
-    study.main()
+    study.main([])
     out = next((tmp_path / "results").iterdir())
     summary = json.loads((out / "summary.json").read_text())
     names = {s.name for s in study.specs()}

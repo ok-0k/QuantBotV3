@@ -145,6 +145,44 @@ def load_funding(symbol: str, start, end=None) -> pd.Series:
     return s
 
 
+PERP_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndexKlines"
+
+
+def load_premium(symbol: str, start, end=None) -> pd.Series:
+    """Perp premium index (perp vs spot index, as a fraction) at 8h bar
+    closes, indexed by close time — the basis of a spot/perp hedge."""
+    step = INTERVAL_MS["1h"] * 8
+    now = int(time.time() * 1000)
+    start = to_ms(start) // step * step
+    end = min(to_ms(end) if end is not None else now, now // step * step)
+    path = ROOT / "premium_8h" / f"{symbol}.npz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    have = dict(np.load(path)) if path.exists() else {"t": np.array([], np.int64), "c": np.array([])}
+    t = start if have["t"].size == 0 or have["t"][0] > start else int(have["t"][-1]) + step
+    new_t, new_c = [], []
+    while t < end:
+        rows = _get(f"{PERP_PREMIUM}?symbol={symbol}&interval=8h&startTime={t}&endTime={end - 1}&limit=1500")
+        time.sleep(_THROTTLE_S)
+        if not rows:
+            break
+        for k in rows:
+            new_t.append(int(k[0])); new_c.append(float(k[4]))
+        nxt = int(rows[-1][0]) + step
+        if nxt <= t:
+            break
+        t = nxt
+    if new_t:
+        tt = np.concatenate([have["t"], np.asarray(new_t, np.int64)])
+        cc = np.concatenate([have["c"], np.asarray(new_c)])
+        tt, keep = np.unique(tt, return_index=True)
+        cc = cc[keep]
+        done = tt + step <= now
+        have = {"t": tt[done], "c": cc[done]}
+        np.savez(path, **have)
+    sel = (have["t"] >= start) & (have["t"] < end)
+    return pd.Series(have["c"][sel], index=pd.to_datetime(have["t"][sel] + step, unit="ms", utc=True))
+
+
 def build_panel(symbols, interval: str, start, end=None) -> dict[str, pd.DataFrame]:
     """Aligned OHLC + quote-volume panel (DataFrames time x symbol), close-time index.
 

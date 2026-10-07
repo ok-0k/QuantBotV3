@@ -150,3 +150,53 @@ def test_funding_carry_earns_funding_net_of_switch_costs():
     r = S.funding_carry(f, theta_on=0.0001, trail=3, switch_cost=0.003, capital_eff=1.0)
     assert r["A"].iloc[2] == pytest.approx(0.0005 - 0.003)   # entry bar: income - entry cost
     assert r["A"].iloc[10] == pytest.approx(0.0005)
+
+
+def test_funding_carry_books_basis_pnl_when_premium_given():
+    idx = pd.date_range("2024-01-01", periods=12, freq="8h", tz="UTC")
+    f = pd.DataFrame({"A": 0.0005}, index=idx)
+    prem = pd.DataFrame({"A": [0.0] * 6 + [0.002] * 6}, index=idx)     # perp richens by 0.2% at bar 6
+    base = S.funding_carry(f, theta_on=0.0001, trail=3, switch_cost=0.0, capital_eff=1.0)
+    withb = S.funding_carry(f, theta_on=0.0001, trail=3, switch_cost=0.0, capital_eff=1.0, premium=prem)
+    diff = (withb - base)["A"]
+    assert diff.iloc[5] == pytest.approx(-0.002)                         # short perp loses the richening
+    assert diff.drop(diff.index[5]).abs().max() == pytest.approx(0.0)
+
+
+# ── no-trade band ────────────────────────────────────────────────────────────
+
+def _rw(seed=3, n=500, k=6):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(100 * np.cumprod(1 + rng.normal(0, 0.03, (n, k)), axis=0),
+                        index=pd.date_range("2024-01-01", periods=n, freq="1D", tz="UTC"),
+                        columns=[f"S{i}" for i in range(k)])
+
+
+def test_band_zero_is_exact_rebalancing():
+    close = _rw()
+    w = pd.DataFrame(np.tile(np.where(np.arange(6) % 2, -1, 1) / 6.0, (len(close), 1)),
+                     index=close.index, columns=close.columns)
+    a, b = bt.run(w, close, 1), bt.run(w, close, 1, band=0.0)
+    assert np.allclose(a.net, b.net) and np.allclose(a.turnover, b.turnover)
+
+
+def test_band_holds_drifting_positions_and_cuts_turnover():
+    close = _rw()
+    w = pd.DataFrame(np.tile(np.where(np.arange(6) % 2, -1, 1) / 6.0, (len(close), 1)),
+                     index=close.index, columns=close.columns)
+    exact, banded = bt.run(w, close, 1), bt.run(w, close, 1, band=0.5)
+    assert banded.turnover.sum() < 0.5 * exact.turnover.sum()
+
+
+def test_band_held_short_behaves_like_buy_and_hold_short():
+    """A held short (no daily top-up) earns the price decline, unlike a
+    constant-weight short which decays in volatile markets."""
+    up_down = np.where(np.arange(400) % 2, 1.08, 1 / 1.08)        # violent chop
+    close = pd.DataFrame({"A": 100 * np.cumprod(up_down)}, index=pd.date_range("2024-01-01", periods=400, freq="1D", tz="UTC"))
+    w = pd.DataFrame({"A": -1.0}, index=close.index)
+    zero = bt.Costs(0, 0, 0)
+    const = (1 + bt.run(w, close, 1, zero).net).prod() - 1
+    held = (1 + bt.run(w, close, 1, zero, band=10.0).net).prod() - 1
+    buy_and_hold_short = -(close["A"].iloc[-1] / close["A"].iloc[0] - 1)   # fixed-quantity short
+    assert held == pytest.approx(buy_and_hold_short, rel=1e-9)
+    assert const < buy_and_hold_short - 0.5                      # inverse-ETF style decay

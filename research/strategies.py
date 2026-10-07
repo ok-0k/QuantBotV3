@@ -102,7 +102,8 @@ def zscore_mr(p, mask, window: int, z_in: float = 2.5, z_out: float = 0.5):
 
 
 def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
-                  switch_cost: float = 0.0031, capital_eff: float = 1 / 1.2) -> pd.DataFrame:
+                  switch_cost: float = 0.0031, capital_eff: float = 1 / 1.2,
+                  premium: pd.DataFrame | None = None) -> pd.DataFrame:
     """Delta-neutral cash-and-carry on perps: hold long spot + short perp while
     trailing mean funding (per 8h) > theta_on; exit below theta_on / 2.
 
@@ -113,7 +114,10 @@ def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
     switch_cost per open or close = spot leg (0.10% fee + 0.08% slip) +
     perp leg (0.05% taker + 0.08% slip) = 0.31% of notional; notional is
     1/1.2 of sleeve capital (20% perp margin).
-    Basis drift between spot and perp is ignored (hedged price P&L ~ 0).
+    premium (optional, perp premium index on the same 8h grid): adds the
+    basis P&L of the hedge, -(premium_{t+1} - premium_t) per period held —
+    short perp / long spot loses when the perp richens. Without it, basis
+    drift is ignored (hedged price P&L assumed ~0).
     """
     tr = funding.rolling(trail, min_periods=trail).mean()
     on = _state_machine(tr > theta_on, tr < theta_on / 2,
@@ -121,5 +125,9 @@ def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
                         pd.DataFrame(False, index=tr.index, columns=tr.columns),
                         funding.notna())
     income = (on * funding.shift(-1).fillna(0.0)) * capital_eff
+    if premium is not None:
+        prem = premium.reindex(index=funding.index, columns=funding.columns)
+        basis = -(prem.shift(-1) - prem)
+        income = income + (on * basis.fillna(0.0)) * capital_eff
     switches = on.diff().abs().fillna(on.abs())
     return (income - switches * switch_cost * capital_eff).where(funding.notna())

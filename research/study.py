@@ -1,7 +1,12 @@
 """
 Pre-registered signal study (written and committed BEFORE any result was seen).
 
-    .venv/bin/python -m research.study
+    .venv/bin/python -m research.study [--band 0.5]
+
+--band (default 0, the pre-registered run): no-trade band for the backtester
+(see research.backtest.run). Added AFTER the first results, when a sanity
+check showed exact daily rebalancing gives volatile shorts inverse-ETF decay
+and inflates turnover; the grid and decision rules are unchanged.
 
 Question: does any simple, well-known crypto signal beat realistic costs on
 the live bot's universe, out of sample?
@@ -124,7 +129,11 @@ def _carry_result(funding: pd.DataFrame, theta: float, cost_mult: float = 1.0) -
                      turnover=z, gross_exposure=on.mean(axis=1).shift(1).fillna(0.0), net_exposure=z)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    ap = argparse.ArgumentParser(prog="research.study")
+    ap.add_argument("--band", type=float, default=0.0)
+    band = ap.parse_args(argv if argv is not None else sys.argv[1:]).band
     t0 = time.time()
     _log(f"building 1h panel for {len(SYMBOLS)} symbols from {DATA_START.date()} (cached after first run)")
     p1h = build_panel(SYMBOLS, "1h", DATA_START)
@@ -158,8 +167,8 @@ def main() -> None:
         else:
             p, m = panels[sp.freq], masks[sp.freq]
             w = sp.make(p, m)
-            res = bt.run(w, p["close"], bpd)
-            res2 = bt.run(w, p["close"], bpd, bt.Costs().scaled(2.0))
+            res = bt.run(w, p["close"], bpd, band=band)
+            res2 = bt.run(w, p["close"], bpd, bt.Costs().scaled(2.0), band=band)
         r = _split(res, bpy, bench[sp.freq])
         r["oos_2x"] = bt.metrics(res2.window(OOS_START, None), bpy, bench[sp.freq][OOS_START:])
         r["daily_equity"] = (1 + res.net).resample("1D", closed="right", label="right").prod().cumprod()
@@ -168,7 +177,7 @@ def main() -> None:
              f"OOS sharpe {r['oos'].get('sharpe', float('nan')):+.2f}")
 
     for name, fn in (("bench_ew", S.equal_weight), ("bench_btc", S.hold)):
-        res = bt.run(fn(panels["1D"], masks["1D"]), panels["1D"]["close"], 1)
+        res = bt.run(fn(panels["1D"], masks["1D"]), panels["1D"]["close"], 1, band=band)
         r = _split(res, 365, bench["1D"])
         r["daily_equity"] = (1 + res.net).cumprod()
         rows[name] = r
@@ -194,7 +203,8 @@ def main() -> None:
             return "   —  "
         return f"{x * 100:+6.1f}%" if pct else f"{x:+6.2f}"
 
-    lines = [f"Signal study — IS {IS_START.date()}..{OOS_START.date()}  OOS {OOS_START.date()}..{end.date()}",
+    lines = [f"Signal study — IS {IS_START.date()}..{OOS_START.date()}  OOS {OOS_START.date()}..{end.date()}"
+             f"  (no-trade band {band:g})",
              "", f"{'strategy':16}{'IS Sh':>8}{'IS CAGR':>9}{'IS a_t':>8}{'β':>6} | {'OOS Sh':>7}{'OOS CAGR':>9}"
                  f"{'OOS MDD':>9}{'a/yr':>8}{'a_t':>7}{'Sh 2x':>7}{'cost/yr':>9}  verdict"]
     for name, r in rows.items():
@@ -210,7 +220,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.txt").write_text(report + "\n")
     summary = {k: {kk: vv for kk, vv in v.items() if kk != "daily_equity"} for k, v in rows.items()}
-    (out / "summary.json").write_text(json.dumps({"verdict": verdict, "metrics": summary,
+    (out / "summary.json").write_text(json.dumps({"verdict": verdict, "metrics": summary, "band": band,
                                                   "is": str(IS_START), "oos": str(OOS_START), "end": str(end)},
                                                  indent=1, default=float))
     pd.DataFrame({k: v["daily_equity"] for k, v in rows.items()}).to_csv(out / "daily_equity.csv")

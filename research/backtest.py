@@ -53,8 +53,16 @@ class Result:
 
 
 def run(weights: pd.DataFrame, close: pd.DataFrame, bars_per_day: float,
-        costs: Costs = Costs()) -> Result:
-    """Simulate target weights against close prices (same index/columns)."""
+        costs: Costs = Costs(), band: float = 0.0) -> Result:
+    """Simulate target weights against close prices (same index/columns).
+
+    band: no-trade band. A position whose sign matches its target and whose
+    drifted weight is within band x |target| of it is left alone instead of
+    being traded back to the exact target. band=0 rebalances every bar
+    (constant-weight; for volatile shorts this behaves like an inverse ETF
+    and decays). band=0.5 trades on signal changes and large drift only —
+    how a discretionary or systematic trader actually holds positions.
+    """
     close = close.sort_index()
     W = weights.reindex(index=close.index, columns=close.columns).fillna(0.0).to_numpy(float)
     R = close.pct_change(fill_method=None).to_numpy(float)
@@ -66,6 +74,10 @@ def run(weights: pd.DataFrame, close: pd.DataFrame, bars_per_day: float,
     borrow_bar = costs.borrow_daily / bars_per_day
     for t in range(T - 1):
         target = W[t]
+        if band > 0:
+            keep = (np.sign(held) == np.sign(target)) & (target != 0) & \
+                   (np.abs(held - target) <= band * np.abs(target))
+            target = np.where(keep, held, target)
         traded = np.abs(target - held).sum()
         c = traded * costs.side
         r = R[t + 1]
