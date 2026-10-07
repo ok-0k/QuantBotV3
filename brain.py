@@ -1,658 +1,702 @@
 """
-brain.py — The cognitive core of the trading system.
+brain.py — Quantitative ensemble + risk engine.
 
-Orchestrates:
-  1. Regime detection (ADX-based)
-  2. XGBoost ML signal (probability of profitable entry)
-  3. SAC actor position sizing (risk-adjusted, continuous action)
-  4. Heuristic strategy ensemble (with softmax allocation)
-  5. Genetic mutation & strategy lifecycle management
-  6. Circuit breaker (max drawdown protection)
-  7. Anti-correlation guard (avoid doubling into correlated pairs)
-  8. Replay buffer review (reinforces winners, mutates chronic losers)
-
-All CPU-bound work (ML inference, RL forward pass) is dispatched to
-ProcessPoolExecutor workers by the bot loop — this class holds state only.
+Mission-critical contract with bot.py:
+  • _top_strategy() picks strategy_name from ensemble["breakdown"] where each item has
+    keys: signal ("buy"|"sell"), strategy (str), alloc (float). For SHORT entries the
+    winning row must use signal=="sell" or SQLite logs a blank strategy.
+  • get_ensemble_signal(symbol, candles, position_side=...) supplies price, regime,
+    breakdown, and multi-factor entry logic.
+  • get_stop_take(exec_price, candles, is_yolo, side=...) returns initial stop/take;
+    bot.py applies additional trailing / BE logic on ticks.
 """
 
 from __future__ import annotations
 
-import copy
-import json
 import logging
 import math
-import random
-from datetime import datetime, timezone
-from typing import Optional
+import time
+from typing import Any, Sequence
 
 import numpy as np
 
 from config import (
-    KILL_THRESHOLD, MUTATION_PROB, MUTATION_SCALE, SOFTMAX_TEMPERATURE,
-    ENSEMBLE_THRESHOLD, MAX_STRATEGIES, MIN_CORE_STRATEGIES,
-    TRIAL_TRADES, YOLO_TRIAL_TRADES, TRIAL_MIN_WIN_RATE, TRIAL_MIN_PNL,
-    GENERATE_EVERY, REPLAY_EVERY, MAX_DRAWDOWN_PCT, CB_RECOVERY_PCT,
-    STOP_LOSS_ATR_MULT, TAKE_PROFIT_ATR_MULT, MAX_HOLD_CANDLES,
-    ML_SIGNAL_THRESHOLD,
+    ADAPTIVE_EDGE_ENABLED,
+    BTC_KING_EMA_FAST,
+    BTC_KING_EMA_SLOW,
+    BTC_KING_SHORT_BLOCK_RATIO,
+    CB_RECOVERY_PCT,
+    EDGE_LEARN_RATE,
+    EDGE_REWARD_TARGET_PCT,
+    EDGE_RR_MAX_MULT,
+    EDGE_RR_MIN_MULT,
+    EDGE_SIZE_MAX_MULT,
+    EDGE_SIZE_MIN_MULT,
+    ENABLE_SHORTING,
+    MAX_DRAWDOWN_PCT,
+    MIN_ML_CONFIDENCE,
+    SAC_STATE_DIM,
+    SHORT_STOP_LOSS_ATR_MULT,
+    SHORT_TAKE_PROFIT_ATR_MULT,
+    STARTING_CASH,
+    STOP_LOSS_ATR_MULT,
+    TAKE_PROFIT_ATR_MULT,
 )
-from db import (save_brain_key, load_brain_key, get_ml_prob,
-                log_rl_experience)
-from features import build_sac_state
-from strategies import (
-    StrategyParams, default_strategies, generate_random_strategy,
-    STRATEGY_FNS, build_generated_strategy, adx_val, atr_val,
-)
+# Brain is otherwise pure logic (no DB access) so it stays trivially unit-
+# testable via a bare Brain(); these two are the sole persistence primitives,
+# used only for the circuit breaker's peak-equity high-water mark below.
+from db import save_brain_key as _db_save_brain_key, load_brain_key as _db_load_brain_key
+
+# Fix O1: _wilder_atr used to be a standalone implementation here that had
+# already drifted from bot.py's copy once (see bot.py's Fix #9 changelog)
+# before being manually re-aligned by hand. Now the single shared
+# implementation lives in indicators.py; imported under the original local
+# name so every call site below (compute_sac_state, get_stop_take,
+# get_ensemble_signal) is unchanged.
+from indicators import wilder_atr as _wilder_atr
 
 log = logging.getLogger(__name__)
 
-REGIMES = ["trending_up", "trending_down", "ranging", "volatile"]
+# brain_state key for the circuit breaker's all-time peak equity (Fix #21).
+_PEAK_EQUITY_BRAIN_KEY = "circuit_breaker_peak_equity_v1"
 
-YOLO_MUTATION_PROB  = 0.50
-YOLO_MUTATION_SCALE = 0.40
+
+# ── Pure numerics (Wilder / ADX / EMA) ───────────────────────────────────────
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ohlcv_arrays(candles: Sequence[dict]) -> tuple[np.ndarray, ...]:
+    """Stack OHLCV into column vectors for vectorised math."""
+    n = len(candles)
+    o = np.empty(n)
+    h = np.empty(n)
+    l = np.empty(n)
+    c = np.empty(n)
+    v = np.empty(n)
+    for i, bar in enumerate(candles):
+        o[i] = _safe_float(bar.get("open"))
+        h[i] = _safe_float(bar.get("high"))
+        l[i] = _safe_float(bar.get("low"))
+        c[i] = _safe_float(bar.get("close"))
+        v[i] = _safe_float(bar.get("volume"))
+    return o, h, l, c, v
+
+def _ema(x: np.ndarray, span: int) -> np.ndarray:
+    """EMA: more weight on recent prices — standard trend proxy."""
+    if len(x) < span:
+        return np.full_like(x, np.nan)
+    alpha = 2.0 / (span + 1.0)
+    out = np.empty_like(x, dtype=np.float64)
+    out[0] = x[0]
+    for i in range(1, len(x)):
+        out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+def _adx_and_di(
+    h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int = 14
+) -> tuple[float, float, float]:
+    """
+    ADX + directional indicators (Wilder). ADX measures trend strength (not direction);
+    +DI vs −DI identifies bullish vs bearish pressure — we require −DI dominance to short
+    against a potential squeeze in an uptrend.
+    """
+    n = len(c)
+    if n < period + 2:
+        return 20.0, 25.0, 25.0  # neutral prior — avoid division blow-ups on short history
+
+    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+    up_move = h[1:] - h[:-1]
+    down_move = l[:-1] - l[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    atr = float(tr[:period].sum())
+    p_dm = float(plus_dm[:period].sum())
+    m_dm = float(minus_dm[:period].sum())
+    dx_vals: list[float] = []
+    for i in range(period, len(tr)):
+        atr = atr - atr / period + tr[i]
+        p_dm = p_dm - p_dm / period + plus_dm[i]
+        m_dm = m_dm - m_dm / period + minus_dm[i]
+        atr_s = max(atr, 1e-12)
+        pdi_i = 100.0 * p_dm / atr_s
+        mdi_i = 100.0 * m_dm / atr_s
+        dx_vals.append(100.0 * abs(pdi_i - mdi_i) / max(pdi_i + mdi_i, 1e-12))
+
+    atr_f = max(atr, 1e-12)
+    pdi = 100.0 * p_dm / atr_f
+    mdi = 100.0 * m_dm / atr_f
+    # ADX ≈ smoothed mean of DX (last window) — trend strength scalar
+    adx = float(np.mean(dx_vals[-period:])) if len(dx_vals) >= period else (
+        float(dx_vals[-1]) if dx_vals else 20.0
+    )
+    return float(adx), float(pdi), float(mdi)
+
+
+def _relative_volume(v: np.ndarray, lookback: int = 20) -> float:
+    """Last bar volume / SMA(volume): >1 means participation spike (squeeze fuel)."""
+    if len(v) < lookback + 1:
+        return 1.0
+    sma = float(np.mean(v[-lookback - 1 : -1]))
+    if sma <= 0:
+        return 1.0
+    return float(v[-1] / sma)
+
+
+def _log_ret_window(c: np.ndarray, bars: int) -> float:
+    """Cumulative log return over `bars` closes — symmetric, scale-free drift."""
+    if len(c) < bars + 1:
+        return 0.0
+    return float(math.log(c[-1] / max(c[-1 - bars], 1e-12)))
 
 
 class Brain:
     """
-    Central intelligence — stateful, single-instance per process.
-    All heavy ML/RL inference happens in worker processes dispatched by bot.py.
+    Multi-factor short engine:
+      • ML bearish tilt (1 - ml_prob)
+      • Trend/microstructure: EMA stack + ADX/DI so we do not short high-ADX bull legs
+      • Liquidity shock: high relative volume + positive drift ⇒ skip (classic squeeze setup)
     """
 
-    def __init__(self) -> None:
-        self.strategies:     list[StrategyParams] = []
-        self.regime_weights: dict = {}
-        self.replay_buffer:  list = []
-        self.total_trades:   int  = 0
-        self.current_regime: str  = "ranging"
-        self.regime_history: list = []
-        self.mutation_log:   list = []
-        self.graveyard:      list = []
-        self.generation_log: list = []
-        self._generated_fns: dict = {}
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.ml_probs: dict[str, float] = {}
+        self.current_regime: str = "neutral"
+        self.circuit_open: bool = False
+        self._peak_equity: float = 0.0
+        # Online adaptive edge model keyed by "side:regime" (e.g., "long:trend_up").
+        self._edge_profiles: dict[str, dict[str, float]] = {}
+        # Rolling peak for drawdown. Starts at 0.0 here (a bare Brain() must stay
+        # side-effect-free for unit tests); call restore_peak_equity() once at
+        # bot startup to load the persisted high-water mark (Fix #21) — without
+        # that call this is RAM-only for the life of the process, same as before.
+        print(
+            "BOOT: QuantBrain V2 — ML-sized shorts, BTC-king regime gate, ATR risk."
+        )
 
-        # Circuit breaker
-        self.peak_equity:  float = 0.0
-        self.circuit_open: bool  = False
-        self.cb_log:       list  = []
+    def update_ml_prob(self, symbol: str, prob: float, *args: Any, **kwargs: Any) -> None:
+        self.ml_probs[symbol] = max(0.0, min(1.0, float(prob)))
 
-        # ML prediction cache per symbol
-        self._ml_probs:    dict[str, float] = {}
+    def save(self, *args: Any, **kwargs: Any) -> bool:
+        return True
 
-        self._load()
+    def export_edge_profiles(self) -> dict[str, dict[str, float]]:
+        """Serializable snapshot of adaptive edge state."""
+        out: dict[str, dict[str, float]] = {}
+        for k, p in self._edge_profiles.items():
+            out[str(k)] = {
+                "rr_mult": float(p.get("rr_mult", 1.0)),
+                "size_mult": float(p.get("size_mult", 1.0)),
+                "score_ema": float(p.get("score_ema", 0.0)),
+                "samples": float(p.get("samples", 0.0)),
+            }
+        return out
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PERSISTENCE (SQLite-backed)
-    # ─────────────────────────────────────────────────────────────────────────
+    def import_edge_profiles(self, payload: Any) -> int:
+        """Restore adaptive edge state from a dict-like payload."""
+        if not isinstance(payload, dict):
+            return 0
+        restored = 0
+        for k, p in payload.items():
+            if not isinstance(k, str) or not isinstance(p, dict):
+                continue
+            rr = float(p.get("rr_mult", 1.0))
+            sm = float(p.get("size_mult", 1.0))
+            se = float(p.get("score_ema", 0.0))
+            n = float(p.get("samples", 0.0))
+            self._edge_profiles[k] = {
+                "rr_mult": max(EDGE_RR_MIN_MULT, min(EDGE_RR_MAX_MULT, rr)),
+                "size_mult": max(EDGE_SIZE_MIN_MULT, min(EDGE_SIZE_MAX_MULT, sm)),
+                "score_ema": max(-1.0, min(1.0, se)),
+                "samples": max(0.0, n),
+            }
+            restored += 1
+        return restored
 
-    def _load(self) -> None:
-        data = load_brain_key("brain_state")
-        if data:
-            self.strategies     = [self._deserialise(s) for s in data["strategies"]]
-            self.regime_weights = data["regime_weights"]
-            self.total_trades   = data["total_trades"]
-            self.current_regime = data.get("current_regime", "ranging")
-            self.regime_history = data.get("regime_history", [])
-            self.mutation_log   = data.get("mutation_log", [])
-            self.graveyard      = data.get("graveyard", [])
-            self.generation_log = data.get("generation_log", [])
-            self.peak_equity    = data.get("peak_equity", 0.0)
-            self.circuit_open   = data.get("circuit_open", False)
-            self.cb_log         = data.get("cb_log", [])
+    # ── brain_state persistence primitives (Fix #21) ─────────────────────────
+    # Best-effort by design: a persistence hiccup (missing schema in a bare
+    # unit test, a transient disk error) must never break risk-engine logic,
+    # so both methods swallow and log rather than raise.
 
-            for s in self.strategies:
-                if getattr(s, "is_generated", False) and s.name not in STRATEGY_FNS:
-                    bp = getattr(s, "blueprint", {})
-                    if bp.get("entry") and bp.get("filter") and bp.get("logic"):
-                        self._generated_fns[s.name] = build_generated_strategy(
-                            bp["entry"], bp["filter"], bp["logic"], s.params, s.name)
-        else:
-            self.strategies     = default_strategies()
-            self.regime_weights = {r: {s.name: 1.0 for s in self.strategies}
-                                   for r in REGIMES}
+    def save_brain_key(self, key: str, value: Any) -> None:
+        try:
+            _db_save_brain_key(key, value)
+        except Exception as exc:
+            log.warning("Brain.save_brain_key(%s) failed — continuing without persistence: %s", key, exc)
 
-        replay = load_brain_key("replay_buffer") or []
-        self.replay_buffer = replay
+    def load_brain_key(self, key: str, default: Any = None) -> Any:
+        try:
+            return _db_load_brain_key(key, default)
+        except Exception as exc:
+            log.warning("Brain.load_brain_key(%s) failed — using default: %s", key, exc)
+            return default
 
-    def save(self) -> None:
-        save_brain_key("brain_state", {
-            "strategies":     [self._serialise(s) for s in self.strategies],
-            "regime_weights": self.regime_weights,
-            "total_trades":   self.total_trades,
-            "current_regime": self.current_regime,
-            "regime_history": self.regime_history[-200:],
-            "mutation_log":   self.mutation_log[-50:],
-            "graveyard":      self.graveyard[-100:],
-            "generation_log": self.generation_log[-50:],
-            "peak_equity":    self.peak_equity,
-            "circuit_open":   self.circuit_open,
-            "cb_log":         self.cb_log[-20:],
-        })
-        save_brain_key("replay_buffer", self.replay_buffer[-500:])
+    def restore_peak_equity(self, default: float) -> float:
+        """
+        Restore the circuit breaker's high-water mark from brain_state.
 
-    def _serialise(self, s: StrategyParams) -> dict:
-        d = s.__dict__.copy()
-        d["is_generated"] = getattr(s, "is_generated", False)
-        d["is_yolo"]      = getattr(s, "is_yolo", False)
-        d["blueprint"]    = getattr(s, "blueprint", {})
-        return d
+        Call once, early in bot.py's startup() — before the exit monitor
+        starts ratcheting it via check_circuit_breaker() — so a restart
+        cannot silently re-arm MAX_DRAWDOWN_PCT from post-restart equity.
+        `default` should be the best available current-equity estimate at
+        boot (or STARTING_CASH if that isn't computable yet); the restored
+        peak never sits below it, so a stale/missing value can never imply
+        a larger drawdown than what's actually observable right now.
+        """
+        loaded = self.load_brain_key(_PEAK_EQUITY_BRAIN_KEY, None)
+        try:
+            loaded_f = float(loaded) if loaded is not None else 0.0
+        except (TypeError, ValueError):
+            loaded_f = 0.0
+        self._peak_equity = max(self._peak_equity, loaded_f, float(default))
+        return self._peak_equity
 
-    def _deserialise(self, d: dict) -> StrategyParams:
-        is_gen  = d.pop("is_generated", False)
-        is_yolo = d.pop("is_yolo", False)
-        bp      = d.pop("blueprint", {})
-        d.setdefault("returns_buffer", [])
-        d.setdefault("peak_score", 0.0)
-        d.setdefault("max_drawdown", 0.0)
-        sp = StrategyParams(**d)
-        sp.is_generated = is_gen
-        sp.is_yolo      = is_yolo
-        sp.blueprint    = bp
-        return sp
+    def check_circuit_breaker(self, equity: float, *args: Any, **kwargs: Any) -> bool:
+        """
+        Trip on peak-to-trough drawdown; clear when drawdown recovers by CB_RECOVERY_PCT
+        (hysteresis avoids chatter at the threshold).
+        """
+        eq = max(0.0, float(equity))
+        prev_peak = self._peak_equity
+        self._peak_equity = max(self._peak_equity, eq)
+        if self._peak_equity > prev_peak:
+            # Fix #21: persist immediately on every new peak so a restart can
+            # never forget how high equity has actually been.
+            self.save_brain_key(_PEAK_EQUITY_BRAIN_KEY, self._peak_equity)
+        peak = max(self._peak_equity, 1e-9)
+        dd = (peak - eq) / peak
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # CIRCUIT BREAKER
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def check_circuit_breaker(self, current_equity: float) -> bool:
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-            if self.circuit_open:
-                if current_equity >= self.peak_equity * (1 - CB_RECOVERY_PCT):
-                    self.circuit_open = False
-                    self.cb_log.append({"time": _now(), "event": "reset",
-                                        "equity": current_equity})
-                    log.warning("🟢 CIRCUIT BREAKER RESET — equity $%.2f", current_equity)
-
-        if self.peak_equity > 0 and not self.circuit_open:
-            dd = (self.peak_equity - current_equity) / self.peak_equity
-            if dd >= MAX_DRAWDOWN_PCT:
-                self.circuit_open = True
-                self.cb_log.append({"time": _now(), "event": "open",
-                                    "drawdown_pct": round(dd * 100, 2),
-                                    "peak": self.peak_equity,
-                                    "equity": current_equity})
-                log.warning("🔴 CIRCUIT BREAKER OPEN — drawdown %.1f%% "
-                            "(peak $%.2f → $%.2f)",
-                            dd * 100, self.peak_equity, current_equity)
+        if not self.circuit_open and dd >= MAX_DRAWDOWN_PCT:
+            self.circuit_open = True
+            log.warning("Circuit breaker OPEN — drawdown %.2f%% (limit %.2f%%)", dd * 100, MAX_DRAWDOWN_PCT * 100)
+        elif self.circuit_open and dd <= max(0.0, MAX_DRAWDOWN_PCT - CB_RECOVERY_PCT):
+            self.circuit_open = False
+            log.info("Circuit breaker CLOSED — drawdown recovered to %.2f%%", dd * 100)
 
         return self.circuit_open
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # STOP LOSS / TAKE PROFIT  (ATR-based)
-    # ─────────────────────────────────────────────────────────────────────────
+    def compute_sac_state(self, *args: Any, **kwargs: Any) -> np.ndarray:
+        """
+        Pack SAC_STATE_DIM features for the NumPy actor. Uses positional convention from bot.py:
+        compute_sac_state(symbol, candles, cash, unrealised_pnl, total_equity).
+        """
+        symbol = args[0] if len(args) > 0 else kwargs.get("symbol", "")
+        candles = args[1] if len(args) > 1 else kwargs.get("candles") or []
+        cash = _safe_float(args[2] if len(args) > 2 else kwargs.get("cash"))
+        unreal = _safe_float(args[3] if len(args) > 3 else kwargs.get("unrealised_pnl"))
+        teq = _safe_float(args[4] if len(args) > 4 else kwargs.get("total_equity"), STARTING_CASH)
 
-    def get_stop_take(self, entry_price: float, candles: list[dict],
-                      is_yolo: bool = False) -> tuple[float, float]:
-        atr = atr_val(candles, 14)
-        if atr == 0:
-            atr = entry_price * 0.01
+        ml_p = self.ml_probs.get(str(symbol), 0.5)
+        vec = np.zeros(SAC_STATE_DIM, dtype=np.float32)
+        if not candles or len(candles) < 3:
+            vec[0] = np.float32(ml_p)
+            vec[1] = np.float32(cash / max(teq, 1e-6))
+            vec[2] = np.float32(unreal / max(teq, 1e-6))
+            return vec
 
-        sl_mult = STOP_LOSS_ATR_MULT   * (0.6 if is_yolo else 1.0)
-        tp_mult = TAKE_PROFIT_ATR_MULT * (1.5 if is_yolo else 1.0)
+        _, h, l, c, v = _ohlcv_arrays(candles)
+        price = float(c[-1]) if len(c) else 1.0
+        atr = _wilder_atr(h, l, c, 14)
+        adx, pdi, mdi = _adx_and_di(h, l, c, 14)
+        rvol = _relative_volume(v, 20)
 
-        stop   = entry_price - sl_mult * atr
-        target = entry_price + tp_mult * atr
-        return round(stop, 6), round(target, 6)
+        vec[0] = np.float32(ml_p)
+        vec[1] = np.float32(cash / max(teq, 1e-6))
+        vec[2] = np.float32(unreal / max(teq, 1e-6))
+        vec[3] = np.float32(atr / max(price, 1e-12))  # vol as % of price
+        vec[4] = np.float32(adx / 100.0)
+        vec[5] = np.float32((mdi - pdi) / 100.0)  # bearish DI edge
+        vec[6] = np.float32(min(rvol / 3.0, 1.0))  # cap participation spike
+        vec[7] = np.float32(_log_ret_window(c, 20) / 0.05)  # normalised drift (~5% move ref)
+        ema12 = _ema(c, 12)
+        ema26 = _ema(c, 26)
+        stack = 0.0
+        if len(ema12) and len(ema26) and not math.isnan(ema12[-1]) and not math.isnan(ema26[-1]):
+            stack = float((ema12[-1] - ema26[-1]) / max(price, 1e-12))
+        vec[8] = np.float32(math.tanh(stack * 50.0))
+        vec[9] = np.float32(1.0 if self.current_regime == "trend_down" else 0.0)
+        vec[10] = np.float32(1.0 if self.current_regime == "trend_up" else 0.0)
+        vec[11] = np.float32(1.0 if self.circuit_open else 0.0)
+        vec[12] = np.float32(min(max((1.0 - ml_p) - 0.5, -0.5), 0.5) * 2.0)  # bearish ML tilt
+        return vec
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # REGIME DETECTION  (ADX + realised vol)
-    # ─────────────────────────────────────────────────────────────────────────
+    def _conf01(self, confidence_mult: float) -> float:
+        # Confidence multiplier usually sits in ~[0.35, 1.45].
+        return max(0.0, min(1.0, (float(confidence_mult) - 0.35) / 1.10))
 
-    def detect_regime(self, candles: list[dict]) -> str:
-        if len(candles) < 30:
-            return "ranging"
+    def _edge_key(self, side: str, regime: str) -> str:
+        s = "short" if str(side).lower() == "short" else "long"
+        r = str(regime or "ranging")
+        return f"{s}:{r}"
 
-        closes = [c["close"] for c in candles]
-        adx, plus_di, minus_di = adx_val(candles, 14)
+    def _edge_profile(self, side: str, regime: str) -> dict[str, float]:
+        k = self._edge_key(side, regime)
+        p = self._edge_profiles.get(k)
+        if p is None:
+            p = {"rr_mult": 1.0, "size_mult": 1.0, "score_ema": 0.0, "samples": 0.0}
+            self._edge_profiles[k] = p
+        return p
 
-        rets = [(closes[i] - closes[i-1]) / (closes[i-1] + 1e-9)
-                for i in range(1, len(closes))]
-        vol = math.sqrt(sum(r**2 for r in rets[-20:]) / 20) * 100
+    def edge_position_mult(self, side: str, regime: str, confidence_mult: float) -> float:
+        """
+        Dynamic position scaling:
+        - high confidence => larger allocation
+        - low confidence => smaller allocation
+        - online edge profile nudges per side/regime.
+        """
+        if not ADAPTIVE_EDGE_ENABLED:
+            return 1.0
+        c01 = self._conf01(confidence_mult)
+        conf_scale = 0.55 + 0.90 * c01
+        p = self._edge_profile(side, regime)
+        raw = conf_scale * p["size_mult"]
+        return max(EDGE_SIZE_MIN_MULT, min(EDGE_SIZE_MAX_MULT, raw))
 
-        if vol > 3.5:
-            regime = "volatile"
-        elif adx > 25 and plus_di > minus_di:
-            regime = "trending_up"
-        elif adx > 25 and minus_di > plus_di:
-            regime = "trending_down"
-        else:
-            regime = "ranging"
+    def reward(self, *args: Any, **kwargs: Any) -> float:
+        """
+        Online learner update from realized shaped reward.
+        Returns pnl for compatibility with callers.
+        """
+        pnl = _safe_float(kwargs.get("pnl", args[0] if args else 0.0), 0.0)
+        if not ADAPTIVE_EDGE_ENABLED:
+            return pnl
 
-        self.current_regime = regime
-        self.regime_history.append({
-            "time": _now(), "regime": regime,
-            "adx": round(adx, 1), "plus_di": round(plus_di, 1),
-            "minus_di": round(minus_di, 1), "vol": round(vol, 3),
-        })
-        return regime
+        trade_value = _safe_float(kwargs.get("trade_value"), 1.0)
+        regime = str(kwargs.get("regime", self.current_regime or "ranging"))
+        side = str(kwargs.get("side", "long"))
+        p = self._edge_profile(side, regime)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SOFTMAX ALLOCATION  (Sharpe-adjusted + regime weights)
-    # ─────────────────────────────────────────────────────────────────────────
+        norm = pnl / max(abs(trade_value), 1.0)
+        tgt = max(1e-6, EDGE_REWARD_TARGET_PCT)
+        adv = math.tanh((norm - tgt) / tgt)
 
-    def _softmax(self, scores: list[float],
-                 temp: float = SOFTMAX_TEMPERATURE) -> list[float]:
-        scaled = [s / temp for s in scores]
-        max_s  = max(scaled)
-        exps   = [math.exp(s - max_s) for s in scaled]
-        total  = sum(exps) + 1e-9
-        return [e / total for e in exps]
-
-    def get_allocations(self, regime: str) -> dict[str, float]:
-        weights = self.regime_weights.get(regime, {s.name: 1.0 for s in self.strategies})
-        composite = []
-        for s in self.strategies:
-            rw      = weights.get(s.name, 1.0)
-            score_w = s.score * 0.10
-            sharpe_w = max(s.sharpe, 0) * 0.15
-            composite.append(rw + score_w + sharpe_w)
-
-        probs = self._softmax(composite)
-        return {s.name: round(p, 4) for s, p in zip(self.strategies, probs)}
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ML + RL POSITION SIZING
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def update_ml_prob(self, symbol: str, prob: float) -> None:
-        """Store latest XGBoost probability for a symbol (updated async)."""
-        self._ml_probs[symbol] = prob
-
-    def get_ml_prob(self, symbol: str) -> float:
-        return self._ml_probs.get(symbol, 0.5)
-
-    def compute_sac_state(self, symbol: str, candles: list[dict],
-                          cash: float, unrealised_pnl: float,
-                          current_equity: float) -> np.ndarray:
-        """Build the 8-dim state vector for the SAC actor."""
-        ml_prob      = self.get_ml_prob(symbol)
-        balance_ratio = cash / max(current_equity, 1.0)
-        pnl_pct      = unrealised_pnl / max(current_equity, 1.0)
-        dd_pct       = max(0.0, (self.peak_equity - current_equity)
-                         / max(self.peak_equity, 1.0))
-
-        closes = [c["close"] for c in candles]
-        atr    = atr_val(candles, 14)
-        atr_pct = atr / (closes[-1] + 1e-9)
-
-        adx, _, _ = adx_val(candles, 14)
-
-        rets = [(closes[i] - closes[i-1]) / (closes[i-1] + 1e-9)
-                for i in range(max(1, len(closes)-20), len(closes))]
-        vol  = math.sqrt(sum(r**2 for r in rets) / max(len(rets), 1)) * 100
-
-        return build_sac_state(
-            ml_prob=ml_prob,
-            balance_ratio=balance_ratio,
-            unrealised_pnl_pct=pnl_pct,
-            drawdown_pct=dd_pct,
-            atr_pct=atr_pct,
-            adx_norm=adx,
-            regime=self.current_regime,
-            vol_norm=min(vol / 5.0, 1.0),
+        p["samples"] += 1.0
+        p["score_ema"] = 0.92 * p["score_ema"] + 0.08 * adv
+        p["rr_mult"] = max(
+            EDGE_RR_MIN_MULT,
+            min(EDGE_RR_MAX_MULT, p["rr_mult"] + EDGE_LEARN_RATE * p["score_ema"]),
         )
+        p["size_mult"] = max(
+            EDGE_SIZE_MIN_MULT,
+            min(EDGE_SIZE_MAX_MULT, p["size_mult"] + EDGE_LEARN_RATE * 0.75 * p["score_ema"]),
+        )
+        return pnl
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ENSEMBLE SIGNAL AGGREGATION
-    # ─────────────────────────────────────────────────────────────────────────
+    def _classify_regime(self, adx: float, ema_fast: float, ema_slow: float, price: float) -> str:
+        """ADX gates trend strength; EMA cross gives sign."""
+        if adx < 18:
+            return "ranging"
+        if ema_fast < ema_slow and price < ema_fast:
+            return "trend_down"
+        if ema_fast > ema_slow and price > ema_fast:
+            return "trend_up"
+        return "ranging"
 
-    def get_ensemble_signal(self, symbol: str, candles: list[dict]) -> dict:
-        regime      = self.detect_regime(candles)
-        allocations = self.get_allocations(regime)
-        ml_prob     = self.get_ml_prob(symbol)
+    def _king_ema_ratio(self, candles: list[dict], fast: int, slow: int) -> float | None:
+        """Fast/slow EMA ratio on closes — structural bull when ratio > 1 + ε."""
+        if len(candles) < slow + 5:
+            return None
+        _, _, _, c, _ = _ohlcv_arrays(candles)
+        ef = _ema(c, fast)
+        es = _ema(c, slow)
+        if math.isnan(ef[-1]) or math.isnan(es[-1]):
+            return None
+        return float(ef[-1] / max(es[-1], 1e-12))
 
-        buy_weight   = 0.0
-        sell_weight  = 0.0
-        breakdown    = []
-        on_fire      = False
-        max_pos_mult = 1.0
-
-        for strat in self.strategies:
-            fn = STRATEGY_FNS.get(strat.name) or self._generated_fns.get(strat.name)
-            if not fn:
+    def btc_eth_macro_risk_on(
+        self, btc_candles: list[dict] | None, eth_candles: list[dict] | None
+    ) -> bool:
+        """
+        “BTC King” filter: when majors trade in sustained bull structure, systematic
+        alt shorts load negatively on the same beta factor — block shorts.
+        """
+        for series in (btc_candles, eth_candles):
+            if not series:
                 continue
+            r = self._king_ema_ratio(series, BTC_KING_EMA_FAST, BTC_KING_EMA_SLOW)
+            if r is not None and r >= BTC_KING_SHORT_BLOCK_RATIO:
+                return True
+        return False
 
-            result = fn(candles, strat.params)
-            alloc  = allocations.get(strat.name, 0.0)
+    @staticmethod
+    def ml_conviction_size_mult(ml_prob: float, short_score: float) -> float:
+        """
+        Map ML probability distance from 0.5 → position weight.
 
-            if result["signal"] == "buy":
-                buy_weight  += alloc
-            elif result["signal"] == "sell":
-                sell_weight += alloc
+        |p−0.5| is a proper scoring-inspired notion of “confidence” on a calibrated
+        classifier; combine with structural short_score for final scale ∈ ~[0.45, 1.45].
 
-            if result.get("on_fire"):
-                on_fire = True
-            mult = result.get("position_size_mult", 1.0)
-            if mult > max_pos_mult:
-                max_pos_mult = mult
+        Contract: bot.py re-invokes this at order-commit time (`_authoritative_conviction_mult`)
+        so live notional cannot silently diverge from ensemble dict serialization.
+        """
+        conv = 2.0 * abs(float(ml_prob) - 0.5)
+        base = 0.42 + 0.58 * (conv ** 1.15)
+        struct = 0.62 + 0.38 * min(1.0, max(0.0, float(short_score)))
+        return round(min(1.45, max(0.35, base * struct)), 4)
 
-            breakdown.append({
-                "strategy": strat.name,
-                "signal":   result["signal"],
-                "alloc":    round(alloc * 100, 1),
-                "score":    round(strat.score, 2),
-                "win_rate": round(strat.win_rate * 100, 1),
-                "sharpe":   round(strat.sharpe, 3),
-                "on_fire":  result.get("on_fire", False),
-                "meta":     result.get("meta", {}),
-            })
+    def _generate_strategy_tag(
+        self, regime: str, short_score: float, ml_down: float, block_reason: str | None
+    ) -> str:
+        """Human-readable, unique-enough tag for SQLite + dashboards."""
+        bucket = int(round(min(9, max(0, short_score * 10))))
+        mlb = int(round(ml_down * 100))
+        suffix = "BLK_" + block_reason if block_reason else f"S{bucket}_M{mlb}"
+        return f"QF_{regime[:2].upper()}_{suffix}"
 
-        # ── ML GATE ──────────────────────────────────────────────────────────
-        # XGBoost acts as a filter: heuristic signals only pass through
-        # when ML confirms the directional thesis.
-        # sell signals are allowed regardless of ML (defensive exits).
-        if buy_weight > ENSEMBLE_THRESHOLD:
-            if ml_prob >= ML_SIGNAL_THRESHOLD:
-                signal = "buy"
+    def get_stop_take(self, *args: Any, **kwargs: Any) -> tuple[float, float]:
+        """
+        Volatility-normalised exits: stop distance ∝ ATR (tighter stop in chop if ATR small).
+        YOLO widens take-profit multipliers so winners can run vs noise.
+        """
+        exec_price = kwargs.get("price")
+        if exec_price is None and args:
+            exec_price = args[0]
+        p = _safe_float(exec_price, 0.0)
+
+        candles: list = []
+        if len(args) > 1:
+            candles = list(args[1]) if args[1] is not None else []
+        elif kwargs.get("candles") is not None:
+            candles = list(kwargs["candles"])
+
+        is_yolo = bool(kwargs.get("is_yolo", args[2] if len(args) > 2 else False))
+        side = str(kwargs.get("side", "long"))
+        regime = str(kwargs.get("regime", self.current_regime or "ranging"))
+        confidence_mult = _safe_float(kwargs.get("confidence_mult", 1.0), 1.0)
+
+        if p <= 0 or len(candles) < 15:
+            # Fallback: tiny % bands only if ATR undefined (degenerate series)
+            pad = max(p * 0.005, 1e-8)
+            if side == "short":
+                return p + pad, p - pad * 1.6
+            return p - pad, p + pad * 1.6
+
+        _, h, l, c, _ = _ohlcv_arrays(candles)
+        atr = _wilder_atr(h, l, c, 14)
+        # Floor distance so we never place a zero-width stop on flat tape
+        min_pct = p * 0.002
+        atr_eff = max(atr, min_pct)
+
+        # Risk/reward asymmetry: shorts use config SHORT_* (tighter — squeeze risk)
+        c01 = self._conf01(confidence_mult)
+        p_edge = self._edge_profile(side, regime)
+        rr_edge = p_edge["rr_mult"] if ADAPTIVE_EDGE_ENABLED else 1.0
+        conf_rr = 0.90 + 0.40 * c01      # strong setups let TP run further
+        conf_sl = 1.08 - 0.18 * c01      # weaker setups get a bit more breathing room
+        if side == "short":
+            sl_m = SHORT_STOP_LOSS_ATR_MULT * conf_sl * (1.15 if is_yolo else 1.0)
+            tp_m = SHORT_TAKE_PROFIT_ATR_MULT * rr_edge * conf_rr * (1.25 if is_yolo else 1.0)
+            stop = p + sl_m * atr_eff
+            take = p - tp_m * atr_eff
+        else:
+            sl_m = STOP_LOSS_ATR_MULT * conf_sl * (1.1 if is_yolo else 1.0)
+            tp_m = TAKE_PROFIT_ATR_MULT * rr_edge * conf_rr * (1.2 if is_yolo else 1.0)
+            stop = p - sl_m * atr_eff
+            take = p + tp_m * atr_eff
+
+        # Enforce minimum base R:R floor no matter what the learner suggests.
+        if tp_m < 2.0 * sl_m:
+            tp_m = 2.0 * sl_m
+            if side == "short":
+                take = p - tp_m * atr_eff
             else:
-                signal = "none"   # heuristics agree but ML disagrees → hold
-        elif sell_weight > ENSEMBLE_THRESHOLD:
-            signal = "sell"
+                take = p + tp_m * atr_eff
+
+        return stop, take
+
+    def get_ensemble_signal(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        symbol = kwargs.get("symbol")
+        if symbol is None and args:
+            symbol = args[0]
+        symbol = str(symbol or "")
+
+        candles = args[1] if len(args) > 1 else kwargs.get("candles") or []
+        if not isinstance(candles, list):
+            candles = list(candles)
+        position_side = kwargs.get("position_side")
+
+        ml_prob = kwargs.get("ml_prob")
+        if ml_prob is None:
+            ml_prob = self.ml_probs.get(symbol, 0.5)
+        ml_prob = max(0.0, min(1.0, _safe_float(ml_prob, 0.5)))
+        ml_down = 1.0 - ml_prob
+
+        current_price = 0.0
+        if candles:
+            current_price = _safe_float(candles[-1].get("close"), 0.0)
+
+        block_reason: str | None = None
+        short_score = 0.0
+        regime = "ranging"
+
+        # Default: flat — breakdown empty so _top_strategy falls through only when we trade
+        breakdown: list[dict[str, Any]] = []
+        signal = "none"
+        strategy_name = self._generate_strategy_tag(regime, 0.0, ml_down, "NOOP")
+
+        if not ENABLE_SHORTING:
+            block_reason = "shorting_disabled"
+            strategy_name = self._generate_strategy_tag(regime, 0.0, ml_down, block_reason)
+            return self._pack(
+                symbol,
+                signal,
+                strategy_name,
+                breakdown,
+                current_price,
+                regime,
+                ml_prob,
+                block_reason,
+            )
+
+        min_bars = 60
+        if len(candles) < min_bars:
+            block_reason = "warmup"
+            strategy_name = self._generate_strategy_tag(regime, 0.0, ml_down, block_reason)
+            return self._pack(
+                symbol,
+                signal,
+                strategy_name,
+                breakdown,
+                current_price,
+                regime,
+                ml_prob,
+                block_reason,
+            )
+
+        _, h, l, c, v = _ohlcv_arrays(candles)
+        price = float(c[-1])
+        atr = _wilder_atr(h, l, c, 14)
+        adx, pdi, mdi = _adx_and_di(h, l, c, 14)
+        ema12 = _ema(c, 12)
+        ema26 = _ema(c, 26)
+        ef = float(ema12[-1]) if not math.isnan(ema12[-1]) else price
+        es = float(ema26[-1]) if not math.isnan(ema26[-1]) else price
+        regime = self._classify_regime(adx, ef, es, price)
+        self.current_regime = regime
+
+        rvol = _relative_volume(v, 20)
+        ret5 = _log_ret_window(c, 5)
+        ret20 = _log_ret_window(c, 20)
+
+        # --- Anti “short the steamroller” filter ---
+        # High RVOL + positive drift = aggressive bids; shorts face asymmetric squeeze risk.
+        volume_heat = rvol > 1.75
+        bull_drift = ret5 > 0.0008 and ret20 > 0.003
+        ema_bull_stack = ef > es and price > ef
+        if volume_heat and (bull_drift or ema_bull_stack):
+            block_reason = "vol_uptrend"
+        # Strong bullish DI dominance: trend participation is upward.
+        elif pdi > mdi + 8.0 and adx > 22:
+            block_reason = "bull_di"
+        # Do not add to shorts if ADX says strong uptrend with price above fast EMA.
+        elif regime == "trend_up" and adx > 26 and price > ef:
+            block_reason = "adx_bull_trend"
+
+        # Composite score ∈ [0,1]: bearish ML + structure + (optionally) bearish DI
+        ml_component = max(0.0, (ml_down - 0.52) / 0.35)  # 0 at ~0.52, 1 by ~0.87
+        ml_component = min(1.0, ml_component)
+        struct_component = 0.0
+        if mdi > pdi:
+            struct_component += 0.35 * min((mdi - pdi) / 40.0, 1.0)
+        if ef < es:
+            struct_component += 0.25
+        if regime == "trend_down":
+            struct_component += 0.25
+        if adx > 20:
+            struct_component += 0.15 * min((adx - 20) / 30.0, 1.0)
+        struct_component = min(1.0, struct_component)
+
+        short_score = 0.55 * ml_component + 0.45 * struct_component
+
+        # Entry: structure + high bearish ML tilt (config MIN_ML_CONFIDENCE ≈ M80+ tags).
+        ml_gate = ml_down >= MIN_ML_CONFIDENCE
+        struct_gate = short_score >= 0.42 and mdi >= pdi - 2.0
+        allow = block_reason is None and struct_gate and ml_gate
+
+        btc_candles = kwargs.get("btc_candles") or kwargs.get("btc_king_candles")
+        eth_candles = kwargs.get("eth_candles")
+        if allow and self.btc_eth_macro_risk_on(
+            btc_candles if isinstance(btc_candles, list) else None,
+            eth_candles if isinstance(eth_candles, list) else None,
+        ):
+            block_reason = "btc_king"
+            allow = False
+
+        if allow:
+            signal = "short"
+            strategy_name = self._generate_strategy_tag(regime, short_score, ml_down, None)
+            # CRITICAL: bot.py _top_strategy() reads breakdown[*].strategy for "sell" arms
+            breakdown = [
+                {
+                    "signal": "sell",
+                    "strategy": strategy_name,
+                    "alloc": float(max(0.05, min(1.0, short_score))),
+                }
+            ]
         else:
             signal = "none"
+            br = block_reason or "filters"
+            strategy_name = self._generate_strategy_tag(regime, short_score, ml_down, br)
 
+        return self._pack(
+            symbol,
+            signal,
+            strategy_name,
+            breakdown,
+            current_price,
+            regime,
+            ml_prob,
+            block_reason,
+            short_score=short_score,
+            atr_pct=atr / max(price, 1e-12),
+            adx=adx,
+            # Raw decision inputs, journaled with each entry (trade journal).
+            pdi=pdi, mdi=mdi, rvol=rvol, ret5=ret5, ret20=ret20,
+            ema_spread=(ef - es) / max(price, 1e-12),
+            ml_component=ml_component, struct_component=struct_component,
+        )
+
+    def _pack(
+        self,
+        symbol: str,
+        signal: str,
+        strategy_name: str,
+        breakdown: list[dict[str, Any]],
+        current_price: float,
+        regime: str,
+        ml_prob: float,
+        block_reason: str | None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        # V2: ML conviction × structure — feeds multiplicative SAC sizing in bot.py
+        ss = float(extra.get("short_score", 0.0))
+        cm = self.ml_conviction_size_mult(ml_prob, ss)
         return {
-            "signal":             signal,
-            "symbol":             symbol,
-            "price":              candles[-1]["close"],
-            "regime":             regime,
-            "buy_weight":         round(buy_weight,  3),
-            "sell_weight":        round(sell_weight, 3),
-            "ml_prob":            round(ml_prob,     3),
-            "on_fire":            on_fire,
-            "position_size_mult": max_pos_mult if signal != "none" else 1.0,
-            "breakdown":          breakdown,
-            "time":               _now(),
+            "signal": signal,
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "price": current_price,
+            "regime": regime,
+            "on_fire": False,
+            "position_size_mult": cm,
+            "buy_weight": 0.0,
+            "sell_weight": float(extra.get("short_score", 0.0)),
+            "ml_prob": round(ml_prob, 6),
+            "breakdown": breakdown,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "block_reason": block_reason,
+            "meta": {
+                k: (round(float(extra[k]), 6) if isinstance(extra[k], (int, float)) else extra[k])
+                for k in (
+                    "atr_pct", "adx", "short_score", "pdi", "mdi", "rvol",
+                    "ret5", "ret20", "ema_spread", "ml_component", "struct_component",
+                )
+                if k in extra
+            },
         }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # REINFORCEMENT LEARNING FEEDBACK
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def reward(self, strategy_name: str, pnl: float, regime: str,
-               state: np.ndarray | None, action: float,
-               next_state: np.ndarray | None, trade_value: float = 1.0) -> None:
-        """
-        Called after every closed trade.
-        Updates strategy scores, regime weights, replay buffer.
-        Logs RL experience for offline SAC training.
-        """
-        strat = self._get_strategy(strategy_name)
-        if strat:
-            strat.record_trade(pnl, trade_value)
-
-        self.total_trades += 1
-
-        # Regime weight EMA update
-        rw      = self.regime_weights.setdefault(regime, {})
-        current = rw.get(strategy_name, 1.0)
-        delta   = 1.0 if pnl > 0 else -0.5
-        rw[strategy_name] = max(0.01, min(5.0, current * 0.9 + delta * 0.1))
-
-        # Replay buffer
-        self.replay_buffer.append({
-            "strategy": strategy_name, "pnl": pnl,
-            "trade_value": trade_value, "regime": regime,
-            "time": _now(), "params": copy.deepcopy(strat.params) if strat else {},
-        })
-
-        # RL experience log (for offline SAC training)
-        if state is not None and next_state is not None:
-            # Differential Sharpe ratio reward
-            rl_reward = _differential_sharpe_reward(pnl, trade_value)
-            log_rl_experience(
-                symbol="ALL", state=state.tolist(), action=action,
-                reward=rl_reward, next_state=next_state.tolist(), done=False)
-
-        # Trigger mutation if score crashes
-        if strat and strat.score < KILL_THRESHOLD:
-            self._mutate_strategy(strat, reason="low_score")
-
-        # Trial evaluation for generated strategies
-        if strat and (getattr(strat, "is_generated", False)
-                      or getattr(strat, "is_yolo", False)):
-            trial_len = (YOLO_TRIAL_TRADES if getattr(strat, "is_yolo", False)
-                         else TRIAL_TRADES)
-            self._evaluate_trial(strat, trial_len)
-
-        if self.total_trades % REPLAY_EVERY == 0:
-            self._replay_review()
-
-        if self.total_trades % GENERATE_EVERY == 0:
-            self._try_generate()
-
-        self.save()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # GENETIC MUTATION
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _mutate_strategy(self, strat: StrategyParams, reason: str = "scheduled") -> None:
-        is_yolo   = getattr(strat, "is_yolo", False)
-        mut_prob  = YOLO_MUTATION_PROB  if is_yolo else MUTATION_PROB
-        mut_scale = YOLO_MUTATION_SCALE if is_yolo else MUTATION_SCALE
-
-        old_params = copy.deepcopy(strat.params)
-        new_params: dict = {}
-        for key, val in strat.params.items():
-            if random.random() < mut_prob:
-                if isinstance(val, float):
-                    noise = val * mut_scale * random.uniform(-1, 1)
-                    new_params[key] = round(val + noise, 4)
-                elif isinstance(val, int):
-                    delta = max(1, int(val * mut_scale))
-                    new_params[key] = max(2, val + random.randint(-delta, delta))
-                else:
-                    new_params[key] = val
-            else:
-                new_params[key] = val
-
-        strat.params     = new_params
-        strat.score      = 0.0
-        strat.generation += 1
-
-        self.mutation_log.append({
-            "time": _now(), "strategy": strat.name, "reason": reason,
-            "generation": strat.generation,
-            "old_params": old_params, "new_params": new_params,
-            "yolo": is_yolo,
-        })
-        emoji = "🔥" if is_yolo else "🧬"
-        log.info("%s MUTATION [%s] gen %d — %s",
-                 emoji, strat.name, strat.generation, reason)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # STRATEGY GENERATION & LIFECYCLE
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _try_generate(self) -> None:
-        if len(self.strategies) >= MAX_STRATEGIES:
-            gen_strats = [s for s in self.strategies
-                          if getattr(s, "is_generated", False)
-                          and s.total_trades >= TRIAL_TRADES]
-            if not gen_strats:
-                return
-            worst = min(gen_strats, key=lambda s: s.score + s.sharpe)
-            self._retire(worst, reason="replaced_by_new")
-
-        existing_names = {s.name for s in self.strategies}
-        sp, fn         = generate_random_strategy(existing_names)
-
-        self.strategies.append(sp)
-        self._generated_fns[sp.name] = fn
-        for r in REGIMES:
-            self.regime_weights.setdefault(r, {})[sp.name] = 1.0
-
-        bp = sp.blueprint
-        self.generation_log.append({
-            "time": _now(), "name": sp.name,
-            "entry": bp.get("entry", "?"), "filter": bp.get("filter", "?"),
-            "logic": bp.get("logic", "?"), "status": "trial",
-        })
-        log.info("🌱 NEW STRATEGY: %s  Entry=%s Filter=%s Logic=%s",
-                 sp.name, bp.get("entry"), bp.get("filter"), bp.get("logic"))
-
-    def _evaluate_trial(self, strat: StrategyParams, trial_len: int) -> None:
-        if strat.total_trades < trial_len:
-            return
-
-        is_core = not getattr(strat, "is_generated", False) and not getattr(strat, "is_yolo", False)
-        passed  = strat.win_rate >= TRIAL_MIN_WIN_RATE and strat.total_pnl >= TRIAL_MIN_PNL
-
-        if passed:
-            verdict = "graduated"
-            log.info("✅ GRADUATED: %s  wr=%.0f%%  pnl=%.2f  sharpe=%.2f",
-                     strat.name, strat.win_rate * 100, strat.total_pnl, strat.sharpe)
-        elif strat.win_rate < 0.30 or strat.total_pnl < TRIAL_MIN_PNL * 2:
-            if not is_core:
-                self._retire(strat, reason="failed_trial")
-                return
-            self._mutate_strategy(strat, reason="core_underperforming")
-            verdict = "mutated"
-        else:
-            self._mutate_strategy(strat, reason="trial_improvement")
-            verdict = "mutated_retry"
-
-        for entry in reversed(self.generation_log):
-            if entry["name"] == strat.name:
-                entry["status"]   = verdict
-                entry["win_rate"] = round(strat.win_rate * 100, 1)
-                entry["pnl"]      = round(strat.total_pnl, 2)
-                break
-
-    def _retire(self, strat: StrategyParams, reason: str) -> None:
-        self.graveyard.append({
-            "time": _now(), "name": strat.name, "reason": reason,
-            "win_rate": round(strat.win_rate * 100, 1),
-            "total_pnl": round(strat.total_pnl, 2),
-            "sharpe": round(strat.sharpe, 3),
-            "generation": strat.generation,
-            "blueprint": getattr(strat, "blueprint", {}),
-        })
-        self.strategies = [s for s in self.strategies if s.name != strat.name]
-        self._generated_fns.pop(strat.name, None)
-        for rw in self.regime_weights.values():
-            rw.pop(strat.name, None)
-        log.info("💀 RETIRED: %s  reason=%s", strat.name, reason)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # REPLAY REVIEW
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _replay_review(self) -> None:
-        if len(self.replay_buffer) < 20:
-            return
-        recent    = self.replay_buffer[-100:]
-        combo_pnl: dict[str, list] = {}
-        for entry in recent:
-            key = f"{entry['strategy']}|{entry['regime']}"
-            combo_pnl.setdefault(key, []).append(entry["pnl"])
-
-        best_combo, best_avg = None, -999.0
-        for key, pnls in combo_pnl.items():
-            sn, regime = key.split("|")
-            avg = sum(pnls) / len(pnls)
-            rw  = self.regime_weights.setdefault(regime, {})
-            boost = 0.15 if avg > 0 else -0.08
-            rw[sn] = max(0.01, min(5.0, rw.get(sn, 1.0) + boost))
-            if avg > best_avg:
-                best_avg, best_combo = avg, key
-
-        log.info("📼 REPLAY — %d trades | best combo: %s avg=$%.2f",
-                 len(recent), best_combo, best_avg)
-
-        for regime in REGIMES:
-            rw    = self.regime_weights.get(regime, {})
-            worst = min(rw, key=lambda k: rw[k], default=None)
-            if worst and rw[worst] < 0.3:
-                s = self._get_strategy(worst)
-                if s:
-                    self._mutate_strategy(s, reason=f"replay_{regime}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ANTI-CORRELATION GUARD
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def are_correlated(self, closes_a: list[float], closes_b: list[float],
-                       window: int = 20) -> bool:
-        if len(closes_a) < window + 1 or len(closes_b) < window + 1:
-            return False
-        ra = [(closes_a[i] - closes_a[i-1]) / (closes_a[i-1] + 1e-9)
-              for i in range(-window, 0)]
-        rb = [(closes_b[i] - closes_b[i-1]) / (closes_b[i-1] + 1e-9)
-              for i in range(-window, 0)]
-        n  = len(ra)
-        ma, mb = sum(ra)/n, sum(rb)/n
-        cov = sum((a-ma)*(b-mb) for a, b in zip(ra, rb)) / n
-        sa  = math.sqrt(sum((a-ma)**2 for a in ra) / n + 1e-12)
-        sb  = math.sqrt(sum((b-mb)**2 for b in rb) / n + 1e-12)
-        return (cov / (sa * sb)) > 0.85
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # HELPERS
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _get_strategy(self, name: str) -> Optional[StrategyParams]:
-        for s in self.strategies:
-            if s.name == name:
-                return s
-        return None
-
-    def get_summary(self) -> dict:
-        return {
-            "total_trades":   self.total_trades,
-            "current_regime": self.current_regime,
-            "circuit_open":   self.circuit_open,
-            "peak_equity":    round(self.peak_equity, 2),
-            "mutations":      len(self.mutation_log),
-            "strategies": [{
-                "name":         s.name,
-                "score":        round(s.score, 2),
-                "win_rate":     round(s.win_rate * 100, 1),
-                "sharpe":       round(s.sharpe, 3),
-                "total_trades": s.total_trades,
-                "total_pnl":    round(s.total_pnl, 2),
-                "generation":   s.generation,
-                "params":       s.params,
-                "is_generated": getattr(s, "is_generated", False),
-                "is_yolo":      getattr(s, "is_yolo", False),
-                "blueprint":    getattr(s, "blueprint", {}),
-                "max_drawdown": round(s.max_drawdown, 2),
-                "on_trial":     (
-                    (getattr(s, "is_generated", False) or getattr(s, "is_yolo", False))
-                    and s.total_trades < (YOLO_TRIAL_TRADES
-                                          if getattr(s, "is_yolo", False) else TRIAL_TRADES)
-                ),
-                "trial_progress": (
-                    round(s.total_trades / (YOLO_TRIAL_TRADES
-                          if getattr(s, "is_yolo", False) else TRIAL_TRADES) * 100)
-                    if (getattr(s, "is_generated", False) or getattr(s, "is_yolo", False))
-                    else None
-                ),
-            } for s in self.strategies],
-            "regime_history":  self.regime_history[-50:],
-            "graveyard":       self.graveyard[-10:],
-            "generation_log":  self.generation_log[-10:],
-            "last_mutations":  self.mutation_log[-3:],
-            "cb_log":          self.cb_log[-5:],
-        }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _differential_sharpe_reward(pnl: float, trade_value: float,
-                                 alpha: float = 0.01) -> float:
-    """
-    Differential Sharpe ratio approximation for RL reward.
-    Penalises losses more than it rewards equivalent gains (risk-averse).
-    """
-    ret = pnl / max(abs(trade_value), 1.0)
-    # Simple differential Sharpe: penalise losses asymmetrically
-    if ret < 0:
-        return ret * 2.0   # losses count double
-    return ret

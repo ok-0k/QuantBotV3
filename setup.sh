@@ -21,7 +21,18 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 TRADING_USER="${SUDO_USER:-pi}"
 HOME_DIR="/home/${TRADING_USER}"
 DATA_DIR="${HOME_DIR}/trading_data"
-BOT_DIR="${HOME_DIR}/quant_bot"
+# Fix O3: BOT_DIR used to default to a hardcoded guess (${HOME_DIR}/trading_bot).
+# That guess already went stale once — this repo was previously cloned to
+# .../quant_bot, and when it was renamed to .../trading_bot, nobody re-ran
+# setup.sh; the *installed* systemd units kept pointing at the old path
+# until a hand-written, untracked drop-in (/etc/systemd/system/quant-bot
+# .service.d/10-paths.conf) patched them at runtime. Deriving BOT_DIR from
+# wherever this script actually lives -- it's always run via `cd <repo>;
+# sudo bash setup.sh` per the README -- means a fresh run can never produce
+# a stale path again, regardless of what the repo directory happens to be
+# named. Still overridable via `BOT_DIR=/some/other/path sudo -E bash setup.sh`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOT_DIR="${BOT_DIR:-${SCRIPT_DIR}}"
 
 info "Setting up Quant Bot v3 for user: ${TRADING_USER}"
 

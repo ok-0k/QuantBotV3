@@ -24,7 +24,7 @@ done
 [[ -z "$PI_IP" ]] && { echo "Usage: ./deploy.sh <pi-ip> [--models] [--restart]"; exit 1; }
 
 PI_USER="${PI_USER:-pi}"
-BOT_DIR="${BOT_DIR:-/home/${PI_USER}/quant_bot}"
+BOT_DIR="${BOT_DIR:-/home/${PI_USER}/trading_bot}"
 DATA_DIR="${DATA_DIR:-/home/${PI_USER}/trading_data}"
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; NC='\033[0m'

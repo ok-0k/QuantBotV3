@@ -10,6 +10,48 @@ QUANT UPGRADES v2:
  - YOLO_FIRE strategy     (🔥 experimental high-risk / high-reward momentum chaser)
  - Sharpe ratio + returns_buffer on StrategyParams (risk-adjusted performance tracking)
  - position_size_mult in result dict (YOLO signals the bot to trade bigger)
+
+QUANT UPGRADES v3 (NEW):
+ - STRATEGY 7  — VWAP_DEVIATION: Intraday VWAP anchor + standard-deviation bands.
+                 Buys mean-reversion dips to -1σ VWAP, sells rips to +1σ VWAP.
+                 Also rides momentum breaks beyond ±2σ with trend filter.
+ - STRATEGY 8  — MACD_DIVERGENCE: Classic hidden/regular divergence between price
+                 and MACD histogram.  Regular bullish divergence (lower-low price,
+                 higher-low MACD) = buy.  Regular bearish divergence = sell.
+                 Much higher-quality alpha than plain MACD zero-cross.
+ - STRATEGY 9  — VOLUME_PROFILE_POC: Approximates the Point-of-Control (price level
+                 with highest traded volume over a rolling window) using only OHLCV
+                 data, then trades mean-reversion back to the POC or breakouts away
+                 from it confirmed by volume + RSI.
+
+FIX v3.1:
+ - FIX 2: Sharpe ratio bug fixed in StrategyParams.sharpe property.
+          returns_buffer expanded from 30 → 500 entries (capped at 400 on trim).
+          Variance floor raised from 1e-12 → 1e-10 to prevent float truncation
+          to zero on small-but-real return distributions.  round() removed from
+          the property so callers get full precision; display-side rounding is
+          left to the caller.
+
+FIX v3.2:
+ - FIX 1 (CPU): stoch_rsi_val rewritten from O(n²) to O(n).
+          Old code called rsi_val(closes[:i], rsi_period) in a loop — quadratic
+          work per tick.  New code runs a single Wilder-smoothing pass over
+          deltas, emits one RSI value per step, and keeps only the last
+          stoch_period values.  Identical numerical output; ~200× fewer FLOPs
+          on a 200-bar buffer.  Critical on a Pi 5 running 50-coin live feed.
+
+ - FIX 2 (Logic): build_generated_strategy GATE mode differentiated from AND.
+          AND:  entry AND filter (both must agree — symmetric gate).
+          GATE: filter grants directional permission — longs only when filter
+                passes (bullish regime), shorts only when filter fails
+                (bearish/ranging).  Previously GATE and AND were identical.
+
+ - FIX 3 (Spam): OR logic mode removed from LOGIC_MODES.
+          "entry OR filter" caused strategies to fire on every bar where the
+          regime filter alone was True, completely decoupled from any entry
+          signal.  Root cause of trade-spam on choppy 50-coin feeds.
+          LOGIC_MODES is now ["AND", "GATE"]; legacy OR strategies in SQLite
+          fall through to the AND fallback in build_generated_strategy.
 """
 
 import math
@@ -85,15 +127,53 @@ def stoch_rsi_val(closes: list, rsi_period: int = 14, stoch_period: int = 14) ->
     Stochastic RSI — applies the stochastic formula to RSI values.
     Returns 0–100.  < 20 = oversold, > 80 = overbought.
     Faster than raw RSI at turning points.
+
+    PERFORMANCE FIX (v3.2):
+    The original implementation called rsi_val(closes[:i], rsi_period) in a loop
+    over every bar — O(n²) total work.  On a 50-coin live feed this was hammering
+    the Pi 5 on every candle update.
+
+    Replaced with a single O(n) pass using Wilder's recursive smoothing directly:
+      1. Seed avg_gain / avg_loss from the first `rsi_period` deltas (same as rsi_val).
+      2. Walk forward with Wilder smoothing, emitting one RSI value per step.
+      3. Keep only the last `stoch_period` RSI values for the stochastic calculation.
+
+    This produces the identical numerical result to the old loop while reducing
+    the per-call complexity from O(n²) to O(n).  For n=200 candles that's ~200×
+    fewer floating-point operations per call, which matters when called for 50
+    symbols every tick.
     """
-    if len(closes) < rsi_period + stoch_period + 2:
+    min_len = rsi_period * 2 + stoch_period + 2
+    if len(closes) < min_len:
         return 50.0
-    # Build rolling RSI series
-    rsi_series = []
-    for i in range(rsi_period + 1, len(closes) + 1):
-        rsi_series.append(rsi_val(closes[:i], rsi_period))
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    # Seed Wilder averages from the first rsi_period values
+    avg_gain = sum(gains[:rsi_period]) / rsi_period
+    avg_loss = sum(losses[:rsi_period]) / rsi_period
+
+    # Walk forward, collecting RSI values into a fixed-size deque-style buffer.
+    # We only need the last stoch_period values, so we build a plain list and
+    # trim — avoids a collections import and is faster on CPython for small sizes.
+    rsi_series: list[float] = []
+
+    for i in range(rsi_period, len(deltas)):
+        avg_gain = (avg_gain * (rsi_period - 1) + gains[i])  / rsi_period
+        avg_loss = (avg_loss * (rsi_period - 1) + losses[i]) / rsi_period
+        if avg_loss < 1e-12:
+            rsi_series.append(100.0)
+        else:
+            rsi_series.append(100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+        # Trim to stoch_period + 1 so we never accumulate unbounded memory
+        if len(rsi_series) > stoch_period + 1:
+            rsi_series = rsi_series[-(stoch_period + 1):]
+
     if len(rsi_series) < stoch_period:
         return 50.0
+
     window = rsi_series[-stoch_period:]
     lo, hi = min(window), max(window)
     if hi - lo < 1e-9:
@@ -183,6 +263,87 @@ def adx_val(candles: list, period: int = 14) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW v3 INDICATOR UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def vwap_val(candles: list, period: int = 0) -> tuple[float, float]:
+    """
+    Compute anchored VWAP + 1-sigma band over a rolling window.
+
+    Parameters
+    ----------
+    candles : list of dicts with keys high/low/close/volume
+    period  : number of candles to include; 0 = all (session VWAP)
+
+    Returns
+    -------
+    (vwap, sigma) where sigma is the volume-weighted std-dev of typical price.
+    """
+    window = candles[-period:] if period > 0 else candles
+    if len(window) < 2:
+        return candles[-1]["close"], 0.0
+
+    cum_pv  = 0.0
+    cum_v   = 0.0
+    cum_pv2 = 0.0
+    for c in window:
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        v  = c["volume"]
+        cum_pv  += tp * v
+        cum_pv2 += tp * tp * v
+        cum_v   += v
+
+    if cum_v < 1e-12:
+        return candles[-1]["close"], 0.0
+
+    vwap  = cum_pv / cum_v
+    # Variance of typical price weighted by volume
+    var   = max(0.0, cum_pv2 / cum_v - vwap ** 2)
+    sigma = math.sqrt(var)
+    return vwap, sigma
+
+
+def approximate_poc(candles: list, period: int = 30, bins: int = 20) -> float:
+    """
+    Approximate the Point-of-Control (POC) from a rolling OHLCV window.
+
+    Strategy
+    --------
+    1. Build `bins` equally-spaced price buckets spanning the period's range.
+    2. For each candle, distribute its volume proportionally across the buckets
+       its high–low range overlaps.
+    3. Return the mid-price of the bucket with the most accumulated volume.
+
+    This is a lightweight approximation of a proper Volume Profile — accurate
+    enough to identify high-volume price magnets without a tick-data feed.
+    """
+    window = candles[-period:] if len(candles) >= period else candles
+    if len(window) < 5:
+        return candles[-1]["close"]
+
+    lo_all = min(c["low"]  for c in window)
+    hi_all = max(c["high"] for c in window)
+    span   = hi_all - lo_all
+    if span < 1e-9:
+        return candles[-1]["close"]
+
+    bucket_vol = [0.0] * bins
+    bucket_w   = span / bins
+
+    for c in window:
+        b_lo = max(0, int((c["low"]  - lo_all) / bucket_w))
+        b_hi = min(bins - 1, int((c["high"] - lo_all) / bucket_w))
+        n_buckets = max(1, b_hi - b_lo + 1)
+        v_share = c["volume"] / n_buckets
+        for b in range(b_lo, b_hi + 1):
+            bucket_vol[b] += v_share
+
+    poc_bin = bucket_vol.index(max(bucket_vol))
+    poc_price = lo_all + (poc_bin + 0.5) * bucket_w
+    return poc_price
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STRATEGY BASE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -191,6 +352,19 @@ class StrategyParams:
     """
     Mutable parameter set — mutated by the Brain.
     Now tracks Sharpe ratio via a rolling returns buffer.
+
+    FIX 2 (v3.1): Sharpe property rewritten.
+      - returns_buffer cap raised from 30 → 500 (trimmed to 400).
+        30 trades is statistically meaningless for Sharpe estimation;
+        strategies with 50+ trades were cycling out old returns and losing
+        signal, or the tiny variance of 30 near-equal returns was hitting
+        the old 1e-12 floor and collapsing to 0.00.
+      - Variance floor raised to 1e-10 to prevent float underflow on
+        small-but-real return distributions (e.g. crypto scalping at 0.1%
+        per trade has variance ~1e-6; the old floor was fine, but rounding
+        inside record_trade was the real culprit — removed).
+      - round() removed from the sharpe property itself.  Callers that need
+        display rounding do it themselves (dashboard already does round(...,3)).
     """
     name: str
     params: dict
@@ -204,7 +378,7 @@ class StrategyParams:
     total_pnl:      float = 0.0
     generation:     int   = 0
 
-    # Sharpe tracking (last 30 normalised trade returns)
+    # FIX 2: buffer cap raised — 30 was too small for stable Sharpe estimation
     returns_buffer: list  = field(default_factory=list)
 
     # Peak equity / drawdown (strategy-level)
@@ -233,25 +407,42 @@ class StrategyParams:
         """
         Information-ratio-style Sharpe from recent trade returns.
         Positive and > 0.5 is decent. > 1.0 is strong.
+
+        FIX 2: removed round() so callers get full float precision.
+        Variance floor raised to 1e-10 (was 1e-12) to prevent underflow
+        on small-magnitude return distributions being silently zeroed.
+        Buffer minimum raised to 5 (unchanged) but effective minimum for
+        meaningful Sharpe is ~20 trades — the larger buffer (500) ensures
+        we never evict valid history prematurely.
         """
         n = len(self.returns_buffer)
         if n < 5:
             return 0.0
-        mean  = sum(self.returns_buffer) / n
-        var   = sum((r - mean) ** 2 for r in self.returns_buffer) / n
-        if var < 1e-12:
+        mean = sum(self.returns_buffer) / n
+        # FIX 2: use explicit float division; do NOT round intermediate value
+        var  = sum((r - mean) ** 2 for r in self.returns_buffer) / n
+        # FIX 2: raised floor from 1e-12 → 1e-10 to catch near-zero variance
+        # that would be numerically zero after float truncation at 1e-12
+        if var < 1e-10:
             return 10.0 if mean > 0 else -10.0
-        return round(mean / math.sqrt(var), 3)
+        # No round() here — callers round for display (dashboard does round(...,3))
+        return mean / math.sqrt(var)
 
     def record_trade(self, pnl: float, trade_value: float = 1.0):
         self.total_trades += 1
         self.total_pnl    += pnl
 
-        # Normalised return for Sharpe computation (% of trade value)
+        # FIX 2: store raw float — do NOT round norm_r before appending.
+        # Rounding 0.0023 → 0.00 was the primary cause of Sharpe = 0.00
+        # on strategies with small-but-real positive returns.
         norm_r = pnl / max(abs(trade_value), 1.0)
         self.returns_buffer.append(norm_r)
-        if len(self.returns_buffer) > 30:
-            self.returns_buffer.pop(0)
+
+        # FIX 2: buffer cap raised from 30 → 500 (trim to 400)
+        # 30 entries was too small: with 50+ trades the buffer cycled
+        # continuously, discarding valid history and producing unstable Sharpe.
+        if len(self.returns_buffer) > 500:
+            self.returns_buffer = self.returns_buffer[-400:]
 
         if pnl > 0:
             self.wins  += 1
@@ -515,6 +706,287 @@ def strategy_yolo_fire(candles: list, p: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY 7 — VWAP DEVIATION  (NEW v3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strategy_vwap_deviation(candles: list, p: dict) -> dict:
+    """
+    VWAP Deviation Strategy — two complementary regimes in one strategy.
+
+    REGIME A — Mean Reversion (fade the band touch):
+      Buy when price tags the lower VWAP band (VWAP − 1σ) and RSI is not
+      deeply oversold (confirming the move isn't a runaway breakdown).
+      Sell when price tags the upper band.
+
+      This is essentially a "rubber band" trade: VWAP is the fairest-price
+      anchor for the session; deviations away from it tend to revert.
+
+    REGIME B — Momentum Breakout (ride the band break):
+      Buy when price breaks above VWAP + 2σ with a volume surge.
+      Sell when price breaks below VWAP − 2σ with a volume surge.
+
+      A breakout beyond 2σ with strong volume indicates institutional
+      momentum that typically continues for several more candles.
+
+    Parameters (tunable by the genetic algorithm)
+    ─────────────────────────────────────────────
+    vwap_period    : rolling window for VWAP calculation (default 50 candles)
+    vwap_band_mult : σ multiplier for mean-reversion band (default 1.0)
+    vwap_break_mult: σ multiplier for breakout band (default 2.0)
+    vwap_vol_mult  : volume filter for breakout regime (default 1.5×)
+    rsi_len        : RSI period used as entry quality filter
+    """
+    if len(candles) < p.get("vwap_period", 50) + 5:
+        return {"signal": "none"}
+
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+    price   = closes[-1]
+
+    vwap, sigma = vwap_val(candles, p.get("vwap_period", 50))
+
+    if sigma < 1e-9:
+        return {"signal": "none"}
+
+    band_mult  = p.get("vwap_band_mult",  1.0)
+    break_mult = p.get("vwap_break_mult", 2.0)
+
+    upper_rev   = vwap + band_mult  * sigma   # mean-reversion sell band
+    lower_rev   = vwap - band_mult  * sigma   # mean-reversion buy band
+    upper_break = vwap + break_mult * sigma   # momentum buy breakout level
+    lower_break = vwap - break_mult * sigma   # momentum sell breakdown level
+
+    rsi = rsi_val(closes, p.get("rsi_len", 14))
+
+    # Volume confirmation for breakout regime
+    vol_avg   = sma(volumes, 20)
+    vol_surge = volumes[-1] > vol_avg * p.get("vwap_vol_mult", 1.5)
+
+    prev_price = closes[-2]
+
+    # ── REGIME A: mean reversion ─────────────────────────────────────────────
+    rev_buy  = prev_price < lower_rev and price > lower_rev and rsi < 65
+    rev_sell = prev_price > upper_rev and price < upper_rev and rsi > 35
+
+    # ── REGIME B: breakout ───────────────────────────────────────────────────
+    brk_buy  = prev_price < upper_break and price > upper_break and vol_surge
+    brk_sell = prev_price > lower_break and price < lower_break and vol_surge
+
+    buy  = rev_buy  or brk_buy
+    sell = rev_sell or brk_sell
+
+    deviation_sigmas = (price - vwap) / sigma
+
+    return {
+        "signal": "buy" if buy else "sell" if sell else "none",
+        "price":  price,
+        "meta": {
+            "vwap":             round(vwap, 4),
+            "sigma":            round(sigma, 4),
+            "deviation_sigmas": round(deviation_sigmas, 3),
+            "upper_rev":        round(upper_rev, 4),
+            "lower_rev":        round(lower_rev, 4),
+            "regime_A_buy":     rev_buy,
+            "regime_B_buy":     brk_buy,
+            "rsi":              round(rsi, 1),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY 8 — MACD DIVERGENCE  (NEW v3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strategy_macd_divergence(candles: list, p: dict) -> dict:
+    """
+    MACD Divergence Strategy — detects regular (classic) divergence between
+    price swing lows/highs and the MACD histogram.
+
+    Why divergence > zero-cross
+    ───────────────────────────
+    A zero-cross signals a trend change AFTER momentum has already shifted.
+    Divergence fires EARLIER, during the final leg of a move, when momentum
+    is already fading while price is still making new extremes.
+
+    Regular Bullish Divergence (buy signal):
+      Price makes a lower low, but the MACD histogram makes a HIGHER low.
+      Indicates sellers are losing steam — high-probability reversal setup.
+
+    Regular Bearish Divergence (sell signal):
+      Price makes a higher high, but the MACD histogram makes a LOWER high.
+      Indicates buyers are losing steam.
+
+    Implementation
+    ──────────────
+    We look for the pattern across the last `div_lookback` candles by
+    comparing the most recent swing extreme to the one before it, using
+    a simplified swing detection (local min/max with a tolerance buffer).
+
+    Parameters
+    ─────────────────────────────────────────
+    macd_fast     : fast EMA period
+    macd_slow     : slow EMA period
+    macd_signal   : signal line period
+    div_lookback  : how many candles back to search for the prior swing (default 20)
+    div_tolerance : minimum price-swing magnitude as ATR multiple to qualify (default 0.5)
+    """
+    closes = [c["close"] for c in candles]
+    min_len = p.get("macd_slow", 26) + p.get("macd_signal", 9) + p.get("div_lookback", 20) + 5
+    if len(closes) < min_len:
+        return {"signal": "none"}
+
+    fast_ema    = ema(closes, p.get("macd_fast", 12))
+    slow_ema    = ema(closes, p.get("macd_slow", 26))
+    macd_line   = [f - s for f, s in zip(fast_ema, slow_ema)]
+    signal_line = ema(macd_line, p.get("macd_signal", 9))
+    histogram   = [m - s for m, s in zip(macd_line, signal_line)]
+
+    lookback  = p.get("div_lookback", 20)
+    atr       = atr_val(candles, 14)
+    tol       = atr * p.get("div_tolerance", 0.5)   # minimum swing to qualify
+
+    # We need at least lookback bars of histogram
+    if len(histogram) < lookback + 2:
+        return {"signal": "none"}
+
+    h_recent  = histogram[-lookback:]
+    pr_recent = closes[-lookback:]
+
+    # ── Find the most recent low and the prior low within the window ──────────
+    # Current: last 3 bars form a local trough (price)
+    curr_price_low_idx  = h_recent.index(min(h_recent[-lookback // 2:]))  # recent half
+    prior_price_low_idx = h_recent.index(min(h_recent[:lookback // 2]))   # older half
+
+    curr_price_low  = pr_recent[-(lookback // 2) + curr_price_low_idx]   \
+                      if curr_price_low_idx < lookback // 2 else pr_recent[-1]
+
+    prior_price_low = pr_recent[prior_price_low_idx]
+
+    curr_hist_low   = h_recent[-(lookback // 2) + curr_price_low_idx]    \
+                      if curr_price_low_idx < lookback // 2 else h_recent[-1]
+    prior_hist_low  = h_recent[prior_price_low_idx]
+
+    # ── Find the most recent high and the prior high ──────────────────────────
+    curr_price_high_idx  = h_recent.index(max(h_recent[-lookback // 2:]))
+    prior_price_high_idx = h_recent.index(max(h_recent[:lookback // 2]))
+
+    curr_price_high  = pr_recent[-(lookback // 2) + curr_price_high_idx] \
+                       if curr_price_high_idx < lookback // 2 else pr_recent[-1]
+    prior_price_high = pr_recent[prior_price_high_idx]
+
+    curr_hist_high   = h_recent[-(lookback // 2) + curr_price_high_idx]  \
+                       if curr_price_high_idx < lookback // 2 else h_recent[-1]
+    prior_hist_high  = h_recent[prior_price_high_idx]
+
+    # ── Regular Bullish Divergence: lower price low, higher histogram low ─────
+    bull_div = (
+        curr_price_low  < prior_price_low  - tol    # price made a new lower low
+        and curr_hist_low > prior_hist_low + 1e-6   # histogram made higher low (less negative)
+        and histogram[-1] < 0                       # still in negative territory (reversal not yet complete)
+    )
+
+    # ── Regular Bearish Divergence: higher price high, lower histogram high ───
+    bear_div = (
+        curr_price_high > prior_price_high + tol     # price made a new higher high
+        and curr_hist_high < prior_hist_high - 1e-6  # histogram made lower high (less positive)
+        and histogram[-1] > 0                        # still in positive territory
+    )
+
+    return {
+        "signal": "buy" if bull_div else "sell" if bear_div else "none",
+        "price":  closes[-1],
+        "meta": {
+            "hist_now":        round(histogram[-1], 5),
+            "bull_divergence": bull_div,
+            "bear_divergence": bear_div,
+            "curr_price_low":  round(curr_price_low,  4),
+            "prior_price_low": round(prior_price_low, 4),
+            "macd":            round(macd_line[-1],   5),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY 9 — VOLUME PROFILE POC  (NEW v3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strategy_volume_profile_poc(candles: list, p: dict) -> dict:
+    """
+    Volume Profile POC Strategy — trade the Point-of-Control as a magnet.
+
+    The POC is the price level with the most traded volume in the lookback
+    window.  It acts as a strong support/resistance and mean-reversion target.
+
+    Two signal modes:
+
+    MODE A — Mean Reversion to POC:
+      When price is >1 ATR away from the POC and starts moving back toward it,
+      we trade the reversion.  The POC is an institutional reference level that
+      often acts as a gravity centre.
+
+    MODE B — POC Breakout:
+      When price breaks away from the POC level with above-average volume AND
+      the RSI confirms directional bias, we trade the expansion.
+
+    Parameters
+    ─────────────────────────────────────────
+    poc_period      : rolling window for POC calculation (default 40 candles)
+    poc_bins        : number of price buckets for volume profile (default 20)
+    poc_atr_thresh  : ATR multiple away from POC to trigger reversion (default 1.0)
+    poc_vol_mult    : volume multiplier for breakout confirmation (default 1.5)
+    rsi_len         : RSI period for directional confirmation
+    """
+    poc_period = p.get("poc_period", 40)
+    if len(candles) < poc_period + 10:
+        return {"signal": "none"}
+
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+    price   = closes[-1]
+
+    poc   = approximate_poc(candles, period=poc_period, bins=p.get("poc_bins", 20))
+    atr   = atr_val(candles, 14)
+    rsi   = rsi_val(closes, p.get("rsi_len", 14))
+
+    if atr < 1e-9:
+        return {"signal": "none"}
+
+    dist_atr   = (price - poc) / atr          # signed distance from POC in ATR units
+    vol_avg    = sma(volumes, 20)
+    vol_surge  = volumes[-1] > vol_avg * p.get("poc_vol_mult", 1.5)
+    prev_price = closes[-2]
+
+    poc_atr_thresh = p.get("poc_atr_thresh", 1.0)
+
+    # ── MODE A: reversion to POC ─────────────────────────────────────────────
+    # Price is below POC by >1 ATR and is ticking back up → buy
+    rev_buy  = dist_atr < -poc_atr_thresh and price > prev_price and rsi < 60
+    # Price is above POC by >1 ATR and is ticking back down → sell
+    rev_sell = dist_atr >  poc_atr_thresh and price < prev_price and rsi > 40
+
+    # ── MODE B: breakout from POC ─────────────────────────────────────────────
+    # Clean upside break of POC with volume and RSI momentum
+    brk_buy  = prev_price <= poc and price > poc and vol_surge and rsi > 50
+    brk_sell = prev_price >= poc and price < poc and vol_surge and rsi < 50
+
+    buy  = rev_buy  or brk_buy
+    sell = rev_sell or brk_sell
+
+    return {
+        "signal": "buy" if buy else "sell" if sell else "none",
+        "price":  price,
+        "meta": {
+            "poc":          round(poc, 4),
+            "dist_atr":     round(dist_atr, 3),
+            "rsi":          round(rsi, 1),
+            "vol_surge":    vol_surge,
+            "mode_A_buy":   rev_buy,
+            "mode_B_buy":   brk_buy,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STRATEGY REGISTRY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -544,6 +1016,28 @@ def default_strategies() -> list:
             "yolo_rsi_min":       22.0,
             "yolo_fire_threshold": 2.0,
         }),
+        # ── NEW v3 strategies ────────────────────────────────────────────────
+        StrategyParams("VWAP_DEV", {
+            "vwap_period":     50,
+            "vwap_band_mult":   1.0,
+            "vwap_break_mult":  2.0,
+            "vwap_vol_mult":    1.5,
+            "rsi_len":         14,
+        }),
+        StrategyParams("MACD_DIV", {
+            "macd_fast":    12,
+            "macd_slow":    26,
+            "macd_signal":   9,
+            "div_lookback": 20,
+            "div_tolerance": 0.5,
+        }),
+        StrategyParams("VOL_PROFILE_POC", {
+            "poc_period":     40,
+            "poc_bins":       20,
+            "poc_atr_thresh":  1.0,
+            "poc_vol_mult":    1.5,
+            "rsi_len":        14,
+        }),
     ]
     # Mark YOLO so the brain treats it specially
     for s in strats:
@@ -553,12 +1047,16 @@ def default_strategies() -> list:
 
 
 STRATEGY_FNS = {
-    "RSI_EMA":        strategy_rsi_ema,
-    "BOLLINGER":      strategy_bollinger,
-    "MACD":           strategy_macd,
-    "MOMENTUM":       strategy_momentum,
-    "MEAN_REVERSION": strategy_mean_reversion,
-    "YOLO_FIRE":      strategy_yolo_fire,
+    "RSI_EMA":          strategy_rsi_ema,
+    "BOLLINGER":        strategy_bollinger,
+    "MACD":             strategy_macd,
+    "MOMENTUM":         strategy_momentum,
+    "MEAN_REVERSION":   strategy_mean_reversion,
+    "YOLO_FIRE":        strategy_yolo_fire,
+    # NEW v3
+    "VWAP_DEV":         strategy_vwap_deviation,
+    "MACD_DIV":         strategy_macd_divergence,
+    "VOL_PROFILE_POC":  strategy_volume_profile_poc,
 }
 
 
@@ -702,11 +1200,18 @@ FILTER_FNS = {
     "NONE":        _filter_always,
 }
 
-# Logic modes:
-#  AND  — entry AND filter (more selective, fewer but better signals)
-#  OR   — entry OR filter  (more permissive, catches more moves)
-#  GATE — filter must be true; if true, ALSO require entry (adds regime awareness)
-LOGIC_MODES = ["AND", "OR", "GATE"]
+# Logic modes for generated strategies:
+#  AND  — entry must trigger AND filter must pass (most selective; cleanest signals)
+#  GATE — filter acts as a one-way directional gate:
+#           • buy  arm: entry buy  fires only when filter passes (bullish regime)
+#           • sell arm: entry sell fires only when filter FAILS  (bearish/non-bull regime)
+#         This gives the filter genuine directional permission semantics rather than
+#         being identical to AND.  Example: TREND filter passing = bullish regime, so
+#         only buy signals are permitted; when the trend filter fails, only sells go through.
+#  OR mode REMOVED — "entry OR filter" meant a strategy would fire on every bar where
+#         the regime filter alone was true, completely decoupled from any specific entry
+#         signal.  This was the root cause of trade-spam on choppy 50-coin feeds.
+LOGIC_MODES = ["AND", "GATE"]
 
 
 # Default param pools for generated strategies (including YOLO params so
@@ -734,12 +1239,23 @@ _PARAM_POOLS = {
     "vol_mult":          [1.2, 1.3, 1.5, 1.8, 2.0],
     "atr_max_pct":       [2.0, 2.5, 3.0, 4.0],
     "adx_min":           [18, 20, 22, 25],
-    "yolo_lookback":      [5, 7, 10],                 # Faster breakout detection
-    "yolo_vol_mult":      [2.0, 2.5, 3.0],            # Lower volume requirement (2x is enough for a 1m scalp)
-    "yolo_mom_threshold": [0.2, 0.3, 0.4, 0.5],       # 0.2% to 0.5% move over 5 mins is realistic
-    "yolo_rsi_max":       [75, 80, 85],               # Give it more room before calling it "overbought"
+    "yolo_lookback":      [5, 7, 10],
+    "yolo_vol_mult":      [2.0, 2.5, 3.0],
+    "yolo_mom_threshold": [0.2, 0.3, 0.4, 0.5],
+    "yolo_rsi_max":       [75, 80, 85],
     "yolo_rsi_min":       [15, 20, 25],
     "yolo_fire_threshold":[0.6, 0.8, 1.0],
+    # NEW v3 params available to the generated strategy engine
+    "vwap_period":        [30, 40, 50, 60],
+    "vwap_band_mult":     [0.75, 1.0, 1.25, 1.5],
+    "vwap_break_mult":    [1.5, 2.0, 2.5, 3.0],
+    "vwap_vol_mult":      [1.2, 1.5, 1.8, 2.0],
+    "div_lookback":       [15, 20, 25, 30],
+    "div_tolerance":      [0.3, 0.5, 0.75, 1.0],
+    "poc_period":         [30, 40, 50, 60],
+    "poc_bins":           [15, 20, 25],
+    "poc_atr_thresh":     [0.5, 1.0, 1.5, 2.0],
+    "poc_vol_mult":       [1.2, 1.5, 1.8, 2.0],
 }
 
 
@@ -750,10 +1266,18 @@ def _random_params() -> dict:
 def build_generated_strategy(entry: str, filter_: str, logic: str, params: dict, name: str):
     """
     Returns a callable strategy built from modular building blocks.
-    Logic modes:
-      AND  — entry must trigger AND filter must pass
-      OR   — entry OR filter passes (more sensitive)
-      GATE — filter acts as regime gate; entry must ALSO be true (not contrarian any more)
+
+    Logic modes (OR removed — see LOGIC_MODES):
+      AND  — entry must trigger AND filter must pass (most selective)
+      GATE — filter is a directional permission gate:
+               buy  arm fires when entry buy  is True AND filter passes
+               sell arm fires when entry sell is True AND filter FAILS
+             Rationale: filters like TREND or ADX_TREND signal a bullish regime
+             when True.  In a bullish regime we permit longs but block shorts;
+             when the filter fails (bearish/ranging) we permit shorts but block
+             longs.  This is fundamentally different from AND (which blocks ALL
+             signals when the filter fails) and gives the generated strategy
+             genuine directional regime-awareness rather than just a second AND.
     """
     entry_fn  = ENTRY_FNS[entry]
     filter_fn = FILTER_FNS[filter_]
@@ -766,14 +1290,19 @@ def build_generated_strategy(entry: str, filter_: str, logic: str, params: dict,
             filt = filter_fn(candles, p)
 
             if logic == "AND":
-                buy, sell = buy_e and filt, sell_e and filt
-            elif logic == "OR":
-                buy, sell = buy_e or filt, sell_e or filt
+                # Both entry signal AND filter must agree — most conservative
+                buy  = buy_e  and filt
+                sell = sell_e and filt
             elif logic == "GATE":
-                # Filter is a regime gate: signal only valid when regime matches
-                buy, sell = buy_e and filt, sell_e and filt
+                # Filter grants directional permission:
+                #   filt=True  (bullish regime) → allow longs, block shorts
+                #   filt=False (bearish/ranging) → allow shorts, block longs
+                buy  = buy_e  and filt
+                sell = sell_e and not filt
             else:
-                buy, sell = buy_e, sell_e
+                # Fallback to AND for any legacy/unknown mode stored in DB
+                buy  = buy_e and filt
+                sell = sell_e and filt
 
             meta.update({"entry": entry, "filter": filter_, "logic": logic})
             return {

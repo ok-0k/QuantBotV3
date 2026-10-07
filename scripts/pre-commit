@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan — blocks commits whose staged ADDED lines look like
+# they contain credentials. Install:  cp scripts/pre-commit .git/hooks/ && chmod +x .git/hooks/pre-commit
+# Bypass deliberately (rarely): SKIP_SECRET_SCAN=1 git commit ...
+
+set -euo pipefail
+[ "${SKIP_SECRET_SCAN:-0}" = "1" ] && exit 0
+
+added=$(git diff --cached --diff-filter=ACM -U0 | grep '^+' | grep -v '^+++' || true)
+[ -z "$added" ] && exit 0
+
+patterns=(
+  'discord\.com/api/webhooks/[0-9]+'
+  '(api[_-]?key|api[_-]?secret|apikey)[^=]{0,12}=[[:space:]]*["'"'"'][A-Za-z0-9+/=_-]{16,}'
+  'BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY'
+  'AKIA[0-9A-Z]{16}'
+  'BINANCE[A-Z_]*(KEY|SECRET)[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9]{20,}'
+)
+
+for p in "${patterns[@]}"; do
+  if match=$(printf '%s\n' "$added" | grep -i -E "$p" | head -3); then
+    if [ -n "$match" ]; then
+      echo "✖ pre-commit: staged lines match a secret pattern:" >&2
+      echo "    pattern: $p" >&2
+      echo "$match" | sed 's/^/    /' | cut -c1-100 >&2
+      echo "  Move the value to ~/.config/quant-bot/env (or SKIP_SECRET_SCAN=1 if this is a false positive)." >&2
+      exit 1
+    fi
+  fi
+done
+exit 0

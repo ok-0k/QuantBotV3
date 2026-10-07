@@ -33,16 +33,21 @@ Self-improving algorithmic trading bot: XGBoost signal filtering + SAC reinforce
 
 | File | Role | Runs On |
 |------|------|---------|
-| `bot.py` | Async WebSocket orchestrator | Pi (main) |
-| `brain.py` | Strategy ensemble + regime + circuit breaker | Pi |
-| `strategies.py` | 6 core strategies + generated strategy engine | Pi |
+| `bot.py` | Async WebSocket orchestrator + `_execute_trade` executor | Pi (main) |
+| `brain.py` | Short-only signal engine + regime + circuit breaker + adaptive edge | Pi |
+| `execution/` | Order backends: `paper` (default) and Binance Spot **testnet** — no live mode exists | Pi |
+| `risk_engine.py` | Conviction sizing, volatility R:R, correlation + exposure caps | Pi |
+| `accounting_v2.py` | Fee-deducted PnL / equity components | Pi |
+| `binance_margin.py` | Optional read-only margin telemetry (signed SAPI GET) | Pi |
+| `strategies.py` | Legacy strategy library (not wired into the current short-only Brain) | Pi |
 | `features.py` | Vectorized feature engineering (pandas/numpy) | Pi (worker) |
 | `ml_engine.py` | XGBoost incremental training + inference | Pi (worker) |
 | `rl_agent.py` | SAC actor NumPy inference (40 µs forward pass) | Pi (worker) |
-| `db.py` | WAL-mode SQLite with all PRAGMAs | Pi |
-| `config.py` | All tunable constants | Pi |
-| `dashboard.py` | FastAPI + HTMX + SSE real-time UI | Pi (separate process) |
+| `db.py` | WAL-mode SQLite: candles/positions/trades/equity/RL + **orders journal** | Pi |
+| `config.py` | All tunable constants + env overrides + `~/.config/quant-bot/env` loader | Pi |
+| `dashboard.py` | FastAPI + SSE UI (optional `DASHBOARD_AUTH_TOKEN`) | Pi (systemd unit) |
 | `offline_trainer.py` | Optuna + full XGBoost + SAC training | **Laptop** |
+| `tests/` | pytest suite — characterization + protection tests (sandboxed DB) | dev |
 
 ---
 
@@ -132,22 +137,69 @@ The SAC actor hot-reloads automatically — no bot restart needed.
 
 ---
 
-## Key Configuration (`config.py`)
+## Key Configuration (`config.py`) — synced 2026-07-11
 
-| Constant | Default | Notes |
+| Constant | Live value | Notes |
 |----------|---------|-------|
 | `STARTING_CASH` | 10,000 | Paper trading balance |
-| `SYMBOLS` | 5 pairs | BTC ETH SOL BNB XRP |
-| `TRADE_SIZE_PCT` | 8% | Base allocation per trade |
-| `YOLO_TRADE_SIZE_PCT` | 12% | YOLO_FIRE starting size |
-| `MAX_TRADE_SIZE_PCT` | 25% | Hard ceiling |
-| `MAX_OPEN_POSITIONS` | 4 | Concurrent positions |
-| `STOP_LOSS_ATR_MULT` | 4.5× | ATR-based stop distance |
-| `TAKE_PROFIT_ATR_MULT` | 8.0× | ATR-based target distance |
-| `MAX_DRAWDOWN_PCT` | 20% | Circuit breaker threshold |
-| `ML_SIGNAL_THRESHOLD` | 0.60 | XGBoost buy-gate threshold |
+| `SYMBOLS` | 47 pairs | Large caps → gaming/NFT alts |
+| `MAX_OPEN_POSITIONS` | 15 | Concurrent longs |
+| `SHORT_MAX_OPEN` | 5 | Concurrent shorts |
+| `_SAC_SIZE_CEILING` (bot.py) | 35% | Per-trade equity ceiling (SAC-sized) |
+| `MAX_ORDER_EQUITY_FRAC` | 50% | V4 hard per-order clamp (defense in depth) |
+| `STOP_LOSS_ATR_MULT` / `TAKE_PROFIT_ATR_MULT` | 6× / 12× | Long ATR distances |
+| `SHORT_STOP_LOSS_ATR_MULT` / `SHORT_TAKE_PROFIT_ATR_MULT` | 3.5× / 10× | Short ATR distances |
+| `MAX_DRAWDOWN_PCT` / `CB_RECOVERY_PCT` | 20% / 10% | Circuit breaker trip / re-arm |
+| `MIN_ML_CONFIDENCE` | 0.80 | Entry ML gate (long: p, short: 1−p) |
+| `HARD_STOP_LOSS_USD` | −15 | Survival kill-switch per position |
+| `FEE_GATE_ROUND_TRIP` | 0.12% | Round-trip taker fee model |
+| `EXECUTION_MODE` | paper | `paper` \| `testnet` (env) — **no live mode** |
+| `STALE_ENTRY_MAX_SECS` | 180 | V4: refuse entries on stale candles |
+| `WS_BACKFILL_AFTER_SECS` | 90 | V4: REST backfill after WS outage |
 | `PROCESS_POOL_WORKERS` | 2 | Worker processes (thermal limit) |
 | `CHECK_EVERY_SECS` | 30 | Exit monitor scan interval |
+
+Strategy-lifecycle note: `config.py`'s `TRIAL_*` / `KILL_THRESHOLD` /
+`MUTATION_*` constants belong to the legacy `strategies.py` system, which the
+current short-only `brain.py` does **not** use. `strategy_engine_gen2.py`
+carries its own separate thresholds and is also not wired into `bot.py`.
+The live signal path is: `brain.get_ensemble_signal` → ML gate → SAC sizing.
+
+## Execution modes & V4 order protections
+
+- `EXECUTION_MODE=paper` (default): simulated fills, identical maths to the
+  historical behaviour — pinned by `tests/test_executor.py`.
+- `EXECUTION_MODE=testnet`: Binance Spot testnet. Requires
+  `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` (put them in
+  `~/.config/quant-bot/env`, chmod 600). There is deliberately no mainnet mode.
+- Protections active in every mode:
+  - **Duplicate orders**: deterministic client-order-id per
+    (symbol, action, candle) claimed in the `orders` journal before money
+    moves; retries and duplicate signals collapse onto one order.
+  - **Stale data**: entries refused when the newest candle is older than
+    `STALE_ENTRY_MAX_SECS`; exits never gated.
+  - **Oversized orders**: `MAX_ORDER_EQUITY_FRAC` clamp at the executor.
+  - **Restarts**: boot-time journal reconciliation + cash-invariant report.
+  - **Network loss**: WS exponential backoff + full REST backfill after
+    outages > `WS_BACKFILL_AFTER_SECS`; entry freeze via the stale gate.
+  - **Partial fills / retries / rate limits** (testnet): actual executedQty
+    booked, query-before-retry idempotency, weight-based token bucket.
+
+## Secrets
+
+Never hardcode credentials. `config.py` loads `~/.config/quant-bot/env`
+(KEY=VALUE, chmod 600) at import; real env vars win. Known keys:
+`DISCORD_WEBHOOK_URL`, `DASHBOARD_AUTH_TOKEN`, `BINANCE_API_KEY`,
+`BINANCE_API_SECRET`, `BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`.
+A pre-commit hook (`scripts/pre-commit`, installed in `.git/hooks/`) blocks
+staged lines that look like credentials.
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+Runs against a throwaway temp-dir database — never the live one.
 
 ---
 

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+bot_log.txt
+training_data.csv
+*.npz
+offline_output/
+*.log
+.pytest_cache/
