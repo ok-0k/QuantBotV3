@@ -15,6 +15,7 @@ known at T.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
@@ -163,9 +164,11 @@ def build_panel(symbols, interval: str, start, end=None) -> dict[str, pd.DataFra
     return {name: df.reindex(full) for name, df in out.items()}
 
 
-def resample(panel: dict[str, pd.DataFrame], rule: str) -> dict[str, pd.DataFrame]:
-    """Coarsen a close-time-indexed panel. A coarse bar is kept only if it is
-    complete (all constituent fine bars present) — otherwise NaN."""
+def resample(panel: dict[str, pd.DataFrame], rule: str, min_frac: float = 0.9) -> dict[str, pd.DataFrame]:
+    """Coarsen a close-time-indexed panel. A coarse bar is kept only if at
+    least min_frac of its fine bars are present (default 90%: a daily bar
+    survives one or two missing hours, e.g. the 2023-03-24 exchange outage;
+    a 4h bar still needs all four hours) — otherwise NaN."""
     r = {
         "open": panel["open"].resample(rule, closed="right", label="right").first(),
         "high": panel["high"].resample(rule, closed="right", label="right").max(),
@@ -176,8 +179,9 @@ def resample(panel: dict[str, pd.DataFrame], rule: str) -> dict[str, pd.DataFram
     idx = panel["close"].index
     fine = idx[1] - idx[0]
     expected = int(pd.Timedelta(rule) / fine)
+    need = math.ceil(expected * min_frac - 1e-9)
     n = panel["close"].notna().resample(rule, closed="right", label="right").sum()
-    return {k: v.where(n >= expected) for k, v in r.items()}
+    return {k: v.where(n >= need) for k, v in r.items()}
 
 
 def utc(y: int, m: int, d: int) -> pd.Timestamp:

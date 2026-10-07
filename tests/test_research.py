@@ -93,13 +93,15 @@ def test_random_signals_lose_the_costs():
 def test_resample_daily_ohlc_and_incomplete_days():
     c = pd.DataFrame({"A": np.arange(1.0, len(IDX_H) + 1)}, index=IDX_H)
     panel = {"open": c - 0.5, "high": c + 1, "low": c - 1, "close": c, "qv": c * 0 + 10}
-    panel["close"].iloc[30] = np.nan                     # a gap on day 2
+    panel["close"].iloc[30:33] = np.nan                  # 3 missing hours on day 2 (> 10%)
+    panel["close"].iloc[60] = np.nan                     # 1 missing hour on day 3 (tolerated)
     d = resample(panel, "1D")
     day1 = pd.Timestamp("2024-01-02", tz="UTC")           # bar covering (01-01 00:00, 01-02 00:00]
     assert d["close"]["A"][day1] == 24.0 and d["high"]["A"][day1] == 25.0
     assert d["low"]["A"][day1] == 0.0 and d["qv"]["A"][day1] == 240.0
     assert np.isnan(d["close"]["A"][pd.Timestamp("2024-01-03", tz="UTC")])   # incomplete day dropped
-    assert d["close"]["A"][pd.Timestamp("2024-01-04", tz="UTC")] == 72.0
+    assert d["close"]["A"][pd.Timestamp("2024-01-04", tz="UTC")] == 72.0      # one gap hour tolerated
+    assert resample(panel, "1D", min_frac=1.0)["close"]["A"].isna().sum() >= 3
 
 
 def test_tradable_requires_listing_age_and_volume():

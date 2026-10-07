@@ -43,9 +43,9 @@ def main() -> None:
     print(f"market-wide missing hours (>50% of listed symbols): {len(outage)}"
           + (f" e.g. {', '.join(str(t) for t in outage.index[:5])}" if len(outage) else ""))
     d = resample(p, "1D")["close"]
-    dl = d.notna().cumsum() > 0
-    inc = (d.isna() & dl & (d.index <= d.index.max())).sum().sum()
-    print(f"daily bars dropped as incomplete (after listing): {inc} of {int(dl.sum().sum())}")
+    live = (d.notna().cumsum() > 0) & (d[::-1].notna().cumsum()[::-1] > 0)   # listing .. delisting
+    inc = int((d.isna() & live).sum().sum())
+    print(f"daily bars dropped as incomplete (while listed): {inc} of {int(live.sum().sum())}")
     nf = 0
     for s in SYMBOLS:
         try:
