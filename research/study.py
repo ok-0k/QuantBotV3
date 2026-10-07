@@ -90,6 +90,19 @@ def specs() -> list[Spec]:
     return out
 
 
+def funding_buckets(funding: pd.DataFrame) -> pd.DataFrame:
+    """Total funding per 8h window, labelled by the window END.
+
+    Some perps settle every 4h, others every 8h, so settlements are SUMMED
+    into 8h buckets (t-8h, t] -> t: a decision at t only sees settlements
+    already paid by t. Settlement timestamps carry ms jitter, hence the
+    rounding to the hour first.
+    """
+    f = funding.copy()
+    f.index = f.index.round("1h").ceil("8h")
+    return f.groupby(level=0).sum(min_count=1)
+
+
 def _log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
@@ -133,9 +146,7 @@ def main() -> None:
                 fund[s] = f
         except Exception as exc:          # no perp for this symbol
             _log(f"  funding {s}: {exc}")
-    funding = pd.DataFrame(fund).sort_index()
-    funding.index = funding.index.floor("8h")
-    funding = funding.groupby(level=0).last()
+    funding = funding_buckets(pd.DataFrame(fund).sort_index())
     bench["8h"] = bench["1h"].pipe(lambda r: (1 + r).resample("8h", closed="right", label="right").prod() - 1)
 
     rows = {}
