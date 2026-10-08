@@ -55,11 +55,12 @@ Nightly cron 04:00 (Pi time): stop bot → prune_db.sh → start bot → restart
 | `config.py` | All tunables, env overrides, `~/.config/quant-bot/env` loader |
 | `dashboard.py` | FastAPI + SSE dashboard (optional `DASHBOARD_AUTH_TOKEN`) |
 | `ml_engine.py`, `features.py`, `rl_agent.py` | XGBoost gate, features, SAC actor inference |
-| `prune_db.sh` | Nightly maintenance. Trims candles and old equity detail, **never trade data** |
+| `prune_db.sh` | Nightly maintenance: compressed DB backup first, then trims candles and old equity detail, **never trade data** |
+| `insights.py` | Read-only journal analytics behind the dashboard's Insights / Experiment / "How Trades End" sections |
 | `scripts/experiment_report.py` | Read-only A/B report for the running experiment |
 | `scripts/entry_edge.py` | Read-only: the bot's entries against random entry, using Binance history |
 | `research/` | Offline backtester, data cache, pre-registered study, carry analysis ([results](research/RESULTS.md)) |
-| `tests/` | pytest suite (209 tests, sandboxed DB, no network) |
+| `tests/` | pytest suite (224 tests, sandboxed DB, no network) |
 | `offline_trainer.py`, `deploy.sh` | Legacy laptop-side training and deploy tooling |
 | `trader.py`, `live_trader.py/` | Legacy V1 scripts, not used (V1 cron disabled 2026-10-06) |
 
@@ -151,7 +152,9 @@ per fill, plus 0.03%/day short borrow. Unit tests prove there is no lookahead.
 | Services | `quant-bot`, `quant-dashboard` (systemd; a drop-in at `/etc/systemd/system/quant-*.service.d/10-paths.conf` points them at this directory) |
 | Deploy | Commit, then `sudo systemctl restart quant-bot quant-dashboard`. Otherwise the 04:00 cron picks it up |
 | Logs | `/dev/shm/trading_logs/bot.log` (RAM, rotates, lost on reboot). The journal in the DB is the durable record |
-| Prune log | `/home/admin/trading_data/prune.log` |
+| Backups | Nightly, before the prune: `/home/admin/trading_data/backups/db/trading-<UTC>.db.gz`, newest 14 kept. To restore, stop the bot, then `gunzip -c <file> > /home/admin/trading_data/trading.db`, then start it. They live on the same SD card, so copy one off the Pi now and then |
+| Prune log | `/home/admin/trading_data/prune.log` (backup and prune results) |
+| Alerts | Discord alerts are off until `DISCORD_WEBHOOK_URL` is set in `~/.config/quant-bot/env` |
 | Dashboard | `http://<pi-ip>:8000` |
 | Pre-deploy smoke test | Run `bot.py` against a copy of the DB with `TRADING_DATA_DIR` / `TRADING_LOG_DIR` pointed at a scratch dir, `TRADING_ENV_FILE=/nonexistent`, `EXECUTION_MODE=paper`, under `timeout -s KILL 75` |
 
@@ -211,7 +214,7 @@ credentials.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q      # 209 tests; throwaway temp DB, never the live one
+.venv/bin/python -m pytest tests/ -q      # 224 tests; throwaway temp DB, never the live one
 ```
 
 ## Pi setup (first time)
