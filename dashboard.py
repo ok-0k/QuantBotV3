@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from config import DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, SSE_HEARTBEAT_SECS, STARTING_CASH, SYMBOLS
+import insights
 from db import (
     get_all_positions,
     get_cash,
@@ -649,6 +650,21 @@ async def api_equity(tf: str = "24H"):
     return JSONResponse({"equity_curve": data["equity_curve"], "equity_tf": data["equity_tf"]})
 
 
+_INSIGHTS_CACHE: dict[str, Any] = {"t": 0.0, "data": None}
+
+
+@app.get("/api/insights")
+async def api_insights():
+    """Trade-journal analytics (read-only, cached 60 s): 7-day / 24-hour exit
+    mix and per-trade economics, lifetime counts, and the running experiment."""
+    now = time.time()
+    if _INSIGHTS_CACHE["data"] is None or now - _INSIGHTS_CACHE["t"] > 60:
+        loop = asyncio.get_running_loop()
+        _INSIGHTS_CACHE["data"] = await loop.run_in_executor(None, insights.snapshot)
+        _INSIGHTS_CACHE["t"] = now
+    return JSONResponse(_INSIGHTS_CACHE["data"])
+
+
 @app.get("/api/cash")
 async def api_cash(limit: int = 2000):
     """Cash-flow curve endpoint.  limit caps at 10 000 to prevent abuse."""
@@ -901,6 +917,16 @@ section.block{margin-top:36px;}
 .ledger-ok{color:var(--pos);}
 .ledger-fail{color:var(--warn);}
 
+/* Insights: exit mix rows */
+.mix-row{display:grid;grid-template-columns:150px 1fr 64px 92px;align-items:center;gap:14px;
+  padding:12px 18px;border-bottom:1px solid var(--border-soft);}
+.mix-row:last-child{border-bottom:none;}
+.mix-name{font-size:12.5px;font-weight:600;color:var(--t1);}
+.mix-n{font-size:12px;color:var(--t3);text-align:right;}
+.mix-net{font-size:13px;font-weight:700;text-align:right;}
+.mix-row .stat-bar-track{margin-top:0;height:6px;}
+.ins-note{font-size:11.5px;color:var(--t3);margin-top:10px;line-height:1.5;}
+
 /* ══════════════════════════════ RESPONSIVE ══════════════════════════════ */
 @media(max-width:600px){
   .topbar{padding:14px 16px 8px;}
@@ -909,6 +935,7 @@ section.block{margin-top:36px;}
   .hero-balance{font-size:clamp(34px,12vw,48px);}
   .chart-wrap{height:220px;}
   .system-tile:nth-child(2n){border-right:none;}
+  .mix-row{grid-template-columns:108px 1fr 40px 74px;gap:10px;padding:11px 14px;}
   .system-tile:nth-last-child(-n+2){border-bottom:1px solid var(--border-soft);}
   .system-tile:nth-last-child(-n+1),.system-tile:nth-last-child(-n+2):last-child{border-bottom:none;}
   .pos-top{flex-direction:column;}
@@ -1008,6 +1035,32 @@ section.block{margin-top:36px;}
     <div class="list-card" id="activity-list">
       <div class="empty-state">No trades yet</div>
     </div>
+  </section>
+
+  <!-- ══════════════════════════ INSIGHTS ══════════════════════════ -->
+  <section class="block">
+    <div class="block-hdr">
+      <span class="block-title">Insights</span>
+      <span class="count-badge">last 7 days</span>
+    </div>
+    <div class="stats-grid" id="insights-grid"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-hdr">
+      <span class="block-title">Experiment</span>
+      <span class="count-badge" id="exp-name">—</span>
+    </div>
+    <div class="stats-grid" id="experiment-grid"></div>
+    <div class="ins-note" id="exp-note"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-hdr">
+      <span class="block-title">How Trades End</span>
+      <span class="count-badge" id="mix-count">7 days</span>
+    </div>
+    <div class="list-card" id="exit-mix"><div class="empty-state">No closed trades yet</div></div>
   </section>
 
   <!-- ══════════════════════════ SYSTEM ══════════════════════════ -->
@@ -1462,6 +1515,81 @@ es.addEventListener('update', e=>{
 es.onerror = ()=>{ const dot = g('status-dot'); if(dot) dot.className = 'brand-mark err'; };
 
 fetch('/api/data').then(r=>r.json()).then(applyUpdate).catch(console.error);
+
+/* ══════════════════════════════ INSIGHTS ══════════════════════════════ */
+const EXIT_LABELS = {
+  TAKE_PROFIT:'Take profit', STOP_LOSS:'Stop loss', TIGHTENED_STOP:'Tightened stop',
+  BREAKEVEN_STOP:'Break-even stop', TRAILING_STOP:'Trailing stop', HARD_STOP:'Hard stop',
+  TIME_HOLD_EXIT:'4h time exit', MAX_HOLD:'Max hold', CIRCUIT_BREAKER:'Circuit breaker', OTHER:'Other',
+};
+const insPct = (v, d=2) => v==null ? '—' : (v>0?'+':'') + Number(v).toFixed(d) + '%';
+const insMin = v => v==null ? '—' : (v >= 90 ? (v/60).toFixed(1)+' h' : Math.round(v)+' min');
+
+function statCards(cards){
+  return cards.map(c=>`
+    <div class="stat-card">
+      <div class="stat-label">${c.label}</div>
+      <span class="stat-value num ${c.cls||''}">${c.value}</span>
+      <span class="stat-sub">${c.sub||''}</span>
+    </div>`).join('');
+}
+
+function renderInsights(d){
+  const w = d.week || {}, day = d.day || {}, life = d.lifetime || {};
+  const cost = w.cost_pct || 0.36;
+  const cards = [
+    {label:'Closed trades', value:(w.closed||0).toLocaleString(),
+     sub: w.closed ? fmtSigned$(w.net||0)+' net · '+(w.win_rate||0).toFixed(0)+'% won' : 'none yet'},
+    {label:'Avg per trade', value:insPct(w.avg_pct), cls: w.avg_pct==null?'':(w.avg_pct>0?'pos':'neg'),
+     sub:'round-trip cost ≈ '+cost.toFixed(2)+'%'},
+    {label:'Cleared costs', value: w.cleared_cost_share==null?'—':w.cleared_cost_share.toFixed(0)+'%',
+     sub:'trades whose best moment beat '+cost.toFixed(2)+'%'},
+    {label:'Typical hold', value:insMin(w.median_hold_min), sub:'median · mean '+insMin(w.mean_hold_min)},
+    {label:'Last 24 hours', value:fmtSigned$(day.net||0), cls:pnlCls(day.net||0),
+     sub:(day.closed||0)+' trades · '+insPct(day.avg_pct)+'/trade'},
+    {label:'History kept', value:(life.rows_kept||0).toLocaleString()+' rows',
+     sub:(life.lifetime_trades!=null ? life.lifetime_trades.toLocaleString()+' lifetime trades' : '')},
+  ];
+  g('insights-grid').innerHTML = statCards(cards);
+
+  const mix = w.exit_mix || [];
+  g('mix-count').textContent = (w.closed||0).toLocaleString() + ' · 7 days';
+  g('exit-mix').innerHTML = mix.length ? mix.map(m=>`
+    <div class="mix-row">
+      <span class="mix-name">${EXIT_LABELS[m.reason] || m.reason}</span>
+      <div class="stat-bar-track"><div class="stat-bar-fill" style="width:${Math.max(1, m.share).toFixed(1)}%;background:${m.net>=0?'var(--pos)':'var(--neg)'}"></div></div>
+      <span class="mix-n num">${m.n} · ${m.share.toFixed(0)}%</span>
+      <span class="mix-net num ${pnlCls(m.net)}">${fmtSigned$(m.net)}</span>
+    </div>`).join('') : '<div class="empty-state">No closed trades yet</div>';
+
+  const e = d.experiment;
+  if(!e){
+    g('exp-name').textContent = 'none';
+    g('experiment-grid').innerHTML = '<div class="stat-card"><div class="stat-label">No experiment running</div></div>';
+    g('exp-note').textContent = '';
+    return;
+  }
+  g('exp-name').textContent = e.name;
+  const names = {A:'Group A · current', B:'Group B · as designed'};
+  const ecards = ['A','B'].filter(k=>e.arms[k]).map(k=>{
+    const a = e.arms[k];
+    return {label:names[k] || ('Group '+k), value:insPct(a.avg_pct)+'/trade',
+      cls: a.avg_pct==null?'':(a.avg_pct>0?'pos':'neg'),
+      sub:(a.closed||0)+' closed · '+fmtSigned$(a.net||0)+' · hold '+insMin(a.median_hold_min)};
+  });
+  const vcls = e.verdict==='B better' ? 'pos' : e.verdict==='A better' ? 'neg' : 'warn';
+  ecards.push({label:'B − A per trade', value: e.diff==null?'—':insPct(e.diff, 3), cls:vcls,
+    sub: e.diff==null ? e.verdict : '95% CI '+insPct(e.ci_lo,2)+' … '+insPct(e.ci_hi,2)+' · '+e.verdict});
+  g('experiment-grid').innerHTML = statCards(ecards);
+  g('exp-note').textContent = 'Symbols alternate between groups. A keeps the legacy time decay; '
+    + 'B applies it as designed. A winner is only called when the 95% range excludes zero.';
+}
+
+function loadInsights(){
+  fetch('/api/insights').then(r=>r.json()).then(renderInsights).catch(console.error);
+}
+loadInsights();
+setInterval(loadInsights, 60000);
 </script>
 </body>
 </html>
