@@ -350,6 +350,17 @@ DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 #       from wall-clock age, applied to the INITIAL levels (idempotent).
 EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "decay_v2").strip()
 
+# ── V3 FIXES (deferred behaviour fixes, default OFF) ─────────────────────────
+# Verified bugs whose fixes change live exits/entries, held back so the
+# decay_v2 experiment stays clean. With this OFF every code path behaves
+# exactly as before. Turn ON (env V3_FIXES=true) after decay_v2 ends:
+#   - stops/targets only ever tighten; trail/BE levels are not undone by decay
+#   - tick path checks survival -> stop -> take-profit (a fee-gated TP no
+#     longer skips the stop check); a stop armed mid-candle uses the mark
+#   - in-flight entry slot reservation (no same-minute cap overshoot)
+#   - exit rewards credit the position's own entry regime
+V3_FIXES: bool = os.getenv("V3_FIXES", "false").strip().lower() in ("1", "true", "yes")
+
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
 # ═════════════════════════════════════════════════════════════════════════════
