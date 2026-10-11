@@ -34,6 +34,7 @@ def fresh(clean_db):
     bot.brain.ml_probs.clear()
     bot.brain.circuit_open = False
     bot.brain._peak_equity = 0.0
+    bot._tick_minute_stop.clear()
     return clean_db
 
 
@@ -303,3 +304,146 @@ def test_v3_monitor_rereads_position_before_decay(fresh, v3, monkeypatch):
     monkeypatch.setattr(bot, "_refresh_margin_health", moves_stop_meanwhile)
     _one_monitor_cycle(monkeypatch, candles, ENTRY * 0.999)
     assert _stop(fresh, B_SYM) == ENTRY
+
+
+# ── V3: tick-path exit order ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("v3_on", [True, False])
+def test_fee_gated_take_profit_falls_through_to_the_stop(fresh, monkeypatch, v3_on):
+    monkeypatch.setattr(bot, "V3_FIXES", v3_on)
+    tp = ENTRY * (1 - 0.0021)                               # touch is fee-gated
+    stop = ENTRY * 1.003
+    _place_short(fresh, B_SYM, stop=stop, tp=tp)
+    candles, _ = _history(B_SYM)
+    mark = ENTRY * 1.0035
+    _tick(B_SYM, candles, high=ENTRY * 1.004, low=tp, close=mark)
+    if v3_on:
+        row = _covers(fresh)[0]
+        assert row["exit_reason"] == "TIGHTENED_STOP"
+        assert row["exec_price"] == pytest.approx(mark * (1 + SLIPPAGE_PCT), rel=1e-9)
+    else:                                                   # legacy: gated TP hides the stop
+        assert fresh.get_short_position(B_SYM) is not None and _covers(fresh) == []
+
+
+@pytest.mark.parametrize("v3_on", [True, False])
+def test_survival_exits_at_mark_even_when_tp_touched(fresh, monkeypatch, v3_on):
+    monkeypatch.setattr(bot, "V3_FIXES", v3_on)
+    _place_short(fresh, B_SYM)
+    candles, _ = _history(B_SYM)
+    mark = ENTRY * 1.16                                     # open loss -$16 < -$15 floor
+    _tick(B_SYM, candles, high=ENTRY * 1.17, low=TP0 - 0.4, close=mark)
+    row = _covers(fresh)[0]
+    if v3_on:
+        assert row["exit_reason"] == "HARD_STOP"
+        assert row["exec_price"] == pytest.approx(mark * (1 + SLIPPAGE_PCT), rel=1e-9)
+        assert row["exit_detail"].startswith("hard_stop_survival_tick")
+    else:                                                   # legacy: booked at the TP price
+        assert row["exit_reason"] == "TAKE_PROFIT"
+
+
+def test_v3_stop_and_take_profit_in_one_candle_takes_the_stop(fresh, v3):
+    tp = ENTRY * 0.99                                       # clears fees: would book
+    _place_short(fresh, B_SYM, stop=ENTRY * 1.003, tp=tp)
+    candles, _ = _history(B_SYM)
+    _tick(B_SYM, candles, high=ENTRY * 1.004, low=tp * 0.999, close=ENTRY)
+    assert _covers(fresh)[0]["exit_reason"] == "TIGHTENED_STOP"
+
+
+def test_v3_mid_candle_break_even_triggers_on_mark_only(fresh, v3):
+    _place_short(fresh, B_SYM)
+    candles, atr = _history(B_SYM)
+    hi = ENTRY + 1.0 * atr                                  # printed before break-even existed
+    _tick(B_SYM, candles, high=hi, low=ENTRY - 5.0 * atr, close=ENTRY - 2.0 * atr)
+    assert _stop(fresh, B_SYM) == ENTRY and _covers(fresh) == []
+    # Later ticks in the same minute: the stored high still counts only
+    # against the stop in place when the minute began.
+    _tick(B_SYM, candles, high=hi, low=ENTRY - 5.0 * atr, close=ENTRY - 1.0 * atr)
+    assert _covers(fresh) == []
+    # The mark crossing the break-even stop does trigger it, at the mark.
+    mark = ENTRY + 0.2 * atr
+    _tick(B_SYM, candles, high=hi, low=ENTRY - 5.0 * atr, close=mark)
+    row = _covers(fresh)[0]
+    assert row["exit_reason"] == "BREAKEVEN_STOP"
+    assert row["exec_price"] == pytest.approx(mark * (1 + SLIPPAGE_PCT), rel=1e-9)
+
+
+def test_v3_persisted_break_even_uses_the_next_minutes_high(fresh, v3):
+    _place_short(fresh, B_SYM)
+    candles, atr = _history(B_SYM)
+    _tick(B_SYM, candles, high=ENTRY + 1.0 * atr, low=ENTRY - 5.0 * atr, close=ENTRY - 2.0 * atr)
+    _tick(B_SYM, candles, high=ENTRY + 0.5 * atr, low=ENTRY - 1.0 * atr,
+          close=ENTRY - 0.5 * atr, minute=2)
+    row = _covers(fresh)[0]                                 # wick through BE: stop fills at BE
+    assert row["exit_reason"] == "BREAKEVEN_STOP"
+    assert row["exec_price"] == pytest.approx(ENTRY * (1 + SLIPPAGE_PCT), rel=1e-9)
+
+
+def test_v3_off_mid_candle_break_even_hit_by_earlier_high(fresh):
+    assert bot.V3_FIXES is False
+    _place_short(fresh, B_SYM)
+    candles, atr = _history(B_SYM)
+    _tick(B_SYM, candles, high=ENTRY + 1.0 * atr, low=ENTRY - 5.0 * atr, close=ENTRY - 2.0 * atr)
+    assert _covers(fresh)[0]["exit_reason"] == "BREAKEVEN_STOP"
+
+
+# ── V3: stop-integrity property over a tick sequence, per arm (TI1) ──────────
+
+STOP_CODES = {"STOP_LOSS", "TIGHTENED_STOP", "BREAKEVEN_STOP", "TRAILING_STOP"}
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+@pytest.mark.parametrize("tp", [TP0, ENTRY * (1 - 0.0021)])     # far / fee-gated (trail acts)
+@pytest.mark.parametrize("sym,arm,count", [(A_SYM, "A", 60), (B_SYM, "B", 0)])
+def test_v3_stop_integrity_over_tick_sequence(fresh, v3, monkeypatch, sym, arm, count, tp, seed):
+    """~10 minutes of 2 s ticks (cumulative per-minute high/low, like Binance
+    klines) on a 60-minute-old short, with an exit_monitor cycle every 15
+    ticks. Invariants: no stop level written is ever undone (within a call
+    or across calls); once at or past entry it stays there; an open
+    position's mark is below its stop; a stop exit fired on a level stored
+    since the minute began, or on the mark."""
+    import random
+
+    async def no_margin(*_a, **_k):
+        return {}
+    monkeypatch.setattr(bot, "_refresh_margin_health", no_margin)
+    _place_short(fresh, sym, arm=arm, age_min=60, count=count, tp=tp)
+    candles, _ = _history(sym)
+    t0 = candles[-1]["time"]
+    rng, px = random.Random(seed), ENTRY
+    writes = _spy_stop_writes(monkeypatch)
+    minute = hi = lo = s_minute = None
+    for i in range(300):
+        pos = fresh.get_short_position(sym)
+        if pos is None:
+            break
+        s_before = pos["stop_price"]
+        px *= 1 + rng.gauss(-0.0002 if i < 75 else 0.0002, 0.0001)   # down, then back up
+        m = i // 30
+        if m != minute:
+            minute, hi, lo, s_minute = m, px, px, s_before
+        hi, lo = max(hi, px), min(lo, px)
+        if i % 15 == 14:
+            _one_monitor_cycle(monkeypatch, candles, px, sym)
+            high_seen = px
+        else:
+            candle = {"open": px, "high": hi, "low": lo, "close": px, "volume": 1.0,
+                      "time": t0 + (m + 1) * 60_000}
+            bot._candles_cache[sym] = candles
+
+            async def run():
+                await bot._tick_exit_check(sym, candle, asyncio.get_running_loop())
+            asyncio.run(run())
+            high_seen = hi
+        after = fresh.get_short_position(sym)
+        if after is not None:
+            s = after["stop_price"]
+            assert s <= s_before + 1e-12, f"stop loosened at tick {i}"
+            assert s <= min([SL0] + [w for w, ok in writes if ok]) + 1e-12, \
+                f"a stop written earlier was undone at tick {i}"
+            if s_before <= ENTRY:
+                assert s <= ENTRY, f"break-even/trail undone at tick {i}"
+            assert px < s, f"open with mark {px} >= stop {s} at tick {i}"
+        else:
+            row = _covers(fresh)[-1]
+            if row["exit_reason"] in STOP_CODES:
+                assert px >= s_before or high_seen >= s_minute, f"phantom stop exit at tick {i}"

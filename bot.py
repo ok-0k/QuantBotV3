@@ -241,6 +241,9 @@ _cash_lock = asyncio.Lock()         # serialise cross-symbol cash read-modify-wr
 _strict_execution_lock = asyncio.Lock()
 _symbol_last_trade: dict[str, float] = {}   # cooldown tracker
 _exit_in_flight:    set[str] = set()
+# V3 tick path: the stop stored when each 1m candle was first seen, per position:
+# sym -> ((opened_ts, candle open time), stop). See _tick_exit_check.
+_tick_minute_stop:  dict[str, tuple] = {}
 
 # V2: last margin / utilization snapshot for gating + dashboard
 _margin_health_cache: dict = {}
@@ -906,6 +909,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
 
     stop = pos.get("stop_price", 0)
     tp = pos.get("tp_price",   0)
+    _stop0, _tp0 = float(stop or 0.0), float(tp or 0.0)   # V3: levels stored when this call began
 
     candle_high = candle["high"]
     candle_low = candle["low"]
@@ -1054,7 +1058,58 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # disabled), it fills at the current price. Filling every stop at its
     # trigger level understated losses, e.g. a stop 5.7% under market booked ~$0.
     _mark_now = float(candle.get("close", 0.0) or 0.0)
-    if not is_short:
+    if V3_FIXES:
+        # Order as in exit_monitor: survival -> stop -> take-profit, so a
+        # fee-gated TP can no longer hide a breached stop, and a candle that
+        # touched both books the stop (conservative).
+        # The candle's high/low is the whole minute so far, partly printed
+        # before a stop moved within the minute existed (trail / break-even,
+        # in this call or an earlier tick, or decay). It is only tested
+        # against the loosest stop in place since the minute began (_ext_stop);
+        # a stop moved since triggers on the mark only. Otherwise a break-even
+        # armed mid-candle is "hit" by the minute's earlier high, closing a
+        # winner at entry. A take-profit is tested against the level stored
+        # when this call began (_tp0) as before, or the current one on the mark.
+        _mkey = (pos.get("opened_ts"), candle.get("time"))
+        _seen = _tick_minute_stop.get(sym)
+        if _seen is None or _seen[0] != _mkey:
+            _seen = _tick_minute_stop[sym] = (_mkey, float(_stop0 or 0.0))
+        _s_open, _s_now = _seen[1], float(stop or 0.0)
+        _ext_stop = 0.0
+        if _s_open > 0 and _s_now > 0:
+            _ext_stop = max(_s_open, _s_now) if is_short else min(_s_open, _s_now)
+        if _is_survival:
+            reason     = f"hard_stop_survival_tick (pnl=${_open_pnl:.2f})"
+            exit_price = _mark_close
+        elif not is_short:
+            if _ext_stop > 0 and candle_low <= _ext_stop:
+                stop = _ext_stop
+                reason = f"stop_loss_tick (low=${candle_low:,.4f} <= stop=${stop:,.4f})"
+                exit_price = min(stop, _mark_now) if _mark_now > 0 else stop
+            elif stop > 0 and 0 < _mark_now <= stop:
+                reason = f"stop_loss_tick (mark=${_mark_now:,.4f} <= stop=${stop:,.4f})"
+                exit_price = _mark_now
+            elif _tp0 > 0 and candle_high >= _tp0:
+                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
+                exit_price = _tp0
+            elif tp > 0 and _mark_now >= tp:
+                reason = f"take_profit_tick (mark=${_mark_now:,.4f} >= tp=${tp:,.4f})"
+                exit_price = tp
+        else:
+            if _ext_stop > 0 and candle_high >= _ext_stop:
+                stop = _ext_stop
+                reason = f"stop_loss_tick_short (high=${candle_high:,.4f} >= stop=${stop:,.4f})"
+                exit_price = max(stop, _mark_now)
+            elif stop > 0 and _mark_now >= stop:
+                reason = f"stop_loss_tick_short (mark=${_mark_now:,.4f} >= stop=${stop:,.4f})"
+                exit_price = _mark_now
+            elif _tp0 > 0 and candle_low <= _tp0:
+                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
+                exit_price = _tp0
+            elif tp > 0 and 0 < _mark_now <= tp:
+                reason = f"take_profit_tick_short (mark=${_mark_now:,.4f} <= tp=${tp:,.4f})"
+                exit_price = tp
+    elif not is_short:
         if tp > 0 and candle_high >= tp:
             reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${tp:,.4f})"
             exit_price = tp
