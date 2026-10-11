@@ -243,6 +243,7 @@ _closed_candle_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
 _executor: Optional[ProcessPoolExecutor] = None
 
 _shutdown_event = asyncio.Event()
+_stop_requested = False   # SIGTERM/SIGINT seen: an exit is wanted, never pause it
 _trade_locks:       dict[str, asyncio.Lock] = {}
 _cash_lock = asyncio.Lock()         # serialise cross-symbol cash read-modify-write
 # One portfolio commit at a time: risk reads + SQLite fills cannot race (WS burst / ticks / monitor).
@@ -602,7 +603,9 @@ def _top_strategy(ensemble: dict, direction: str) -> str:
 
 
 def _handle_signal(signame: str) -> None:
+    global _stop_requested
     log.info("Received %s - initiating graceful shutdown", signame)
+    _stop_requested = True
     _shutdown_event.set()
 
 
@@ -3275,15 +3278,36 @@ async def main() -> int:
             "exit_monitor": exit_monitor(loop),
             "housekeeping_loop": housekeeping_loop(),
         })
+    except Exception:
+        exit_code = 1
+        raise
     finally:
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)
         log.info("Bot stopped %s.", "cleanly" if exit_code == 0 else "after a subsystem failure")
     return exit_code
 
-if __name__ == "__main__":
-    _code = asyncio.run(main())
-    if _code:
-        # After the event loop has closed, so SIGTERM is never blocked by the pause.
+def _run() -> int:
+    """
+    Process entry point. After an unexpected exit, whether main() returned
+    non-zero or raised (e.g. startup failing on every boot), apply the
+    crash-loop pause, unless a stop was requested. The pause runs after the
+    event loop has closed, so SIGTERM is never blocked by it. A refused second
+    instance (SystemExit from the lock) exits at once.
+    """
+    try:
+        code = asyncio.run(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:                        # Ctrl-C before the handlers exist
+        return 130
+    except BaseException:
+        log.critical("⚠ Bot crashed — exiting so systemd restarts it", exc_info=True)
+        code = 1
+    if code and not _stop_requested:
         _crash_loop_backoff()
-    sys.exit(_code)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(_run())

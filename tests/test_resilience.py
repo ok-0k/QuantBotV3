@@ -18,6 +18,7 @@ from config import DATA_DIR, SYMBOLS
 @pytest.fixture()
 def fresh(clean_db, monkeypatch):
     monkeypatch.setattr(bot, "_shutdown_event", asyncio.Event())
+    monkeypatch.setattr(bot, "_stop_requested", False)
     return clean_db
 
 
@@ -163,3 +164,40 @@ def test_exit_monitor_isolates_a_failing_position_and_writes_heartbeat(fresh, mo
     assert fresh.get_short_position(sym_ok) is None              # the healthy position still exited
     assert fresh.get_short_position(sym_bad) is not None         # the failing one is retried next cycle
     assert fresh.get_portfolio_stat("exit_monitor_last_cycle")
+
+
+def _entry(monkeypatch, main):
+    pauses = []
+    monkeypatch.setattr(bot, "main", main)
+    monkeypatch.setattr(bot, "_crash_loop_backoff", lambda: pauses.append(1))
+    return pauses
+
+
+def test_run_pauses_when_main_raises(fresh, monkeypatch):
+    async def boom():
+        raise RuntimeError("startup failed")         # e.g. initial_train OOM on every boot
+    pauses = _entry(monkeypatch, boom)
+    assert bot._run() == 1 and pauses == [1]
+
+
+def test_run_pauses_on_subsystem_failure_but_not_after_a_stop(fresh, monkeypatch):
+    async def died():
+        return 1
+    pauses = _entry(monkeypatch, died)
+    assert bot._run() == 1 and pauses == [1]
+    bot._handle_signal("SIGTERM")                    # stop arrived during cleanup
+    assert bot._run() == 1 and pauses == [1]         # no pause delaying systemctl stop
+
+
+def test_run_clean_exit_and_lock_refusal_never_pause(fresh, monkeypatch):
+    async def ok():
+        return 0
+    pauses = _entry(monkeypatch, ok)
+    assert bot._run() == 0
+
+    async def locked():
+        raise SystemExit(1)
+    monkeypatch.setattr(bot, "main", locked)
+    with pytest.raises(SystemExit):
+        bot._run()
+    assert pauses == []
