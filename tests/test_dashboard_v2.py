@@ -181,3 +181,81 @@ def test_cleared_costs_threshold_counts_entry_slippage_once(clean_db):
     assert w["cleared_cost_share"] == 50.0          # was 25% against the 0.36% round-trip
     assert w["cost_pct"] == pytest.approx(insights.COST_PCT, abs=1e-3)   # label unchanged
     assert w["peak_breakeven_pct"] == pytest.approx(thr, abs=1e-3)
+
+
+# ── System health: ledger tile, breaker drawdown, bot liveness ───────────────
+
+import time  # noqa: E402
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def test_ledger_tile_reads_bot_drift_not_a_tautology(clean_db):
+    now = time.time()
+    assert dashboard._ledger_check(now) == {"drift": None, "ok": None, "value": "—", "checked_age_s": None}
+    db.set_portfolio_stat("ledger_drift", "0.73")
+    db.set_portfolio_stat("ledger_checked_at", _iso(now - 120))
+    lg = dashboard._ledger_check(now)
+    assert lg["ok"] is True and lg["value"] == "Balanced" and lg["checked_age_s"] == pytest.approx(120, abs=1)
+    db.set_portfolio_stat("ledger_drift", "-1.0")
+    assert dashboard._ledger_check(now)["value"] == "Balanced"            # |x| <= $1
+    db.set_portfolio_stat("ledger_drift", "-396.41")
+    db.set_portfolio_stat("ledger_checked_at", str(now - 30))             # epoch seconds also accepted
+    lg = dashboard._ledger_check(now)
+    assert lg["ok"] is False and lg["value"] == "Drift -$396.41" and lg["checked_age_s"] == pytest.approx(30, abs=1)
+    assert "p.starting_cash + p.total_net_pnl" not in dashboard.DASHBOARD_HTML
+
+
+def test_breaker_drawdown_from_persisted_peak_and_distance_to_trip(clean_db):
+    import brain
+    assert dashboard._BREAKER_PEAK_KEY == brain._PEAK_EQUITY_BRAIN_KEY
+    assert dashboard._breaker_state(9_000.0)["breaker_drawdown_pct"] is None   # not persisted yet
+    db.save_brain_key(dashboard._BREAKER_PEAK_KEY, 10_000.0)
+    s = dashboard._breaker_state(8_800.0)
+    assert s["breaker_drawdown_pct"] == pytest.approx(-12.0)
+    assert s["breaker_limit_pct"] == pytest.approx(dashboard.MAX_DRAWDOWN_PCT * 100)
+    assert s["breaker_headroom_pct"] == pytest.approx(dashboard.MAX_DRAWDOWN_PCT * 100 - 12.0)
+    assert s["breaker_trip_equity"] == pytest.approx(10_000 * (1 - dashboard.MAX_DRAWDOWN_PCT))
+    assert dashboard._breaker_state(10_500.0)["breaker_drawdown_pct"] == 0.0   # bot ratchets the peak
+
+
+def test_telemetry_peak_breaker_and_liveness(clean_db, monkeypatch):
+    now = time.time()
+    db.set_cash(9_000.0)
+    db.set_equity_rebase(9_500.0, _iso(now - 400_000))
+    db.save_brain_key(dashboard._BREAKER_PEAK_KEY, 10_003.0)
+    rows = [(_iso(now - 500_000), 12_000.0),          # before the rebase: ignored
+            (_iso(now - 390_000), 10_400.0)]          # post-rebase peak, older than 10k rows
+    rows += [(_iso(now - 200 - 30 * i), 9_100.0) for i in range(10_001)]
+    with db.get_db() as conn:
+        conn.executemany("INSERT INTO equity_curve (ts, equity) VALUES (?,?)", rows)
+    db.set_portfolio_stat("exit_monitor_last_cycle", str(now - 10))
+    db.set_portfolio_stat("model_age_xgb_days", "12")
+    db.set_portfolio_stat("model_age_sac_days", "45.5")
+    monkeypatch.setattr(dashboard, "V3_FIXES", True)
+    d = dashboard._build_telemetry()
+    p, h = d["portfolio"], d["health"]
+    assert p["peak_equity"] == pytest.approx(10_400.0)
+    assert p["drawdown_pct"] == pytest.approx((9_000 - 10_400) / 10_400 * 100, abs=1e-3)
+    assert p["breaker_peak_equity"] == pytest.approx(10_003.0)
+    assert p["breaker_drawdown_pct"] == pytest.approx(-(10_003 - 9_000) / 10_003 * 100, abs=1e-3)
+    assert h["ages_s"]["bot"] == pytest.approx(200, abs=5)
+    assert h["ages_s"]["exit_monitor"] == pytest.approx(10, abs=5)
+    assert h["ages_s"]["ws"] is None and h["ages_s"]["housekeeping"] is None      # not written yet
+    assert h["stale"] == ["bot"]                                                    # > 90 s
+    assert h["models_stale"] is True and h["model_age_sac_days"] == 45.5
+    assert h["v3_fixes"] is True
+    assert h["ledger"]["value"] == "—"
+
+
+def test_liveness_fresh_bot_is_not_stale(clean_db):
+    now = time.time()
+    with db.get_db() as conn:
+        conn.execute("INSERT INTO equity_curve (ts, equity) VALUES (?,?)", (_iso(now - 20), 9_000.0))
+    db.set_portfolio_stat("ws_last_msg", _iso(now - 2).replace("+00:00", "Z"))
+    lv = dashboard._liveness(now)
+    assert lv["stale"] == [] and lv["ages_s"]["ws"] == pytest.approx(2, abs=1)
+    assert lv["models_stale"] is False and lv["model_age_xgb_days"] is None
+    assert "not reporting for" in dashboard.DASHBOARD_HTML

@@ -22,7 +22,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from config import DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, SSE_HEARTBEAT_SECS, STARTING_CASH, SYMBOLS
+from config import (
+    DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, MAX_DRAWDOWN_PCT, SSE_HEARTBEAT_SECS,
+    STARTING_CASH, SYMBOLS, V3_FIXES,
+)
 import insights
 from db import (
     get_all_positions,
@@ -30,6 +33,7 @@ from db import (
     get_cash_curve_from_trades,
     get_equity_curve,
     get_equity_curve_since,
+    get_db,
     get_equity_rebase,
     get_filled_trade_count,
     get_portfolio_stat,
@@ -44,13 +48,19 @@ from accounting_v2 import position_equity_components
 VAN_TZ = zoneinfo.ZoneInfo("America/Vancouver")
 
 # Fix W4: the dashboard is strictly read-only -- bot.py is the sole writer of
-# persisted equity/PnL state. Peak equity used to be re-derived AND written
-# back to portfolio.peak_equity_all_time on every telemetry build, racing
-# bot.py's own writes to current_equity/return_pct. It now ratchets up in
-# this process's memory only; a dashboard restart re-seeds it (harmlessly)
-# from the read-only equity_curve/portfolio history the next call already
-# fetches, so no information is actually lost by not persisting it.
-_dashboard_peak_equity: float = 0.0
+# persisted equity/PnL state. The page's peak equity is read on every build
+# as SELECT MAX(equity) over the whole equity_curve since the rebase (5-minute
+# history is kept forever), so a dashboard restart loses nothing.
+
+# Circuit breaker high-water mark persisted by brain.check_circuit_breaker
+# (same key as brain._PEAK_EQUITY_BRAIN_KEY; not imported to keep brain.py and
+# its ML stack out of the dashboard process).
+_BREAKER_PEAK_KEY = "circuit_breaker_peak_equity_v1"
+
+# Health stats written by the bot (all optional: absent on an older bot).
+LIVENESS_STALE_SECS = 90      # bot heartbeat / exit monitor / websocket
+MODEL_STALE_DAYS = 30
+LEDGER_TOLERANCE_USD = 1.0
 
 
 def _utc_to_van(ts_str: str | None) -> str:
@@ -99,6 +109,105 @@ def _van_week_day_prefixes() -> list[tuple[str, str]]:
             label = f"{i}d ago"
         result.append((day.strftime("%Y-%m-%d"), label))
     return result
+
+
+def _to_epoch(raw: Any) -> float | None:
+    """Epoch seconds from an epoch number/string or an ISO-8601 timestamp
+    (offset-less means UTC, as the DB stores it); None if absent/unparseable."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def _age_secs(raw: Any, now: float) -> float | None:
+    ep = _to_epoch(raw)
+    return None if ep is None else round(max(0.0, now - ep), 1)
+
+
+def _opt_float(raw: Any) -> float | None:
+    try:
+        return None if raw is None or str(raw).strip() == "" else float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ledger_check(now: float) -> dict[str, Any]:
+    """Books-vs-ledger drift as computed by the bot (portfolio.ledger_drift)."""
+    drift = _opt_float(get_portfolio_stat("ledger_drift", None))
+    age = _age_secs(get_portfolio_stat("ledger_checked_at", None), now)
+    if drift is None:
+        return {"drift": None, "ok": None, "value": "—", "checked_age_s": age}
+    ok = abs(drift) <= LEDGER_TOLERANCE_USD
+    value = "Balanced" if ok else f"Drift {'+' if drift > 0 else '-'}${abs(drift):,.2f}"
+    return {"drift": round(drift, 2), "ok": ok, "value": value, "checked_age_s": age}
+
+
+def _liveness(now: float) -> dict[str, Any]:
+    """How long ago the bot last reported, from its own writes: equity_curve
+    (every 30 s), the exit monitor cycle, the websocket and housekeeping."""
+    with get_db() as conn:
+        last_equity_ts = conn.execute("SELECT MAX(ts) FROM equity_curve").fetchone()[0]
+    ages = {
+        "bot":          _age_secs(last_equity_ts, now),
+        "exit_monitor": _age_secs(get_portfolio_stat("exit_monitor_last_cycle", None), now),
+        "ws":           _age_secs(get_portfolio_stat("ws_last_msg", None), now),
+        "housekeeping": _age_secs(get_portfolio_stat("housekeeping_last", None), now),
+    }
+    xgb = _opt_float(get_portfolio_stat("model_age_xgb_days", None))
+    sac = _opt_float(get_portfolio_stat("model_age_sac_days", None))
+    return {
+        "ages_s":             ages,
+        "stale_after_s":      LIVENESS_STALE_SECS,
+        "stale":              [k for k in ("bot", "exit_monitor", "ws")
+                               if ages[k] is not None and ages[k] > LIVENESS_STALE_SECS],
+        "model_age_xgb_days": None if xgb is None else round(xgb, 1),
+        "model_age_sac_days": None if sac is None else round(sac, 1),
+        "model_stale_days":   MODEL_STALE_DAYS,
+        "models_stale":       any(v is not None and v > MODEL_STALE_DAYS for v in (xgb, sac)),
+        "v3_fixes":           bool(V3_FIXES),
+    }
+
+
+def _curve_peak_since(rebase_ts: str | None) -> float:
+    """Highest recorded equity since the rebase (whole curve if none)."""
+    since = _to_epoch(rebase_ts) if rebase_ts else None
+    with get_db() as conn:
+        if since is not None:
+            iso = datetime.datetime.fromtimestamp(since, datetime.timezone.utc).isoformat()
+            row = conn.execute("SELECT MAX(equity) FROM equity_curve WHERE ts >= ?", (iso,)).fetchone()
+        else:
+            row = conn.execute("SELECT MAX(equity) FROM equity_curve").fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
+def _breaker_state(total_eq: float) -> dict[str, Any]:
+    """Drawdown as the circuit breaker sees it: from its persisted peak, not
+    the page's. A trip halts new entries until scripts/reset_circuit_breaker.py
+    --confirm and a bot restart."""
+    peak = _opt_float(load_brain_key(_BREAKER_PEAK_KEY, None))
+    if not peak or peak <= 0:
+        return {"breaker_peak_equity": None, "breaker_drawdown_pct": None,
+                "breaker_limit_pct": round(MAX_DRAWDOWN_PCT * 100, 2),
+                "breaker_headroom_pct": None, "breaker_trip_equity": None}
+    peak = max(peak, total_eq)        # the bot ratchets its peak on every check
+    dd = (peak - total_eq) / peak
+    return {
+        "breaker_peak_equity":  round(peak, 2),
+        "breaker_drawdown_pct": round(-dd * 100, 3),      # same sign as drawdown_pct
+        "breaker_limit_pct":    round(MAX_DRAWDOWN_PCT * 100, 2),
+        "breaker_headroom_pct": round((MAX_DRAWDOWN_PCT - dd) * 100, 3),
+        "breaker_trip_equity":  round(peak * (1 - MAX_DRAWDOWN_PCT), 2),
+    }
 
 
 def _downsample_equity(curve: list[dict], max_points: int) -> list[dict]:
@@ -235,7 +344,6 @@ async def _require_token(request: Request, call_next):
 
 
 def _build_telemetry(equity_tf: str | None = None) -> dict:
-    global _dashboard_peak_equity
     try:
         init_db()
     except Exception:
@@ -339,24 +447,13 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     # When a rebase is active, only equity observed AFTER the rebase counts
     # toward the peak -- otherwise pre-rebase curve history (inflated by the
     # since-fixed C3 capital leak) would immediately drag "peak since rebase"
-    # straight back up.
-    rebase_dt = _parse_equity_ts(rebase_ts) if rebase_ts else None
-    if rebase_dt is not None:
-        curve_equity_vals = [
-            float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw
-            if _parse_equity_ts(str(pt.get("time", ""))) >= rebase_dt
-        ]
-    else:
-        curve_equity_vals = [float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw]
-    # Fix W4: read the last-known persisted peak (harmless -- a read, not a
-    # write) as a floor, but hold the ratcheted result in process memory only.
-    # bot.py never writes this key, and neither do we anymore -- the previous
-    # set_portfolio_stat call here was racing bot.py's own current_equity /
-    # return_pct writes every ~2s.
-    stored_peak         = float(get_portfolio_stat("peak_equity_all_time", str(ref_equity)) or ref_equity)
-    _dashboard_peak_equity = max(_dashboard_peak_equity, stored_peak, total_eq, ref_equity, *curve_equity_vals)
-    peak_equity          = _dashboard_peak_equity
+    # straight back up. ref_equity and the persisted peak (read-only) stay
+    # as floors.
+    stored_peak  = float(get_portfolio_stat("peak_equity_all_time", str(ref_equity)) or ref_equity)
+    peak_equity  = max(_curve_peak_since(rebase_ts), stored_peak, total_eq, ref_equity)
     drawdown_pct = round((total_eq - peak_equity) / peak_equity * 100, 3) if peak_equity > 0 else 0.0
+    breaker      = _breaker_state(total_eq)
+    now_epoch    = time.time()
 
     # ── Prices ─────────────────────────────────────────────────────────────────
     prices = []
@@ -562,6 +659,8 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "total_trades":          lifetime_trades,
             "drawdown_pct":          drawdown_pct,
             "peak_equity":           round(peak_equity, 2),
+            # Circuit breaker's own view (persisted peak) -- what actually trips.
+            **breaker,
             "win_rate":              win_rate_overall,
             "win_rate_long":         win_rate_long,
             "win_rate_short":        win_rate_short,
@@ -587,6 +686,8 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "starting_cash":         round(ref_equity, 2),
         },
         "margin_health": margin_health,
+        # Bot-written health stats; every field is None until the bot writes it.
+        "health":       {"ledger": _ledger_check(now_epoch), **_liveness(now_epoch)},
         "positions":    pos_list,
         "trades":       trades_out,
         "equity_curve": equity_curve_out,
@@ -917,6 +1018,7 @@ section.block{margin-top:36px;}
 .system-tile:nth-last-child(-n+2){border-bottom:none;}
 .system-label{font-size:11px;color:var(--t3);font-weight:500;margin-bottom:6px;}
 .system-value{font-size:14.5px;font-weight:700;color:var(--t1);}
+.system-sub{font-size:11px;color:var(--t3);margin-top:3px;}
 .ledger-ok{color:var(--pos);}
 .ledger-fail{color:var(--warn);}
 
@@ -1272,9 +1374,22 @@ function renderStats(p){
   cards.push({label:'Total Return', value:fmtPct(p.return_pct||0), cls:retCls(p.return_pct||0), sub:'vs '+fmt$(p.starting_cash||0)});
   cards.push({label:'Net PnL (all-time)', value:fmtSigned$(p.total_net_pnl||0), cls:pnlCls(p.total_net_pnl||0),
     sub:'R '+fmtSigned$(p.realised_pnl_net||0)+' · U '+fmtSigned$(p.unrealised_pnl_total||0)});
-  const dd = p.drawdown_pct || 0;
-  cards.push({label:'Drawdown', value:fmtPct(dd), cls: dd < -5 ? 'neg' : dd < -2 ? 'warn' : 'pos',
-    sub:'from peak '+fmt$(p.peak_equity||0)});
+  /* Drawdown as the circuit breaker sees it (its persisted peak), falling back
+     to the page's own peak when the bot has not persisted one yet. */
+  if(p.breaker_drawdown_pct != null){
+    const room = p.breaker_headroom_pct;
+    cards.push({label:'Drawdown (breaker)', value:fmtPct(p.breaker_drawdown_pct),
+      cls: room < 5 ? 'neg' : room < 10 ? 'warn' : 'pos',
+      sub:room.toFixed(1)+' pts to the '+p.breaker_limit_pct.toFixed(0)+'% trip · peak '+fmt$(p.breaker_peak_equity),
+      title:'Trips at '+fmt$(p.breaker_trip_equity)+'. A trip halts new entries until '
+        +'scripts/reset_circuit_breaker.py --confirm and a bot restart.',
+      bar:Math.max(0, Math.min(100, -p.breaker_drawdown_pct / p.breaker_limit_pct * 100)),
+      barColor: room < 5 ? 'var(--neg)' : room < 10 ? 'var(--warn)' : 'var(--t2)'});
+  } else {
+    const dd = p.drawdown_pct || 0;
+    cards.push({label:'Drawdown', value:fmtPct(dd), cls: dd < -5 ? 'neg' : dd < -2 ? 'warn' : 'pos',
+      sub:'from peak '+fmt$(p.peak_equity||0)});
+  }
   const lifetimeTrades = p.lifetime_trades || p.total_trades || 0;
   cards.push({label:'Win Rate', value:(p.win_rate||0).toFixed(1)+'%',
     sub:lifetimeTrades.toLocaleString()+' trades · L '+(p.win_rate_long!=null?p.win_rate_long.toFixed(0)+'%':'—')
@@ -1293,7 +1408,7 @@ function renderStats(p){
     bar:deployedPct, barColor: deployedPct>95?'var(--neg)':deployedPct>80?'var(--warn)':'var(--t2)'});
 
   g('stats-grid').innerHTML = cards.map(c=>`
-    <div class="stat-card">
+    <div class="stat-card"${c.title ? ` title="${esc(c.title)}"` : ''}>
       <div class="stat-label">${c.label}</div>
       <span class="stat-value num ${c.cls||''}">${c.value}</span>
       <span class="stat-sub">${c.sub||''}</span>
@@ -1411,10 +1526,33 @@ function renderTicker(prices){
 }
 
 /* ══════════════════════════════ SYSTEM ══════════════════════════════ */
-function renderSystem(p, brain, marginHealth){
+function ageFmt(s){
+  if(s == null) return '—';
+  if(s < 90) return Math.round(s) + 's ago';
+  const m = Math.round(s/60);
+  if(m < 120) return m + ' min ago';
+  const h = Math.round(m/60);
+  return h < 48 ? h + ' h ago' : Math.round(h/24) + ' d ago';
+}
+function renderSystem(p, brain, marginHealth, health){
+  health = health || {};
+  const ages = health.ages_s || {};
+  const stale = health.stale || [];
   const tiles = [];
   tiles.push({label:'Circuit Breaker', value: brain.circuit_open ? 'OPEN' : 'Clear',
-    cls: brain.circuit_open ? 'neg' : 'pos'});
+    cls: brain.circuit_open ? 'neg' : 'pos',
+    sub: brain.circuit_open ? 'entries halted until reset_circuit_breaker.py --confirm + restart'
+      : (p.breaker_headroom_pct != null ? 'DD '+fmtPct(p.breaker_drawdown_pct, 1)+' · trips at '
+         +fmt$(p.breaker_trip_equity, 0)+' (−'+p.breaker_limit_pct.toFixed(0)+'%)' : '')});
+  tiles.push({label:'Bot Heartbeat', value:ageFmt(ages.bot), cls: stale.includes('bot') ? 'warn' : (ages.bot!=null?'pos':''),
+    sub:'last equity snapshot'});
+  tiles.push({label:'Exit Monitor', value:ageFmt(ages.exit_monitor), cls: stale.includes('exit_monitor') ? 'warn' : ''});
+  tiles.push({label:'Websocket', value:ageFmt(ages.ws), cls: stale.includes('ws') ? 'warn' : ''});
+  tiles.push({label:'Housekeeping', value:ageFmt(ages.housekeeping), cls: ages.housekeeping > 180 ? 'warn' : ''});
+  const mAge = v => v == null ? '—' : Math.round(v) + 'd';
+  tiles.push({label:'Model Age', value:'XGB '+mAge(health.model_age_xgb_days)+' · SAC '+mAge(health.model_age_sac_days),
+    cls: health.models_stale ? 'warn' : '', sub: health.models_stale ? 'older than '+health.model_stale_days+' days' : ''});
+  tiles.push({label:'V3 Fixes', value: health.v3_fixes == null ? '—' : (health.v3_fixes ? 'On' : 'Off')});
   const sm = brain.current_size_mult != null ? brain.current_size_mult : 1.0;
   const smPct = Math.round(sm*100);
   tiles.push({label:'AI Sizing', value: smPct>=100 ? '100% nominal' : ('Penalized to '+smPct+'%'),
@@ -1425,20 +1563,17 @@ function renderSystem(p, brain, marginHealth){
   if(mh.margin_level != null) marginParts.push('ML '+mh.margin_level.toFixed(3));
   tiles.push({label:'Margin ('+(mh.source||'—')+')', value: marginParts.length?marginParts.join(' · '):'—',
     cls: mh.halt_new_entries ? 'neg' : ''});
-  let ledgerVal = '—', ledgerCls = '';
-  if(p.starting_cash != null && p.total_net_pnl != null && p.total_equity != null){
-    const computed = Number((p.starting_cash + p.total_net_pnl).toFixed(2));
-    const diff = Math.abs(computed - p.total_equity);
-    const ok = diff < 0.02;
-    ledgerVal = ok ? 'Balanced' : ('Drift ' + fmt$(diff));
-    ledgerCls = ok ? 'ledger-ok' : 'ledger-fail';
-  }
-  tiles.push({label:'Ledger Check', value:ledgerVal, cls:ledgerCls});
+  /* Books vs ledger, as checked by the bot (portfolio.ledger_drift) */
+  const lg = health.ledger || {};
+  tiles.push({label:'Ledger Check', value: lg.value || '—',
+    cls: lg.ok == null ? '' : (lg.ok ? 'ledger-ok' : 'ledger-fail'),
+    sub: lg.checked_age_s != null ? 'checked ' + ageFmt(lg.checked_age_s) : ''});
 
   g('system-grid').innerHTML = tiles.map(t=>`
     <div class="system-tile">
       <div class="system-label">${t.label}</div>
-      <div class="system-value num ${t.cls||''}">${t.value}</div>
+      <div class="system-value num ${t.cls||''}">${esc(t.value)}</div>
+      ${t.sub ? `<div class="system-sub">${esc(t.sub)}</div>` : ''}
     </div>
   `).join('');
 }
@@ -1448,15 +1583,21 @@ function applyUpdate(d){
   const p = d.portfolio || {};
   const brain = d.brain || {};
   const marginHealth = d.margin_health || {};
+  const health = d.health || {};
+  const stale = health.stale || [];
 
   /* Status dot + regime pill + alert banner */
   const dot = g('status-dot');
-  if(dot) dot.className = 'brand-mark' + (brain.circuit_open ? ' cb' : '');
+  if(dot) dot.className = 'brand-mark' + (brain.circuit_open || stale.length ? ' cb' : '');
   const regimeEl = g('regime-pill');
   if(regimeEl) regimeEl.textContent = regimeLabel(brain.current_regime);
 
   const bannerParts = [];
-  if(brain.circuit_open) bannerParts.push('Circuit breaker engaged — new entries paused after drawdown limit');
+  const STALE_NAME = {bot:'Bot', exit_monitor:'Exit monitor', ws:'Websocket feed'};
+  stale.forEach(k=>bannerParts.push(STALE_NAME[k] + ' not reporting for '
+    + Math.max(1, Math.round(((health.ages_s||{})[k]||0)/60)) + ' min'));
+  if(brain.circuit_open) bannerParts.push('Circuit breaker tripped — new entries halted until '
+    + 'scripts/reset_circuit_breaker.py --confirm and a bot restart');
   if(marginHealth.halt_new_entries) bannerParts.push('New entries halted' + (marginHealth.halt_reason ? ' — ' + marginHealth.halt_reason : ''));
   const banner = g('alert-banner');
   if(banner){
@@ -1489,7 +1630,7 @@ function applyUpdate(d){
   renderPositions(d.positions || []);
   renderActivity(d.trades || []);
   if(d.prices && d.prices.length) renderTicker(d.prices);
-  renderSystem(p, brain, marginHealth);
+  renderSystem(p, brain, marginHealth, health);
 
   /* Chart: SSE strips equity_curve (equity_tf=null); re-fetch active TF, throttled */
   if(d.equity_curve && d.equity_curve.length && (!d.equity_tf || d.equity_tf === activeTf)){
