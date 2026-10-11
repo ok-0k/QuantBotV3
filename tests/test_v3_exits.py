@@ -135,3 +135,103 @@ def test_update_tp_price_only_tightens_toward_entry_and_fills_empty(fresh):
         conn.execute("UPDATE positions SET stop_price=NULL, tp_price=0 WHERE symbol=?", (B_SYM,))
     assert fresh.update_stop_price(B_SYM, 101.0, only_tighten=True) is True    # none stored
     assert fresh.update_tp_price(B_SYM, 96.0, only_tighten=True) is True
+
+
+# ── Exit journal (on by default): position regime, mark and stored levels ───
+
+def _spy_reward(monkeypatch):
+    calls = []
+    real = bot.brain.reward
+
+    def spy(*a, **k):
+        calls.append(k)
+        return real(*a, **k)
+    monkeypatch.setattr(bot.brain, "reward", spy)
+    return calls
+
+
+def _tp_exit(fresh, monkeypatch):
+    """Ranging-entered short; the brain last evaluated a trend_down symbol."""
+    _place_short(fresh, B_SYM, regime="ranging")
+    candles, _ = _history(B_SYM)
+    monkeypatch.setattr(bot.brain, "current_regime", "trend_down")
+    calls = _spy_reward(monkeypatch)
+    _tick(B_SYM, candles, high=ENTRY, low=TP0 - 0.1, close=TP0 - 0.05)
+    return _covers(fresh)[0], calls
+
+
+def test_exit_row_journals_position_regime_reward_unchanged_by_default(fresh, monkeypatch):
+    row, calls = _tp_exit(fresh, monkeypatch)
+    assert row["exit_reason"] == "TAKE_PROFIT"
+    assert row["regime"] == "ranging"                       # the position's own regime
+    assert calls[-1]["regime"] == "trend_down"              # V3 off: legacy global value
+    assert calls[-1]["next_state"][9] == 1.0                # SAC exit state: global bits
+
+
+def test_exit_without_entry_regime_keeps_global_regime(fresh, monkeypatch):
+    _place_short(fresh, B_SYM)
+    with fresh.get_db() as conn:
+        conn.execute("UPDATE positions SET entry_features=NULL WHERE symbol=?", (B_SYM,))
+    candles, _ = _history(B_SYM)
+    monkeypatch.setattr(bot.brain, "current_regime", "trend_up")
+    _tick(B_SYM, candles, high=ENTRY, low=TP0 - 0.1, close=TP0 - 0.05)
+    assert _covers(fresh)[0]["regime"] == "trend_up"
+
+
+def test_tick_exit_detail_records_mark_and_stored_levels(fresh):
+    _place_short(fresh, B_SYM)
+    candles, atr = _history(B_SYM)
+    mark, low = TP0 - 0.05, TP0 - 0.1
+    _tick(B_SYM, candles, high=ENTRY, low=low, close=mark)
+    detail = _covers(fresh)[0]["exit_detail"]
+    head, tail = detail.split(" | ")
+    assert head.startswith("take_profit_tick_short (low=")
+    # the stop as stored at exit: the trail had just moved it to low + ATR
+    assert tail == f"mark={mark:.10g} stop={low + atr:.10g} tp={TP0:.10g}"
+
+
+def _one_monitor_cycle(monkeypatch, candles, price, sym=B_SYM):
+    """One exit_monitor cycle with `sym`'s mark at `price` (test_exit_monitor pattern)."""
+    last = dict(candles[-1], close=price, high=max(price, candles[-1]["high"]),
+                low=min(price, candles[-1]["low"]))
+    bot._candles_cache[sym] = candles[:-1] + [last]
+
+    async def run():
+        ev = asyncio.Event()
+        monkeypatch.setattr(bot, "_shutdown_event", ev)
+        monkeypatch.setattr(bot, "CHECK_EVERY_SECS", 0.01)
+        monkeypatch.setattr(bot, "record_equity", lambda eq: ev.set())
+        await asyncio.wait_for(bot.exit_monitor(asyncio.get_running_loop()), 10)
+    asyncio.run(run())
+
+
+def test_monitor_exit_journals_position_regime_and_detail(fresh, monkeypatch):
+    stop = ENTRY * 1.004
+    _place_short(fresh, B_SYM, regime="ranging", stop=stop)
+    candles, _ = _history(B_SYM)
+    monkeypatch.setattr(bot.brain, "current_regime", "trend_up")
+    price = stop * 1.001
+    _one_monitor_cycle(monkeypatch, candles, price)
+    row = _covers(fresh)[0]
+    assert row["regime"] == "ranging"
+    assert row["exit_reason"] == "TIGHTENED_STOP"
+    assert row["exit_detail"].startswith("stop_loss_short (")
+    assert row["exit_detail"].endswith(f" | mark={price:.10g} stop={stop:.10g} tp={TP0:.10g}")
+
+
+@pytest.mark.parametrize("reason,stop,short,initial", [
+    ("take_profit_tick_short (low=$1 <= tp=$2)", 101.0, True, 101.0),
+    ("stop_loss_tick_short (high=$1 >= stop=$2)", 100.0, True, 101.0),
+    ("stop_loss_tick_short (mark=$1 >= stop=$2)", 99.0, True, 101.0),
+    ("stop_loss_short ($1 >= $2)", 100.5, True, 101.0),
+    ("stop_loss_tick (low=$1 <= stop=$2)", 99.0, False, 99.0),
+    ("hard_stop_survival_tick (pnl=$-20)", 101.0, True, 101.0),
+    ("time_hold_exit (4.1h open, in_red=$-1)", 101.0, True, 101.0),
+    ("max_hold_time (900 candles)", 101.0, True, 101.0),
+])
+def test_exit_detail_suffix_leaves_classification_unchanged(fresh, reason, stop, short, initial):
+    _place_short(fresh, B_SYM)
+    detail = bot._exit_detail(reason, B_SYM, 100.25)
+    assert detail.startswith(reason + " | mark=100.25 stop=")
+    assert (bot._classify_exit_reason(detail, 100.0, stop, short, initial)
+            == bot._classify_exit_reason(reason, 100.0, stop, short, initial))

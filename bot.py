@@ -764,6 +764,43 @@ def _initial_stop(pos: dict) -> Optional[float]:
         return None
 
 
+def _position_regime(pos: dict) -> Optional[str]:
+    """Regime the position was entered (and sized) in, from entry_features, or None.
+
+    Exits use it instead of brain.current_regime, which is whichever symbol
+    the brain evaluated last.
+    """
+    try:
+        v = json.loads(pos.get("entry_features") or "{}").get("regime")
+        return str(v) if v else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _open_pos(sym: str) -> Optional[dict]:
+    """The symbol's open position row as stored right now, or None."""
+    return next((p for p in get_all_positions() if p["symbol"] == sym), None)
+
+
+def _exit_detail(reason: str, sym: str, mark: float) -> str:
+    """
+    Trade-journal exit_detail: the trigger text, then the mark and the stop/tp
+    stored in the positions row at exit time, so level-persistence and fill
+    questions can be answered from the DB instead of rotating logs. The
+    trigger stays the prefix, so substring matching on it is unaffected.
+    Telemetry only: never raises into the exit path.
+    """
+    try:
+        out = f"{reason} | mark={float(mark):.10g}"
+        row = _open_pos(sym)
+        if row:
+            out += (f" stop={float(row.get('stop_price') or 0.0):.10g}"
+                    f" tp={float(row.get('tp_price') or 0.0):.10g}")
+        return out
+    except Exception:   # pragma: no cover - defensive
+        return reason
+
+
 def _exit_journal_fields(pos: dict, is_short: bool, trade_rec: dict) -> dict:
     """
     Trade-journal columns for a closing leg, derived from the position row
@@ -1055,10 +1092,11 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
             "signal":             "cover" if is_short else "sell",
             "exit_reason":        _classify_exit_reason(
                 reason, float(avg_cost), float(stop or 0.0), is_short, _initial_stop(pos)),
-            "exit_detail":        reason,
+            "exit_detail":        _exit_detail(reason, sym, _mark_now),
             "symbol":             sym,
             "price":              exit_price,
             "regime":             brain.current_regime,
+            "position_regime":    _position_regime(pos),
             "on_fire":            False,
             "position_size_mult": 1.0,
             "buy_weight":         0.0,
@@ -1543,6 +1581,11 @@ def _prepare_trade(
     if ensemble.get("exit_reason"):
         trade_rec["exit_reason"] = ensemble["exit_reason"]
         trade_rec["exit_detail"] = ensemble.get("exit_detail")
+    # Exits journal the regime the position was entered (and sized) in, not
+    # brain.current_regime (whichever symbol was evaluated last).
+    _pos_regime = ensemble.get("position_regime")
+    if _pos_regime and action in ("sell", "cover"):
+        trade_rec["regime"] = _pos_regime
     # Entries: journal the decision snapshot on every outcome, skips included.
     if action in ("buy", "short"):
         trade_rec["entry_features"] = _entry_snapshot(
@@ -2534,10 +2577,11 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                     "exit_reason":        _classify_exit_reason(
                         reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short,
                         _initial_stop(pos)),
-                    "exit_detail":        reason,
+                    "exit_detail":        _exit_detail(reason, sym, current_price),
                     "symbol":             sym,
                     "price":              current_price,
                     "regime":             brain.current_regime,
+                    "position_regime":    _position_regime(pos),
                     "on_fire":            False,
                     "position_size_mult": 1.0,
                     "buy_weight":         0.0,
