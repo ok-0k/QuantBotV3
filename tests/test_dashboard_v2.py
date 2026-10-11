@@ -6,6 +6,7 @@ threshold.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 from starlette.requests import Request
@@ -158,3 +159,25 @@ def test_experiment_card_headlines_per_symbol_day():
     assert "e.per_symbol_day" in html and "B − A per symbol-day" in html
     assert html.index("B − A per symbol-day") < html.index("B − A per trade")   # per-trade is secondary
     assert "psd.rule" in html and "e.note" in html
+
+
+# ── Insights: cleared-cost threshold (DASH-3) ─────────────────────────────────
+
+def test_cleared_costs_threshold_counts_entry_slippage_once(clean_db):
+    from config import FEE_GATE_ROUND_TRIP, SLIPPAGE_PCT
+    thr = (FEE_GATE_ROUND_TRIP + SLIPPAGE_PCT) * 100
+    assert insights.PEAK_BREAKEVEN_PCT == pytest.approx(thr)
+    ts = datetime.now(timezone.utc).isoformat()
+    with db.get_db() as conn:
+        for peak in (thr + 0.01, (thr + insights.COST_PCT) / 2, thr - 0.05, 0.0):
+            conn.execute("INSERT INTO trades (ts, symbol, action, status, pnl, trade_value, exit_reason, "
+                         "peak_profit_pct) VALUES (?,?,?,?,?,?,?,?)",
+                         (ts, A_SYM, "cover", "filled", -0.1, 100.0, "STOP_LOSS", peak))
+    conn = insights.connect()
+    try:
+        w = insights.journal_window(conn, 7.0)
+    finally:
+        conn.close()
+    assert w["cleared_cost_share"] == 50.0          # was 25% against the 0.36% round-trip
+    assert w["cost_pct"] == pytest.approx(insights.COST_PCT, abs=1e-3)   # label unchanged
+    assert w["peak_breakeven_pct"] == pytest.approx(thr, abs=1e-3)

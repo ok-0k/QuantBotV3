@@ -20,6 +20,9 @@ from config import DB_PATH, EXPERIMENT_NAME, FEE_GATE_ROUND_TRIP, SLIPPAGE_PCT, 
 
 # Round-trip cost of a trade as a % of notional: fee + slippage on both fills.
 COST_PCT = (FEE_GATE_ROUND_TRIP + 2 * SLIPPAGE_PCT) * 100
+# Peak profit (peak_profit_pct) is measured from the already-slipped entry
+# price, so a peak only needs to beat the fee plus the exit slippage (~0.28%).
+PEAK_BREAKEVEN_PCT = (FEE_GATE_ROUND_TRIP + SLIPPAGE_PCT) * 100
 
 # ── Experiment: per-symbol-day metric ──────────────────────────────────────────
 # The assignment unit is the symbol, so the decision metric is net P&L per
@@ -63,7 +66,8 @@ def journal_window(conn: sqlite3.Connection, days: float = 7.0) -> dict:
         "SELECT pnl, trade_value, exit_reason, peak_profit_pct, hold_time_seconds FROM trades "
         "WHERE status='filled' AND action IN ('cover','sell') AND exit_reason IS NOT NULL "
         "AND pnl IS NOT NULL AND ts >= ?", (since,)).fetchall()
-    out = {"days": days, "closed": len(rows), "cost_pct": round(COST_PCT, 3)}
+    out = {"days": days, "closed": len(rows), "cost_pct": round(COST_PCT, 3),
+           "peak_breakeven_pct": round(PEAK_BREAKEVEN_PCT, 3)}
     if not rows:
         return out | {"exit_mix": []}
     pnl = [r["pnl"] for r in rows]
@@ -79,7 +83,7 @@ def journal_window(conn: sqlite3.Connection, days: float = 7.0) -> dict:
         avg_pct=round(st.mean(pct), 3) if pct else None,
         median_hold_min=round(st.median(holds), 1) if holds else None,
         mean_hold_min=round(st.mean(holds), 1) if holds else None,
-        cleared_cost_share=round(100 * sum(p >= COST_PCT for p in peaks) / len(peaks), 1) if peaks else None,
+        cleared_cost_share=round(100 * sum(p >= PEAK_BREAKEVEN_PCT for p in peaks) / len(peaks), 1) if peaks else None,
         exit_mix=sorted(
             ({"reason": k, "n": len(v), "share": round(100 * len(v) / len(rows), 1), "net": round(sum(v), 2)}
              for k, v in mix.items()),

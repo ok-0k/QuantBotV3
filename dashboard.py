@@ -1546,7 +1546,7 @@ function renderInsights(d){
     {label:'Avg per trade', value:insPct(w.avg_pct), cls: w.avg_pct==null?'':(w.avg_pct>0?'pos':'neg'),
      sub:'round-trip cost ≈ '+cost.toFixed(2)+'%'},
     {label:'Cleared costs', value: w.cleared_cost_share==null?'—':w.cleared_cost_share.toFixed(0)+'%',
-     sub:'trades whose best moment beat '+cost.toFixed(2)+'%'},
+     sub:'trades whose best moment beat '+(w.peak_breakeven_pct || cost).toFixed(2)+'% (fee + exit slippage)'},
     {label:'Typical hold', value:insMin(w.median_hold_min), sub:'median · mean '+insMin(w.mean_hold_min)},
     {label:'Last 24 hours', value:fmtSigned$(day.net||0), cls:pnlCls(day.net||0),
      sub:(day.closed||0)+' trades · '+insPct(day.avg_pct)+'/trade'},
