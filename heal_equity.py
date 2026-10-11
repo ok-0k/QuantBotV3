@@ -8,6 +8,14 @@ Recomputes true equity as:
 Then overwrites:
   - portfolio.cash
   - latest equity_curve row (or inserts one if missing)
+
+DO NOT USE for the boot "Cash invariant ... drifted" warning (LEDGER-1).
+The trades table is pruned, so SUM(net_pnl) no longer covers the account's
+history, and the formula ignores deliberate cash top-ups and margin held by
+open shorts: the result is NOT the correct cash (on 2026-10-09 it would have
+added ~$400-500 of phantom cash). Record a reviewed drift with
+scripts/set_ledger_anchor.py instead. Refuses to run while any position is
+open; dry-run by default.
 """
 
 from __future__ import annotations
@@ -18,6 +26,18 @@ import sqlite3
 from datetime import datetime, timezone
 
 from config import DATA_DIR, DB_PATH, STARTING_CASH
+from db import get_all_positions
+
+NOTICE = """
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! heal_equity.py CANNOT compute the correct cash any more.               !!
+!! The trades table is pruned, so STARTING_CASH + SUM(net_pnl) misses the !!
+!! pruned history, deliberate top-ups and open margin: --confirm would    !!
+!! write phantom cash. For the boot "books drifted" warning, review the   !!
+!! drift and record it with:  python scripts/set_ledger_anchor.py         !!
+!! (dry-run first; --confirm writes capital_adjustments, not cash).       !!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+"""
 
 
 def _utc_now_iso() -> str:
@@ -32,6 +52,15 @@ def main() -> None:
     parser.add_argument("--confirm", action="store_true",
                         help="actually overwrite (default is a dry-run report)")
     args = parser.parse_args()
+
+    print(NOTICE)
+    positions = get_all_positions()
+    if positions:
+        print(f"REFUSING TO RUN: {len(positions)} open position(s) exist "
+              "(cash excludes deployed capital).")
+        for p in positions:
+            print(f"  - {p.get('symbol')} {p.get('side')} qty={p.get('shares')}")
+        raise SystemExit(1)
 
     conn = sqlite3.connect(str(DB_PATH), timeout=20.0)
     try:
@@ -59,9 +88,8 @@ def main() -> None:
 
         print(f"Current portfolio.cash: {current_cash}")
         print(f"Recomputed (healed) value: {healed_equity:.2f}")
-        print("NOTE: the trades table is pruned nightly; if history was pruned "
-              "this recomputation may be WRONG. Also unsafe while the bot has "
-              "open positions (cash excludes deployed capital).")
+        print("NOTE: the trades table is pruned, so this recomputation is WRONG "
+              "for any account older than the retained history (see notice above).")
 
         if not args.confirm:
             print("DRY-RUN: nothing changed. Re-run with --confirm to overwrite "

@@ -3,9 +3,11 @@
 #
 # 1. BACKUP first: a consistent SQLite snapshot (gzip) into $BACKUP_DIR,
 #    keeping the newest $BACKUP_KEEP (default 14). If the backup fails,
-#    nothing is pruned. Rotation only drops old backup COPIES — the live DB
-#    keeps all trade data. Restore: stop the bot, then
-#    gunzip -c <backup>.db.gz > /home/admin/trading_data/trading.db
+#    nothing is pruned. Each snapshot must pass PRAGMA quick_check before it is
+#    compressed; a snapshot that fails is kept aside and nothing is rotated or
+#    pruned. Rotation only drops old backup COPIES — the live DB keeps all
+#    trade data. Restore with scripts/restore_db.sh (never by overwriting
+#    trading.db while either service is running: both hold the WAL open).
 #
 # 2. PRUNE only high-volume, re-derivable data: candles (re-fetched from the
 #    exchange) and equity_curve DETAIL — the 30 s snapshot series is kept in full
@@ -26,7 +28,18 @@ mkdir -p "$BACKUP_DIR"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 tmp="$BACKUP_DIR/.trading-$stamp.db"
 out="$BACKUP_DIR/trading-$stamp.db.gz"
-if sqlite3 "$DB" ".backup '$tmp'" && gzip -c "$tmp" > "$out"; then
+if ! sqlite3 "$DB" ".backup '$tmp'"; then
+    rm -f "$tmp"
+    echo "[$(date)] BACKUP FAILED for $DB — prune skipped"
+    exit 1
+fi
+check="$(sqlite3 "$tmp" "PRAGMA quick_check;" 2>&1 | head -1)"
+if [[ "$check" != "ok" ]]; then
+    mv "$tmp" "$BACKUP_DIR/trading-$stamp.CHECK-FAILED.db"
+    echo "[$(date)] BACKUP CHECK FAILED ($check) — snapshot kept as trading-$stamp.CHECK-FAILED.db; nothing rotated or pruned"
+    exit 1
+fi
+if gzip -c "$tmp" > "$out"; then
     rm -f "$tmp"
     echo "[$(date)] Backup written: $out ($(du -h "$out" | cut -f1))"
     ls -1t "$BACKUP_DIR"/trading-*.db.gz | tail -n +$((BACKUP_KEEP + 1)) | xargs -r rm -f

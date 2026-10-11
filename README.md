@@ -18,10 +18,12 @@ offline research toolkit with a cost-aware backtester.
 - **An experiment is running.** `decay_v2` splits the symbols into two groups to
   compare the legacy time decay with the decay as designed. Check it with
   `scripts/experiment_report.py`.
-- **One real edge was found: perpetual-futures funding carry.** It is
-  market-neutral and depends on the regime: about 18% APR on deployed capital in
-  2023–25, but rarely active now. A forward test was frozen on 2026-10-07 in
-  `research/carry_forward.py`.
+- **Funding carry fails out of sample too, so no strategy passes.** Its earlier
+  out-of-sample "confirmation" came from a phantom hedge in delisted MATICUSDT,
+  which an audit found on 2026-10-11. With hedges limited to hours when the spot
+  pair trades, carry earned about 18% APR on deployed capital in sample (2023–24
+  bull-market funding) but lost money out of sample (OOS Sharpe −2.4). The frozen
+  forward test in `research/carry_forward.py` keeps tracking it.
 
 ---
 
@@ -152,7 +154,7 @@ per fill, plus 0.03%/day short borrow. Unit tests prove there is no lookahead.
 | Services | `quant-bot`, `quant-dashboard` (systemd; a drop-in at `/etc/systemd/system/quant-*.service.d/10-paths.conf` points them at this directory) |
 | Deploy | Commit, then `sudo systemctl restart quant-bot quant-dashboard`. Otherwise the 04:00 cron picks it up |
 | Logs | `/dev/shm/trading_logs/bot.log` (RAM, rotates, lost on reboot). The journal in the DB is the durable record |
-| Backups | Nightly, before the prune: `/home/admin/trading_data/backups/db/trading-<UTC>.db.gz`, newest 14 kept. To restore, stop the bot, then `gunzip -c <file> > /home/admin/trading_data/trading.db`, then start it. They live on the same SD card, so copy one off the Pi now and then |
+| Backups | Nightly, before the prune: `/home/admin/trading_data/backups/db/trading-<UTC>.db.gz`, newest 14 kept. Each is integrity-checked before rotation. To restore, stop **both** services (`sudo systemctl stop quant-bot quant-dashboard`), run `scripts/restore_db.sh <file>` (dry run verifies the backup) and then `scripts/restore_db.sh <file> --yes`, then start both. Never overwrite `trading.db` while either service runs: they hold the WAL open and the result can be corrupt. They live on the same SD card, so copy one off the Pi now and then |
 | Prune log | `/home/admin/trading_data/prune.log` (backup and prune results) |
 | Alerts | Discord alerts are off until `DISCORD_WEBHOOK_URL` is set in `~/.config/quant-bot/env` |
 | Dashboard | `http://<pi-ip>:8000` |

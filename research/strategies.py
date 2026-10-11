@@ -103,7 +103,8 @@ def zscore_mr(p, mask, window: int, z_in: float = 2.5, z_out: float = 0.5):
 
 def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
                   switch_cost: float = 0.0031, capital_eff: float = 1 / 1.2,
-                  premium: pd.DataFrame | None = None, return_state: bool = False):
+                  premium: pd.DataFrame | None = None, return_state: bool = False,
+                  tradable: pd.DataFrame | None = None):
     """Delta-neutral cash-and-carry on perps: hold long spot + short perp while
     trailing mean funding (per 8h) > theta_on; exit below theta_on / 2.
 
@@ -118,17 +119,29 @@ def funding_carry(funding: pd.DataFrame, theta_on: float, trail: int = 9,
     basis P&L of the hedge, -(premium_{t+1} - premium_t) per period held —
     short perp / long spot loses when the perp richens. Without it, basis
     drift is ignored (hedged price P&L assumed ~0).
+    tradable (optional, bool on the same grid): whether the SPOT leg traded
+    in each window. Where False (or missing) the hedge is forced flat, paying
+    its exit cost, and the sleeve stops counting towards the portfolio.
+    Without it, funding alone decides, so a hedge can outlive its spot pair:
+    MATICUSDT spot was delisted 2024-09-10 but its perp kept printing the
+    default 0.01%/8h funding, which never meets the strict exit
+    (< theta_on / 2 for theta_on = 0.02%), and that phantom hedge was most of
+    carry's out-of-sample result (audit, 2026-10-11).
     """
+    live = funding.notna()
+    if tradable is not None:
+        live &= tradable.reindex(index=funding.index, columns=funding.columns).eq(True)
     tr = funding.rolling(trail, min_periods=trail).mean()
     on = _state_machine(tr > theta_on, tr < theta_on / 2,
                         pd.DataFrame(False, index=tr.index, columns=tr.columns),
                         pd.DataFrame(False, index=tr.index, columns=tr.columns),
-                        funding.notna())
+                        live)
     income = (on * funding.shift(-1).fillna(0.0)) * capital_eff
     if premium is not None:
         prem = premium.reindex(index=funding.index, columns=funding.columns)
         basis = -(prem.shift(-1) - prem)
         income = income + (on * basis.fillna(0.0)) * capital_eff
     switches = on.diff().abs().fillna(on.abs())
-    out = (income - switches * switch_cost * capital_eff).where(funding.notna())
+    counted = live | (switches > 0)                 # a forced exit still pays its cost
+    out = (income - switches * switch_cost * capital_eff).where(counted)
     return (out, on) if return_state else out

@@ -17,6 +17,10 @@ Deliberately does NOT touch:
                                             balance forward.
   - adaptive_edge_profiles_v1, Brain._peak_equity (risk circuit breaker).
 
+Records the change in the ledger anchor: the same delta is added to
+portfolio.capital_adjustments in the same write as cash (LEDGER-5), so the
+bot's cash invariant / ledger_drift does not move.
+
 Refuses to run (even in dry-run) while open positions exist, since "cash"
 alone would not represent total balance in that case.
 
@@ -33,7 +37,7 @@ import json
 from datetime import datetime, timezone
 
 from config import DATA_DIR, DB_PATH
-from db import get_all_positions, get_cash, record_equity, set_cash
+from db import get_all_positions, get_capital_adjustments, get_cash, record_equity, set_cash_with_adjustment
 
 
 def main() -> None:
@@ -57,9 +61,12 @@ def main() -> None:
 
     old_cash = get_cash()
     new_cash = round(args.amount, 2)
+    old_adjustments = get_capital_adjustments()
 
     print(f"Current portfolio.cash: {old_cash:.2f}")
     print(f"New portfolio.cash:     {new_cash:.2f}")
+    print(f"capital_adjustments:    {old_adjustments:.2f} -> "
+          f"{old_adjustments + new_cash - old_cash:.2f} (same delta, keeps ledger drift unchanged)")
     print()
     print("NOT touched: trades table / lifetime trade count, realised_pnl, "
           "realised_pnl_net, equity_rebase_baseline/ts, adaptive_edge_profiles_v1, "
@@ -79,16 +86,18 @@ def main() -> None:
     backup_path.write_text(json.dumps({
         "old_cash": old_cash,
         "new_cash": new_cash,
+        "old_capital_adjustments": old_adjustments,
         "ts": datetime.now(timezone.utc).isoformat(),
     }, indent=2))
     print(f"Backup written: {backup_path}")
 
-    set_cash(new_cash)
+    _, delta = set_cash_with_adjustment(new_cash)
     record_equity(new_cash)
 
     print("\nCash balance set.")
     print(f"DB: {DB_PATH}")
     print(f"New cash: {new_cash:.2f}")
+    print(f"capital_adjustments: {get_capital_adjustments():.2f} (delta {delta:+.2f})")
 
 
 if __name__ == "__main__":

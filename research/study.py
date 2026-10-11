@@ -8,6 +8,15 @@ Pre-registered signal study (written and committed BEFORE any result was seen).
 check showed exact daily rebalancing gives volatile shorts inverse-ETF decay
 and inflates turnover; the grid and decision rules are unchanged.
 
+Spot-tradability mask for carry (added 2026-10-11, after an audit): a carry
+hedge needs the spot leg, so a symbol's carry sleeve is only live in 8h
+windows where its spot pair traded (see spot_tradable). Before this, funding
+alone decided, and MATICUSDT's perp kept printing a flat 0.01%/8h for two
+years after its spot delisting (2024-09-10): a hedge open at delisting never
+closed and earned riskless phantom funding, which was almost all of
+carry_2's "CONFIRMED" out-of-sample result. Thresholds, grid and decision
+rules are unchanged.
+
 Question: does any simple, well-known crypto signal beat realistic costs on
 the live bot's universe, out of sample?
 
@@ -108,6 +117,19 @@ def funding_buckets(funding: pd.DataFrame) -> pd.DataFrame:
     return f.groupby(level=0).sum(min_count=1)
 
 
+def spot_tradable(close: pd.DataFrame) -> pd.DataFrame:
+    """Whether each symbol's SPOT pair traded in each 8h window, on the
+    funding_buckets grid: True for window (t-8h, t] -> t if the 1h close-time
+    panel has at least one close in it. Pre-listing, post-delisting and long
+    gaps are False; buckets past the end of the spot data are absent."""
+    return close.notna().resample("8h", closed="right", label="right", origin="epoch").sum().gt(0)
+
+
+def load_spot_tradable(symbols, start) -> pd.DataFrame:
+    """spot_tradable() from the cached 1h spot klines (see research.data)."""
+    return spot_tradable(build_panel(symbols, "1h", start)["close"])
+
+
 def _log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
@@ -120,8 +142,9 @@ def _split(res: bt.Result, bpy: float, bench: pd.Series) -> dict:
     }
 
 
-def _carry_result(funding: pd.DataFrame, theta: float, cost_mult: float = 1.0) -> bt.Result:
-    sleeve = S.funding_carry(funding, theta, switch_cost=0.0031 * cost_mult)
+def _carry_result(funding: pd.DataFrame, theta: float, cost_mult: float = 1.0,
+                  tradable: pd.DataFrame | None = None) -> bt.Result:
+    sleeve = S.funding_carry(funding, theta, switch_cost=0.0031 * cost_mult, tradable=tradable)
     port = sleeve.mean(axis=1).fillna(0.0).shift(1).fillna(0.0)      # label by period end
     on = sleeve.notna() & (sleeve != 0)
     z = pd.Series(0.0, index=port.index)
@@ -156,14 +179,16 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:          # no perp for this symbol
             _log(f"  funding {s}: {exc}")
     funding = funding_buckets(pd.DataFrame(fund).sort_index())
+    spot_ok = spot_tradable(p1h["close"])
+    funding = funding[funding.index <= spot_ok.index.max()]       # no spot data yet -> unknown, not untradable
     bench["8h"] = bench["1h"].pipe(lambda r: (1 + r).resample("8h", closed="right", label="right").prod() - 1)
 
     rows = {}
     for sp in specs():
         bpd, bpy = FREQ[sp.freq]
         if sp.family == "carry":
-            res = _carry_result(funding, sp.param)
-            res2 = _carry_result(funding, sp.param, 2.0)
+            res = _carry_result(funding, sp.param, tradable=spot_ok)
+            res2 = _carry_result(funding, sp.param, 2.0, tradable=spot_ok)
         else:
             p, m = panels[sp.freq], masks[sp.freq]
             w = sp.make(p, m)
