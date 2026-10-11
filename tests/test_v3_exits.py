@@ -29,7 +29,8 @@ ENTRY, SL0, TP0 = 100.0, 100.55, 97.4
 
 
 @pytest.fixture()
-def fresh(clean_db):
+def fresh(clean_db, monkeypatch):
+    monkeypatch.setattr(bot, "V3_FIXES", False)              # default, whatever the env says
     bot.brain._edge_profiles.clear()
     bot.brain.ml_probs.clear()
     bot.brain.circuit_open = False
@@ -39,7 +40,7 @@ def fresh(clean_db):
 
 
 @pytest.fixture()
-def v3(monkeypatch):
+def v3(fresh, monkeypatch):                                  # after fresh, so it wins
     monkeypatch.setattr(bot, "V3_FIXES", True)
 
 
