@@ -108,7 +108,7 @@ from risk_engine import (
 )
 from db import (
     close_position, delete_position, get_all_positions, get_candles, get_cash,
-    get_entry_state, get_portfolio_stat, increment_candle_count,
+    get_portfolio_stat, increment_candle_count, record_ledger_check, transaction,
     init_db, load_brain_key, log_trade, log_rl_experience,
     open_position, open_position_count,
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
@@ -2219,6 +2219,29 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
     raw_price     = prepared.order_intent.ref_price
     exec_price    = prepared.order_intent.limit_price
 
+    def _rl_entry() -> tuple[Optional[np.ndarray], float]:
+        """
+        (state, action) at entry of the position being closed, for the RL
+        transition (logging only: brain.reward does not use them). Read from
+        the snapshot _prepare_trade loaded, because close_position/close_short
+        have deleted the row by then; re-reading it logged zeros (ENTRY-09).
+        """
+        pos_snap = prepared.pos or {}
+        state = pre_state
+        try:
+            raw = pos_snap.get("entry_state")
+            stored = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(stored, list) and stored:
+                state = np.array(stored, dtype=np.float32)
+        except (TypeError, ValueError):
+            pass
+        try:
+            feats = json.loads(pos_snap.get("entry_features") or "{}")
+            entry_action = float(feats.get("sac_fraction") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            entry_action = 0.0
+        return state, entry_action
+
     if action == "buy":
         if not fill.executed:
             update_order(_coid, state=fill.status if fill.status in
@@ -2243,37 +2266,42 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         trade_value = shares * exec_price
         trade_rec["exec_price"] = exec_price
 
-        # Fix C4: fresh cash read at commit time, not a prepare-phase
-        # snapshot — the network call above ran with the global lock
-        # released, so other symbols' trades may have already spent cash.
-        cash = get_cash()
+        # LEDGER-6: one atomic booking (cash, position, journal, trade row);
+        # an exception rolls it all back and leaves the order non-terminal.
+        # DB writes only inside: no logging, alerts or brain calls.
+        with transaction():
+            # Fix C4: fresh cash read at commit time, not a prepare-phase
+            # snapshot — the network call above ran with the global lock
+            # released, so other symbols' trades may have already spent cash.
+            cash = get_cash()
+            set_cash(cash - trade_value)
+            open_position(
+                symbol, shares, exec_price, strategy_name,
+                stop_price, tp_price, on_fire,
+                entry_state=pre_state.tolist() if pre_state is not None else None,
+            )
+            update_order(_coid, state=fill.status, filled_qty=shares,
+                         avg_fill_price=exec_price,
+                         exchange_order_id=fill.exchange_order_id, note=fill.note)
+            set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
+
+            trade_rec.update({
+                "status":      "filled",
+                "shares":      round(float(shares or 0.0), 8),
+                "trade_value": round(float(trade_value or 0.0), 2),
+                "stop_price":  stop_price,
+                "tp_price":    tp_price,
+                "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
+            })
+            log_trade(trade_rec)
+
         if cash < trade_value:
             log.warning(
-                "BUY %s committing with cash=$%.2f < trade_value=$%.2f — the "
+                "BUY %s committed with cash=$%.2f < trade_value=$%.2f — the "
                 "fill already executed and cannot be undone; other symbols' "
                 "trades likely consumed cash during this order's round-trip",
                 symbol, cash, trade_value,
             )
-        set_cash(cash - trade_value)
-        open_position(
-            symbol, shares, exec_price, strategy_name,
-            stop_price, tp_price, on_fire,
-            entry_state=pre_state.tolist() if pre_state is not None else None,
-        )
-        update_order(_coid, state=fill.status, filled_qty=shares,
-                     avg_fill_price=exec_price,
-                     exchange_order_id=fill.exchange_order_id, note=fill.note)
-        set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
-
-        trade_rec.update({
-            "status":      "filled",
-            "shares":      round(float(shares or 0.0), 8),
-            "trade_value": round(float(trade_value or 0.0), 2),
-            "stop_price":  stop_price,
-            "tp_price":    tp_price,
-            "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
-        })
-
         alert_sniper_shot(symbol, "buy", exec_price, strategy_name)
 
         log.info(
@@ -2283,7 +2311,6 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             f"{sac_fraction:.3f}" if sac_fraction is not None else "FALLBACK",
             prepared.confidence_multiplier, stop_price, tp_price
         )
-        log_trade(trade_rec)
         return
 
     if action == "sell":
@@ -2313,35 +2340,63 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         hh = _hold_hours_from_candles(hold_candles)
         fee_total, net_pnl = net_realized_pnl(pnl_gross, cost, proceeds, hh)
 
-        # Fix 1 — DYNAMIC MARGIN REFUND (long side): already read cash fresh
-        # here in the original code — unaffected by the C4 split.
-        returned_margin_long = cost
-        set_cash(get_cash() + returned_margin_long + net_pnl)
-        set_portfolio_stat("realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross)
-        set_portfolio_stat(
-            "realised_pnl_net",
-            float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
-        )
-        if shares >= pos_shares * (1.0 - 1e-9):
-            close_position(symbol)
-        else:
-            reduce_position(symbol, shares)
+        _avg_cost_s  = float(pos.get("avg_cost", 0.0))
+        _mfe_price_s = float(pos.get("mfe_price") or _avg_cost_s)
+        _mae_price_s = float(pos.get("mae_price") or _avg_cost_s)
+        _max_unreal  = round((_mfe_price_s - _avg_cost_s) * shares, 4)
+        _min_unreal  = round((_mae_price_s - _avg_cost_s) * shares, 4)
+
+        # LEDGER-6: one atomic booking (cash, realised stats, position,
+        # journal, trade row); an exception rolls it all back, so the retry
+        # cannot credit twice and the order stays non-terminal. DB writes
+        # only inside: no logging, alerts or brain calls.
+        _partial = shares < pos_shares * (1.0 - 1e-9)
+        with transaction():
+            # Fix 1 — DYNAMIC MARGIN REFUND (long side): already read cash fresh
+            # here in the original code — unaffected by the C4 split.
+            returned_margin_long = cost
+            set_cash(get_cash() + returned_margin_long + net_pnl)
+            set_portfolio_stat("realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross)
+            set_portfolio_stat(
+                "realised_pnl_net",
+                float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
+            )
+            if not _partial:
+                close_position(symbol)
+            else:
+                reduce_position(symbol, shares)
+            if _journaled:
+                update_order(_coid, state=fill.status, filled_qty=shares,
+                             avg_fill_price=exec_price,
+                             exchange_order_id=fill.exchange_order_id, note=fill.note)
+            set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
+
+            trade_rec.update({
+                "status":              "filled",
+                "shares":              round(float(shares or 0.0), 8),
+                "trade_value":         round(float(cost or 0.0), 2),
+                "proceeds":            round(float(proceeds or 0.0), 2),
+                "pnl":                 round(float(net_pnl or 0.0), 2),
+                "gross_pnl":           round(float(pnl_gross or 0.0), 2),
+                "fee_total":           round(float(fee_total or 0.0), 6),
+                "net_pnl":             round(float(net_pnl or 0.0), 2),
+                "max_unrealized_pnl":  _max_unreal,
+                "min_unrealized_pnl":  _min_unreal,
+                **_exit_journal_fields(pos, False, trade_rec),
+            })
+            log_trade(trade_rec)
+
+        if _partial:
             log.warning(
                 "SELL %s PARTIAL fill %.8f of %.8f — %.8f remains open",
                 symbol, shares, pos_shares, pos_shares - shares,
             )
-        if _journaled:
-            update_order(_coid, state=fill.status, filled_qty=shares,
-                         avg_fill_price=exec_price,
-                         exchange_order_id=fill.exchange_order_id, note=fill.note)
-        set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
-
-        stored_entry_state = get_entry_state(symbol)
-        entry_state_arr = np.array(stored_entry_state, dtype=np.float32) if stored_entry_state is not None else pre_state
-
+        entry_state_arr, entry_action = _rl_entry()
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
-                                             regime=regime if V3_FIXES else None)
+        exit_state = brain.compute_sac_state(
+            symbol, candles, new_cash, 0.0, _compute_total_equity(new_cash, get_all_positions()),
+            regime=regime if V3_FIXES else None,
+        )
 
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, cost)
         if 0.0 < net_pnl < MICRO_WIN_USD:
@@ -2350,30 +2405,10 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         brain.reward(
             strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
             state=entry_state_arr,
-            action=sac_fraction if sac_fraction is not None else 0.0,
+            action=entry_action,
             next_state=exit_state, trade_value=cost, side="long",
         )
         _persist_adaptive_edge_profiles()
-
-        _avg_cost_s  = float(pos.get("avg_cost", 0.0))
-        _mfe_price_s = float(pos.get("mfe_price") or _avg_cost_s)
-        _mae_price_s = float(pos.get("mae_price") or _avg_cost_s)
-        _max_unreal  = round((_mfe_price_s - _avg_cost_s) * shares, 4)
-        _min_unreal  = round((_mae_price_s - _avg_cost_s) * shares, 4)
-
-        trade_rec.update({
-            "status":              "filled",
-            "shares":              round(float(shares or 0.0), 8),
-            "trade_value":         round(float(cost or 0.0), 2),
-            "proceeds":            round(float(proceeds or 0.0), 2),
-            "pnl":                 round(float(net_pnl or 0.0), 2),
-            "gross_pnl":           round(float(pnl_gross or 0.0), 2),
-            "fee_total":           round(float(fee_total or 0.0), 6),
-            "net_pnl":             round(float(net_pnl or 0.0), 2),
-            "max_unrealized_pnl":  _max_unreal,
-            "min_unrealized_pnl":  _min_unreal,
-            **_exit_journal_fields(pos, False, trade_rec),
-        })
 
         alert_sniper_shot(
             symbol, f"sell (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
@@ -2383,13 +2418,12 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             "SELL %s @ $%.4f gross=$%+.2f net=$%+.2f fees=$%.4f shaped=$%+.4f [%s]",
             symbol, exec_price, pnl_gross, net_pnl, fee_total, shaped_reward, pos.get("strategy", "?")
         )
-        log_trade(trade_rec)
 
         try:
             log_rl_experience(
                 symbol=symbol,
                 state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
-                action=float(sac_fraction) if sac_fraction is not None else 0.0,
+                action=entry_action,
                 reward=float(shaped_reward),
                 next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
                 done=True,
@@ -2432,61 +2466,70 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
                 "tp_pct": round((exec_price - tp_price) / exec_price * 100.0, 4),
             })
 
-        # Fix #22: open_short() before set_cash(), and guarded. open_short()
-        # raises ValueError instead of silently overwriting an already-active
-        # short. Calling it before set_cash() means a rejection here never
-        # leaves cash debited with nothing booked against it.
-        try:
-            open_short(
-                symbol, shares, exec_price, strategy_name,
-                stop_price, tp_price, margin_reserved, on_fire,
-                entry_state=pre_state.tolist() if pre_state is not None else None,
-                entry_features=prepared.entry_features,
-            )
-        except ValueError as _dup_short_exc:
-            trade_rec["reason"] = "short_already_open"
+        # LEDGER-6: one atomic booking (position, cash, journal, trade row);
+        # an exception rolls it all back and leaves the order non-terminal.
+        # DB writes only inside: no logging, alerts or brain calls.
+        _dup_short_exc = None
+        with transaction():
+            # Fix #22: open_short() before set_cash(), and guarded. open_short()
+            # raises ValueError instead of silently overwriting an already-active
+            # short. Calling it before set_cash() means a rejection here never
+            # leaves cash debited with nothing booked against it.
+            try:
+                open_short(
+                    symbol, shares, exec_price, strategy_name,
+                    stop_price, tp_price, margin_reserved, on_fire,
+                    entry_state=pre_state.tolist() if pre_state is not None else None,
+                    entry_features=prepared.entry_features,
+                )
+            except ValueError as _exc:
+                _dup_short_exc = _exc
+                trade_rec["reason"] = "short_already_open"
+                update_order(
+                    _coid, state=fill.status, filled_qty=shares,
+                    avg_fill_price=exec_price, exchange_order_id=fill.exchange_order_id,
+                    note=f"BLOCKED: {_dup_short_exc}",
+                )
+                log_trade(trade_rec)
+            else:
+                # Fix C4: fresh cash read at commit time (see BUY above).
+                cash = get_cash()
+                set_cash(cash - margin_reserved)
+                update_order(_coid, state=fill.status, filled_qty=shares,
+                             avg_fill_price=exec_price,
+                             exchange_order_id=fill.exchange_order_id, note=fill.note)
+                set_portfolio_stat("total_trades", int(
+                    get_portfolio_stat("total_trades", "0")) + 1)
+
+                trade_rec.update({
+                    "status":      "filled",
+                    "shares":      round(float(shares or 0.0), 8),
+                    "trade_value": round(float(trade_value or 0.0), 2),
+                    "margin":      round(float(margin_reserved or 0.0), 2),
+                    "stop_price":  stop_price,
+                    "tp_price":    tp_price,
+                    "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
+                    "entry_features": (
+                        json.dumps(prepared.entry_features, default=str, sort_keys=True)
+                        if prepared.entry_features is not None else None
+                    ),
+                })
+                log_trade(trade_rec)
+
+        if _dup_short_exc is not None:
             log.critical(
                 "⚠ SHORT %s FILLED but BLOCKED from booking — %s — "
                 "no cash moved, manual review required",
                 symbol, _dup_short_exc,
             )
-            update_order(
-                _coid, state=fill.status, filled_qty=shares,
-                avg_fill_price=exec_price, exchange_order_id=fill.exchange_order_id,
-                note=f"BLOCKED: {_dup_short_exc}",
-            )
-            log_trade(trade_rec)
             return
-
-        # Fix C4: fresh cash read at commit time (see BUY above).
-        cash = get_cash()
         if cash < margin_reserved:
             log.warning(
-                "SHORT %s committing with cash=$%.2f < margin=$%.2f — the "
+                "SHORT %s committed with cash=$%.2f < margin=$%.2f — the "
                 "fill already executed and cannot be undone; other symbols' "
                 "trades likely consumed cash during this order's round-trip",
                 symbol, cash, margin_reserved,
             )
-        set_cash(cash - margin_reserved)
-        update_order(_coid, state=fill.status, filled_qty=shares,
-                     avg_fill_price=exec_price,
-                     exchange_order_id=fill.exchange_order_id, note=fill.note)
-        set_portfolio_stat("total_trades", int(
-            get_portfolio_stat("total_trades", "0")) + 1)
-
-        trade_rec.update({
-            "status":      "filled",
-            "shares":      round(float(shares or 0.0), 8),
-            "trade_value": round(float(trade_value or 0.0), 2),
-            "margin":      round(float(margin_reserved or 0.0), 2),
-            "stop_price":  stop_price,
-            "tp_price":    tp_price,
-            "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
-            "entry_features": (
-                json.dumps(prepared.entry_features, default=str, sort_keys=True)
-                if prepared.entry_features is not None else None
-            ),
-        })
         alert_sniper_shot(symbol, "short", exec_price, strategy_name)
         log.info(
             "SHORT %s @ $%.4f  val=$%.0f (%.1f%% of eq=$%.0f) (margin=$%.0f) [%s]  sac=%s  cm=%.2f  stop=$%.4f  tp=$%.4f",
@@ -2495,7 +2538,6 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             f"{sac_fraction:.3f}" if sac_fraction is not None else "FALLBACK",
             prepared.confidence_multiplier, stop_price, tp_price,
         )
-        log_trade(trade_rec)
         return
 
     if action == "cover":
@@ -2528,44 +2570,73 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         hh = _hold_hours_from_candles(hold_candles_c)
         fee_total, net_pnl = net_realized_pnl(pnl_gross, entry_cost, cover_cost, hh)
 
-        # Fix 1 — DYNAMIC MARGIN REFUND (short side): already read cash fresh
-        # here in the original code — unaffected by the C4 split.
-        set_cash(get_cash() + margin_res + net_pnl)
-        set_portfolio_stat(
-            "realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross
-        )
-        set_portfolio_stat(
-            "realised_pnl_net",
-            float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
-        )
-        if shares >= pos_shares * (1.0 - 1e-9):
-            close_short(symbol)
-        else:
-            reduce_position(symbol, shares, margin_released=margin_res)
+        # For shorts: mfe_price is the LOWEST low seen (favourable); mae_price
+        # is the HIGHEST high seen (adverse squeeze). Convert to USD PnL sign.
+        _avg_cost_c  = float(pos.get("avg_cost", 0.0))
+        _mfe_price_c = float(pos.get("mfe_price") or _avg_cost_c)
+        _mae_price_c = float(pos.get("mae_price") or _avg_cost_c)
+        _max_unreal  = round((_avg_cost_c - _mfe_price_c) * shares, 4)  # short profit
+        _min_unreal  = round((_avg_cost_c - _mae_price_c) * shares, 4)  # short loss
+
+        # LEDGER-6 / EXIT-07: one atomic booking (cash, realised stats,
+        # position, journal, trade row); an exception rolls it all back, so
+        # the retry cannot credit margin + PnL twice and the order stays
+        # non-terminal. DB writes only inside: no logging, alerts or brain calls.
+        _partial = shares < pos_shares * (1.0 - 1e-9)
+        with transaction():
+            # Fix 1 — DYNAMIC MARGIN REFUND (short side): already read cash fresh
+            # here in the original code — unaffected by the C4 split.
+            set_cash(get_cash() + margin_res + net_pnl)
+            set_portfolio_stat(
+                "realised_pnl", float(get_portfolio_stat("realised_pnl", "0.0")) + pnl_gross
+            )
+            set_portfolio_stat(
+                "realised_pnl_net",
+                float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
+            )
+            if not _partial:
+                close_short(symbol)
+            else:
+                reduce_position(symbol, shares, margin_released=margin_res)
+            if _journaled:
+                update_order(_coid, state=fill.status, filled_qty=shares,
+                             avg_fill_price=exec_price,
+                             exchange_order_id=fill.exchange_order_id, note=fill.note)
+            # Fix (Wave 3): cover previously fell through without incrementing
+            # total_trades, unlike buy/sell/short -- undercounting the lifetime
+            # trade stat for every closed short.
+            set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
+
+            trade_rec.update({
+                "status":              "filled",
+                "shares":              round(float(shares or 0.0), 8),
+                "trade_value":         round(float(entry_cost or 0.0), 2),
+                "proceeds":            round(float(cover_cost or 0.0), 2),
+                "pnl":                 round(float(net_pnl or 0.0), 2),
+                "gross_pnl":           round(float(pnl_gross or 0.0), 2),
+                "fee_total":           round(float(fee_total or 0.0), 6),
+                "net_pnl":             round(float(net_pnl or 0.0), 2),
+                "max_unrealized_pnl":  _max_unreal,
+                "min_unrealized_pnl":  _min_unreal,
+                **_exit_journal_fields(pos, True, trade_rec),
+            })
+            log_trade(trade_rec)
+
+        if _partial:
             log.warning(
                 "COVER %s PARTIAL fill %.8f of %.8f — %.8f remains open",
                 symbol, shares, pos_shares, pos_shares - shares,
             )
-        if _journaled:
-            update_order(_coid, state=fill.status, filled_qty=shares,
-                         avg_fill_price=exec_price,
-                         exchange_order_id=fill.exchange_order_id, note=fill.note)
-        # Fix (Wave 3): cover previously fell through without incrementing
-        # total_trades, unlike buy/sell/short -- undercounting the lifetime
-        # trade stat for every closed short.
-        set_portfolio_stat("total_trades", int(get_portfolio_stat("total_trades", "0")) + 1)
         alert_sniper_shot(
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )
 
-        stored_entry_state = get_entry_state(symbol)
-        entry_state_arr = (
-            np.array(stored_entry_state, dtype=np.float32)
-            if stored_entry_state is not None else pre_state
-        )
+        entry_state_arr, entry_action = _rl_entry()
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
-                                             regime=regime if V3_FIXES else None)
+        exit_state = brain.compute_sac_state(
+            symbol, candles, new_cash, 0.0, _compute_total_equity(new_cash, get_all_positions()),
+            regime=regime if V3_FIXES else None,
+        )
 
         hold_candles = pos.get("candle_count", 1)
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
@@ -2575,43 +2646,21 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         brain.reward(
             strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
             state=entry_state_arr,
-            action=sac_fraction if sac_fraction is not None else 0.0,
+            action=entry_action,
             next_state=exit_state, trade_value=entry_cost, side="short",
         )
         _persist_adaptive_edge_profiles()
 
-        # For shorts: mfe_price is the LOWEST low seen (favourable); mae_price
-        # is the HIGHEST high seen (adverse squeeze). Convert to USD PnL sign.
-        _avg_cost_c  = float(pos.get("avg_cost", 0.0))
-        _mfe_price_c = float(pos.get("mfe_price") or _avg_cost_c)
-        _mae_price_c = float(pos.get("mae_price") or _avg_cost_c)
-        _max_unreal  = round((_avg_cost_c - _mfe_price_c) * shares, 4)  # short profit
-        _min_unreal  = round((_avg_cost_c - _mae_price_c) * shares, 4)  # short loss
-
-        trade_rec.update({
-            "status":              "filled",
-            "shares":              round(float(shares or 0.0), 8),
-            "trade_value":         round(float(entry_cost or 0.0), 2),
-            "proceeds":            round(float(cover_cost or 0.0), 2),
-            "pnl":                 round(float(net_pnl or 0.0), 2),
-            "gross_pnl":           round(float(pnl_gross or 0.0), 2),
-            "fee_total":           round(float(fee_total or 0.0), 6),
-            "net_pnl":             round(float(net_pnl or 0.0), 2),
-            "max_unrealized_pnl":  _max_unreal,
-            "min_unrealized_pnl":  _min_unreal,
-            **_exit_journal_fields(pos, True, trade_rec),
-        })
         log.info(
             "COVER %s @ $%.4f  gross=$%+.2f net=$%+.2f fees=$%.4f shaped=$%+.4f  [%s]",
             symbol, exec_price, pnl_gross, net_pnl, fee_total, shaped_reward, pos.get("strategy", "?")
         )
-        log_trade(trade_rec)
 
         try:
             log_rl_experience(
                 symbol=symbol,
                 state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
-                action=float(sac_fraction) if sac_fraction is not None else 0.0,
+                action=entry_action,
                 reward=float(shaped_reward),
                 next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
                 done=True,
@@ -2950,37 +2999,54 @@ def _reconcile_orders_on_boot() -> None:
             log.error("Reconcile failed for %s (%s): %s — left for next boot", coid, sym, exc)
 
 
-def _report_cash_invariant() -> None:
+def _report_cash_invariant(periodic: bool = False) -> Optional[dict]:
     """
     V4 restart protection: verify the books still balance after a restart.
 
     Invariant: cash + Σ(long cost basis) + Σ(short margin reserved)
-               == STARTING_CASH + realised_pnl_net
-    Report-only — drift is surfaced loudly, never auto-'healed' (heal_equity.py
-    exists for deliberate, backed-up repair).
+               == STARTING_CASH + capital_adjustments + realised_pnl_net
+    (db.ledger_drift). Every booking moves both sides equally, so the drift
+    is constant; capital_adjustments records deliberate out-of-band cash
+    changes. Report-only — drift is surfaced loudly and recorded as
+    ledger_drift / ledger_checked_at for the dashboard, never auto-'healed'.
+
+    periodic=True is the housekeeping loop's once-a-minute check (IMPR-1):
+    it warns only when the drift moved by more than $1 since the previous
+    check, so a known, explained offset does not warn every minute.
     """
     try:
-        cash = get_cash()
-        deployed_cost = 0.0
-        for p in get_all_positions():
-            if p.get("side", "long") == "short":
-                deployed_cost += float(p.get("margin_reserved") or 0.0)
-            else:
-                deployed_cost += float(p.get("shares") or 0.0) * float(p.get("avg_cost") or 0.0)
-        realised_net = float(get_portfolio_stat("realised_pnl_net", "0.0") or 0.0)
-        expected = STARTING_CASH + realised_net - deployed_cost
-        drift = cash - expected
+        led = record_ledger_check()
+        drift, prev = led["drift"], led["previous"]
         msg = (
-            f"Cash invariant: cash=${cash:,.2f} deployed=${deployed_cost:,.2f} "
-            f"realised_net=${realised_net:,.2f} -> expected cash=${expected:,.2f} "
+            f"Cash invariant: cash=${led['cash']:,.2f} deployed=${led['deployed']:,.2f} "
+            f"realised_net=${led['realised_net']:,.2f} "
+            f"adjustments=${led['capital_adjustments']:,.2f} "
+            f"-> expected cash=${led['expected'] - led['deployed']:,.2f} "
             f"drift=${drift:+.2f}"
         )
-        if abs(drift) > 1.00:
-            log.warning("⚠ %s — books drifted (heal_equity.py --confirm after review)", msg)
+        if periodic:
+            if (abs(drift) > 1.00 if prev is None else abs(drift - prev) > 1.00):
+                log.warning(
+                    "⚠ %s — ledger drift moved from $%s: cash moved without a "
+                    "matching booking (leak or out-of-band edit), investigate",
+                    msg, "n/a" if prev is None else f"{prev:+.2f}",
+                )
+        elif abs(drift) > 1.00:
+            log.warning(
+                "⚠ %s — books drifted from the ledger anchor (STARTING_CASH + "
+                "capital_adjustments + realised_pnl_net). A drift that stays "
+                "constant between checks is an unrecorded out-of-band cash "
+                "change (e.g. the 2026-09-30 top-up): review it, then record "
+                "it with scripts/set_ledger_anchor.py (dry-run, then --confirm "
+                "--amount %.2f). A drift that changes means a booking leak.",
+                msg, drift,
+            )
         else:
             log.info("✅ %s", msg)
+        return led
     except Exception as exc:
         log.error("Cash invariant check failed: %s", exc)
+        return None
 
 
 async def _load_history_for_all_symbols() -> dict[str, list[dict]]:
@@ -3072,6 +3138,9 @@ async def housekeeping_loop() -> None:
             set_portfolio_stat("circuit_open", "1" if brain.circuit_open else "0")
         except Exception as _hk_reg_exc:
             log.error("❌ Housekeeping — regime persist FAILED: %s", _hk_reg_exc)
+
+        # ── Ledger reconciliation (IMPR-1): ledger_drift for the dashboard ────
+        _report_cash_invariant(periodic=True)   # report-only; never raises
 
         # ── Confirmation log (only emitted when both succeed) ─────────────────
         n_buckets = len(getattr(brain, "_edge_profiles", {}))
