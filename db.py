@@ -78,12 +78,53 @@ def _get_conn() -> sqlite3.Connection:
 @contextmanager
 def get_db():
     conn = _get_conn()
+    if getattr(_local, "tx_depth", 0):
+        # Inside transaction() on this thread: join it. The outermost
+        # transaction() block commits once, or rolls everything back.
+        yield conn
+        return
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+
+
+@contextmanager
+def transaction():
+    """
+    One atomic write transaction on this thread's connection (LEDGER-6).
+
+    BEGIN IMMEDIATE takes the write lock up front, so reads inside see the
+    latest committed state and no other writer can commit until this one
+    does. Every get_db() block nested inside it on the same thread (i.e. any
+    helper in this module) joins it instead of committing; the outermost
+    block commits once at exit, or rolls everything back on an exception and
+    re-raises. A nested transaction() joins the outer one.
+
+    Keep it short (other writers wait on the lock) and never hold it across
+    an await: coroutines on the event-loop thread share one connection.
+    """
+    conn = _get_conn()
+    depth = getattr(_local, "tx_depth", 0)
+    if depth:
+        _local.tx_depth = depth + 1
+        try:
+            yield conn
+        finally:
+            _local.tx_depth = depth
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    _local.tx_depth = 1
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        _local.tx_depth = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -941,11 +982,13 @@ def save_brain_key(key: str, value: Any) -> None:
             "INSERT OR REPLACE INTO brain_state (key, value) VALUES (?, ?)",
             (key, serialised),
         )
-        # Belt-and-suspenders: force WAL checkpoint synchronously.
-        try:
-            conn.commit()
-        except Exception:
-            pass   # get_db() already rolled back; caller will see the exception
+        # Belt-and-suspenders: force WAL checkpoint synchronously. Skipped
+        # inside transaction(), whose outermost block owns the commit.
+        if not getattr(_local, "tx_depth", 0):
+            try:
+                conn.commit()
+            except Exception:
+                pass   # get_db() already rolled back; caller will see the exception
 
 
 def load_brain_key(key: str, default: Any = None) -> Any:
