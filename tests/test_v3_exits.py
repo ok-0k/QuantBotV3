@@ -447,3 +447,14 @@ def test_v3_stop_integrity_over_tick_sequence(fresh, v3, monkeypatch, sym, arm, 
             row = _covers(fresh)[-1]
             if row["exit_reason"] in STOP_CODES:
                 assert px >= s_before or high_seen >= s_minute, f"phantom stop exit at tick {i}"
+
+
+# ── V3: exit reward and SAC exit state use the position regime ──────────────
+
+def test_v3_reward_and_sac_exit_state_use_position_regime(fresh, v3, monkeypatch):
+    row, calls = _tp_exit(fresh, monkeypatch)
+    assert row["regime"] == "ranging"
+    assert calls[-1]["regime"] == "ranging"
+    assert (calls[-1]["next_state"][9], calls[-1]["next_state"][10]) == (0.0, 0.0)
+    assert "short:ranging" in bot.brain._edge_profiles
+    assert "short:trend_down" not in bot.brain._edge_profiles

@@ -1648,10 +1648,13 @@ def _prepare_trade(
         trade_rec["exit_reason"] = ensemble["exit_reason"]
         trade_rec["exit_detail"] = ensemble.get("exit_detail")
     # Exits journal the regime the position was entered (and sized) in, not
-    # brain.current_regime (whichever symbol was evaluated last).
+    # brain.current_regime (whichever symbol was evaluated last). With
+    # V3_FIXES the reward goes to that bucket too (regime -> brain.reward).
     _pos_regime = ensemble.get("position_regime")
     if _pos_regime and action in ("sell", "cover"):
         trade_rec["regime"] = _pos_regime
+        if V3_FIXES:
+            regime = _pos_regime
     # Entries: journal the decision snapshot on every outcome, skips included.
     if action in ("buy", "short"):
         trade_rec["entry_features"] = _entry_snapshot(
@@ -2180,7 +2183,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         entry_state_arr = np.array(stored_entry_state, dtype=np.float32) if stored_entry_state is not None else pre_state
 
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
+                                             regime=regime if V3_FIXES else None)
 
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, cost)
         if 0.0 < net_pnl < MICRO_WIN_USD:
@@ -2403,7 +2407,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             if stored_entry_state is not None else pre_state
         )
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
+                                             regime=regime if V3_FIXES else None)
 
         hold_candles = pos.get("candle_count", 1)
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
