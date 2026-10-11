@@ -351,3 +351,11 @@ def test_sse_clients_share_one_background_build(monkeypatch):
     assert firsts[0] == firsts[1] == firsts[2]
     data = json.loads(firsts[0]["data"])
     assert data["equity_curve"] == [] and data["cash_curve"] == [] and data["equity_tf"] is None
+
+
+def test_recent_activity_is_a_collapsible_section():
+    html = dashboard.DASHBOARD_HTML
+    btn = html.index('id="activity-toggle"')
+    assert 'aria-controls="activity-list"' in html[btn - 120:btn + 120]
+    assert '<div class="list-card" id="activity-list" hidden>' in html        # closed on first load
+    assert "localStorage.getItem('activityOpen')" in html and "list.hidden = !open" in html

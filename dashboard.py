@@ -1001,6 +1001,16 @@ section.block{margin-top:36px;}
 .block-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
 .block-title{font-size:15px;font-weight:700;color:var(--t1);letter-spacing:-.01em;}
 .count-badge{font-size:11px;font-weight:600;color:var(--t3);background:var(--card);border:1px solid var(--border-soft);padding:2px 9px;border-radius:999px;}
+/* Collapsible section header (Recent Activity) */
+.block-toggle{width:100%;background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;text-align:left;}
+.block-toggle[aria-expanded="false"]{margin-bottom:0;}
+.block-toggle:focus-visible{outline:2px solid var(--t3);outline-offset:4px;border-radius:6px;}
+.block-toggle .hdr-right{display:flex;align-items:center;gap:10px;}
+.toggle-hint{font-size:11.5px;font-weight:600;color:var(--t3);}
+.block-toggle:hover .toggle-hint{color:var(--t1);}
+.chev{width:7px;height:7px;border-right:2px solid var(--t3);border-bottom:2px solid var(--t3);transform:rotate(-45deg);transition:transform .15s;margin:0 4px 0 2px;}
+.block-toggle[aria-expanded="true"] .chev{transform:rotate(45deg);}
+#activity-list[hidden]{display:none;}
 
 /* Stats grid */
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;}
@@ -1190,11 +1200,16 @@ section.block{margin-top:36px;}
 
   <!-- ══════════════════════════ ACTIVITY ══════════════════════════ -->
   <section class="block">
-    <div class="block-hdr">
+    <button type="button" class="block-hdr block-toggle" id="activity-toggle"
+            aria-expanded="false" aria-controls="activity-list">
       <span class="block-title">Recent Activity</span>
-      <span class="count-badge" id="trades-count">0</span>
-    </div>
-    <div class="list-card" id="activity-list">
+      <span class="hdr-right">
+        <span class="count-badge" id="trades-count">0</span>
+        <span class="toggle-hint" id="activity-hint">Show</span>
+        <span class="chev" aria-hidden="true"></span>
+      </span>
+    </button>
+    <div class="list-card" id="activity-list" hidden>
       <div class="empty-state">No trades yet</div>
     </div>
   </section>
@@ -1547,6 +1562,26 @@ function renderPositions(positions){
 }
 
 /* ══════════════════════════════ ACTIVITY ══════════════════════════════ */
+/* Recent Activity opens and closes (closed by default so the sections below
+   stay in view); the choice is remembered in this browser. */
+(function(){
+  const btn = g('activity-toggle'), list = g('activity-list'), hint = g('activity-hint');
+  if(!btn || !list) return;
+  let open = false;
+  try { open = localStorage.getItem('activityOpen') === '1'; } catch(e) {}
+  function apply(){
+    btn.setAttribute('aria-expanded', String(open));
+    list.hidden = !open;
+    if(hint) hint.textContent = open ? 'Hide' : 'Show';
+  }
+  btn.addEventListener('click', function(){
+    open = !open;
+    apply();
+    try { localStorage.setItem('activityOpen', open ? '1' : '0'); } catch(e) {}
+  });
+  apply();
+})();
+
 function renderActivity(trades){
   const cnt = g('trades-count');
   if(cnt) cnt.textContent = String((trades||[]).length);
