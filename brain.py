@@ -285,6 +285,8 @@ class Brain:
         """
         Pack SAC_STATE_DIM features for the NumPy actor. Uses positional convention from bot.py:
         compute_sac_state(symbol, candles, cash, unrealised_pnl, total_equity).
+        regime= (optional) sets the regime bits; default current_regime (the
+        last symbol evaluated). Exits pass the position's own regime (V3_FIXES).
         """
         symbol = args[0] if len(args) > 0 else kwargs.get("symbol", "")
         candles = args[1] if len(args) > 1 else kwargs.get("candles") or []
@@ -320,8 +322,9 @@ class Brain:
         if len(ema12) and len(ema26) and not math.isnan(ema12[-1]) and not math.isnan(ema26[-1]):
             stack = float((ema12[-1] - ema26[-1]) / max(price, 1e-12))
         vec[8] = np.float32(math.tanh(stack * 50.0))
-        vec[9] = np.float32(1.0 if self.current_regime == "trend_down" else 0.0)
-        vec[10] = np.float32(1.0 if self.current_regime == "trend_up" else 0.0)
+        regime = kwargs.get("regime") or self.current_regime
+        vec[9] = np.float32(1.0 if regime == "trend_down" else 0.0)
+        vec[10] = np.float32(1.0 if regime == "trend_up" else 0.0)
         vec[11] = np.float32(1.0 if self.circuit_open else 0.0)
         vec[12] = np.float32(min(max((1.0 - ml_p) - 0.5, -0.5), 0.5) * 2.0)  # bearish ML tilt
         return vec

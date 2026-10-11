@@ -262,6 +262,9 @@ _entry_block_journaled: dict[tuple[str, str], float] = {}
 # yet in this process); drives the one-time "entries halted" warning.
 _cb_last_open: Optional[bool] = None
 _ws_heartbeat_last: float = 0.0     # epoch of the last ws_last_msg write (throttled)
+# V3 tick path: the stop stored when each 1m candle was first seen, per position:
+# sym -> ((opened_ts, candle open time), stop). See _tick_exit_check.
+_tick_minute_stop:  dict[str, tuple] = {}
 
 # V2: last margin / utilization snapshot for gating + dashboard
 _margin_health_cache: dict = {}
@@ -452,14 +455,14 @@ def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
     target_sl = sl0 + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - sl0)
     if pos.get("side", "long") == "short":
         if tp < target_tp < entry - 1e-9:
-            update_tp_price(sym, target_tp)
+            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
         if entry + 1e-9 < target_sl < stop:
-            update_stop_price(sym, target_sl)
+            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
     else:
         if entry + 1e-9 < target_tp < tp:
-            update_tp_price(sym, target_tp)
+            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
         if stop < target_sl < entry - 1e-9:
-            update_stop_price(sym, target_sl)
+            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
 
 
 def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
@@ -503,16 +506,16 @@ def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
         new_tp = entry + (tp - entry) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
         new_sl = stop + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - stop)
         if new_tp < tp - 1e-12 and new_tp > entry + 1e-9:
-            update_tp_price(sym, new_tp)
+            update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
         if new_sl > stop + 1e-12 and new_sl < entry - 1e-9:
-            update_stop_price(sym, new_sl)
+            update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
     else:
         new_tp = entry - (entry - tp) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
         new_sl = stop - lam * DECAY_SL_TIGHTEN_STRENGTH * (stop - entry)
         if new_tp > tp + 1e-12 and new_tp < entry - 1e-9:
-            update_tp_price(sym, new_tp)
+            update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
         if new_sl < stop - 1e-12 and new_sl > entry + 1e-9:
-            update_stop_price(sym, new_sl)
+            update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
 
 
 # ── Pure helpers (Fix #15: defined before first use) ─────────────────────────
@@ -866,6 +869,43 @@ def _initial_stop(pos: dict) -> Optional[float]:
         return None
 
 
+def _position_regime(pos: dict) -> Optional[str]:
+    """Regime the position was entered (and sized) in, from entry_features, or None.
+
+    Exits use it instead of brain.current_regime, which is whichever symbol
+    the brain evaluated last.
+    """
+    try:
+        v = json.loads(pos.get("entry_features") or "{}").get("regime")
+        return str(v) if v else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _open_pos(sym: str) -> Optional[dict]:
+    """The symbol's open position row as stored right now, or None."""
+    return next((p for p in get_all_positions() if p["symbol"] == sym), None)
+
+
+def _exit_detail(reason: str, sym: str, mark: float) -> str:
+    """
+    Trade-journal exit_detail: the trigger text, then the mark and the stop/tp
+    stored in the positions row at exit time, so level-persistence and fill
+    questions can be answered from the DB instead of rotating logs. The
+    trigger stays the prefix, so substring matching on it is unaffected.
+    Telemetry only: never raises into the exit path.
+    """
+    try:
+        out = f"{reason} | mark={float(mark):.10g}"
+        row = _open_pos(sym)
+        if row:
+            out += (f" stop={float(row.get('stop_price') or 0.0):.10g}"
+                    f" tp={float(row.get('tp_price') or 0.0):.10g}")
+        return out
+    except Exception:   # pragma: no cover - defensive
+        return reason
+
+
 def _exit_journal_fields(pos: dict, is_short: bool, trade_rec: dict) -> dict:
     """
     Trade-journal columns for a closing leg, derived from the position row
@@ -971,6 +1011,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
 
     stop = pos.get("stop_price", 0)
     tp = pos.get("tp_price",   0)
+    _stop0, _tp0 = float(stop or 0.0), float(tp or 0.0)   # V3: levels stored when this call began
 
     candle_high = candle["high"]
     candle_low = candle["low"]
@@ -1016,7 +1057,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         if tp > 0 and candle_high > tp:
             new_stop = candle_high - _atr
             if new_stop > stop:
-                update_stop_price(sym, new_stop)
+                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
                 stop = new_stop
                 log.info(
                     "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
@@ -1026,7 +1067,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         if tp > 0 and candle_low < tp:
             new_stop = candle_low + _atr
             if new_stop < stop:
-                update_stop_price(sym, new_stop)
+                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
                 stop = new_stop
                 log.info(
                     "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
@@ -1054,7 +1095,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 if avg_cost - _close_now >= _min_be_profit:
                     be_stop = avg_cost
                     if be_stop < stop:
-                        update_stop_price(sym, be_stop)
+                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
                         stop = be_stop
                         log.info(
                             "BREAK-EVEN STOP (short) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
@@ -1070,7 +1111,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 if _close_now - avg_cost >= _min_be_profit:
                     be_stop = avg_cost
                     if be_stop > stop:
-                        update_stop_price(sym, be_stop)
+                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
                         stop = be_stop
                         log.info(
                             "BREAK-EVEN STOP (long) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
@@ -1099,7 +1140,18 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 )
     # ── ML TIME-DECAY (also on tick so targets move with each bar) ────────────
     if _recent and len(_recent) > 20:
-        _apply_ml_time_decay(sym, pos, _recent)
+        if V3_FIXES:
+            # Decay starts from the levels trail / break-even just stored. Fed
+            # the row read at the top of this call, it wrote its own loss-side
+            # level straight over them on every tick.
+            _apply_ml_time_decay(sym, {**pos, "stop_price": stop, "tp_price": tp}, _recent)
+        else:
+            _apply_ml_time_decay(sym, pos, _recent)
+    if V3_FIXES:
+        # The exit checks below use the levels as stored after decay.
+        _row = _open_pos(sym)
+        if _row:
+            stop, tp = float(_row.get("stop_price") or 0.0), float(_row.get("tp_price") or 0.0)
     # ── END BREAK-EVEN / DECAY ────────────────────────────────────────────────
 
     # Fill model: a take-profit is a resting limit -> fills AT tp. A stop is a
@@ -1108,7 +1160,58 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # disabled), it fills at the current price. Filling every stop at its
     # trigger level understated losses, e.g. a stop 5.7% under market booked ~$0.
     _mark_now = float(candle.get("close", 0.0) or 0.0)
-    if not is_short:
+    if V3_FIXES:
+        # Order as in exit_monitor: survival -> stop -> take-profit, so a
+        # fee-gated TP can no longer hide a breached stop, and a candle that
+        # touched both books the stop (conservative).
+        # The candle's high/low is the whole minute so far, partly printed
+        # before a stop moved within the minute existed (trail / break-even,
+        # in this call or an earlier tick, or decay). It is only tested
+        # against the loosest stop in place since the minute began (_ext_stop);
+        # a stop moved since triggers on the mark only. Otherwise a break-even
+        # armed mid-candle is "hit" by the minute's earlier high, closing a
+        # winner at entry. A take-profit is tested against the level stored
+        # when this call began (_tp0) as before, or the current one on the mark.
+        _mkey = (pos.get("opened_ts"), candle.get("time"))
+        _seen = _tick_minute_stop.get(sym)
+        if _seen is None or _seen[0] != _mkey:
+            _seen = _tick_minute_stop[sym] = (_mkey, float(_stop0 or 0.0))
+        _s_open, _s_now = _seen[1], float(stop or 0.0)
+        _ext_stop = 0.0
+        if _s_open > 0 and _s_now > 0:
+            _ext_stop = max(_s_open, _s_now) if is_short else min(_s_open, _s_now)
+        if _is_survival:
+            reason     = f"hard_stop_survival_tick (pnl=${_open_pnl:.2f})"
+            exit_price = _mark_close
+        elif not is_short:
+            if _ext_stop > 0 and candle_low <= _ext_stop:
+                stop = _ext_stop
+                reason = f"stop_loss_tick (low=${candle_low:,.4f} <= stop=${stop:,.4f})"
+                exit_price = min(stop, _mark_now) if _mark_now > 0 else stop
+            elif stop > 0 and 0 < _mark_now <= stop:
+                reason = f"stop_loss_tick (mark=${_mark_now:,.4f} <= stop=${stop:,.4f})"
+                exit_price = _mark_now
+            elif _tp0 > 0 and candle_high >= _tp0:
+                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
+                exit_price = _tp0
+            elif tp > 0 and _mark_now >= tp:
+                reason = f"take_profit_tick (mark=${_mark_now:,.4f} >= tp=${tp:,.4f})"
+                exit_price = tp
+        else:
+            if _ext_stop > 0 and candle_high >= _ext_stop:
+                stop = _ext_stop
+                reason = f"stop_loss_tick_short (high=${candle_high:,.4f} >= stop=${stop:,.4f})"
+                exit_price = max(stop, _mark_now)
+            elif stop > 0 and _mark_now >= stop:
+                reason = f"stop_loss_tick_short (mark=${_mark_now:,.4f} >= stop=${stop:,.4f})"
+                exit_price = _mark_now
+            elif _tp0 > 0 and candle_low <= _tp0:
+                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
+                exit_price = _tp0
+            elif tp > 0 and 0 < _mark_now <= tp:
+                reason = f"take_profit_tick_short (mark=${_mark_now:,.4f} <= tp=${tp:,.4f})"
+                exit_price = tp
+    elif not is_short:
         if tp > 0 and candle_high >= tp:
             reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${tp:,.4f})"
             exit_price = tp
@@ -1157,10 +1260,11 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
             "signal":             "cover" if is_short else "sell",
             "exit_reason":        _classify_exit_reason(
                 reason, float(avg_cost), float(stop or 0.0), is_short, _initial_stop(pos)),
-            "exit_detail":        reason,
+            "exit_detail":        _exit_detail(reason, sym, _mark_now),
             "symbol":             sym,
             "price":              exit_price,
             "regime":             brain.current_regime,
+            "position_regime":    _position_regime(pos),
             "on_fire":            False,
             "position_size_mult": 1.0,
             "buy_weight":         0.0,
@@ -1694,6 +1798,14 @@ def _prepare_trade(
     if ensemble.get("exit_reason"):
         trade_rec["exit_reason"] = ensemble["exit_reason"]
         trade_rec["exit_detail"] = ensemble.get("exit_detail")
+    # Exits journal the regime the position was entered (and sized) in, not
+    # brain.current_regime (whichever symbol was evaluated last). With
+    # V3_FIXES the reward goes to that bucket too (regime -> brain.reward).
+    _pos_regime = ensemble.get("position_regime")
+    if _pos_regime and action in ("sell", "cover"):
+        trade_rec["regime"] = _pos_regime
+        if V3_FIXES:
+            regime = _pos_regime
     # Entries: journal the decision snapshot on every outcome, skips included.
     if action in ("buy", "short"):
         trade_rec["entry_features"] = _entry_snapshot(
@@ -2227,7 +2339,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         entry_state_arr = np.array(stored_entry_state, dtype=np.float32) if stored_entry_state is not None else pre_state
 
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
+                                             regime=regime if V3_FIXES else None)
 
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, cost)
         if 0.0 < net_pnl < MICRO_WIN_USD:
@@ -2450,7 +2563,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             if stored_entry_state is not None else pre_state
         )
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash,
+                                             regime=regime if V3_FIXES else None)
 
         hold_candles = pos.get("candle_count", 1)
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
@@ -2579,7 +2693,18 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
             if not candles:
                 continue
 
+            if V3_FIXES:
+                # The cycle-start snapshot predates the margin-refresh await and
+                # the earlier symbols' exits: the tick path may have moved this
+                # stop (trail / break-even) or closed the position since. Decay
+                # must start from the levels stored now.
+                pos = _open_pos(sym)
+                if not pos:
+                    continue
             _apply_ml_time_decay(sym, pos, candles)
+            if V3_FIXES:
+                # The exit checks below use the levels as stored after decay.
+                pos = _open_pos(sym) or pos
 
             current_price = candles[-1]["close"]
             count = increment_candle_count(sym)
@@ -2690,10 +2815,11 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
                     "exit_reason":        _classify_exit_reason(
                         reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short,
                         _initial_stop(pos)),
-                    "exit_detail":        reason,
+                    "exit_detail":        _exit_detail(reason, sym, current_price),
                     "symbol":             sym,
                     "price":              current_price,
                     "regime":             brain.current_regime,
+                    "position_regime":    _position_regime(pos),
                     "on_fire":            False,
                     "position_size_mult": 1.0,
                     "buy_weight":         0.0,

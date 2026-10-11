@@ -604,30 +604,48 @@ def update_mfe_mae(symbol: str, candle_high: float, candle_low: float, is_short:
 # POSITIONS — TRAILING STOP
 # ─────────────────────────────────────────────────────────────────────────────
 
-def update_tp_price(symbol: str, new_tp: float) -> None:
-    """Update take-profit level (used by ML time-decay exits)."""
+def update_tp_price(symbol: str, new_tp: float, only_tighten: bool = False) -> bool:
+    """
+    Update take-profit level (used by ML time-decay exits).
+
+    only_tighten=True (bot.py passes V3_FIXES) adds the directional guard in
+    the SQL, against the stored row and its side: the target may only move
+    toward entry (short: up, long: down), or be set where none is stored
+    (NULL/0). Returns True if the row was written.
+    """
+    sql = "UPDATE positions SET tp_price=? WHERE symbol=?"
+    params: tuple = (new_tp, symbol)
+    if only_tighten:
+        sql += (" AND (tp_price IS NULL OR tp_price <= 0"
+                " OR CASE WHEN side='short' THEN ? > tp_price ELSE ? < tp_price END)")
+        params += (new_tp, new_tp)
     with get_db() as conn:
-        conn.execute(
-            "UPDATE positions SET tp_price=? WHERE symbol=?",
-            (new_tp, symbol),
-        )
+        return conn.execute(sql, params).rowcount > 0
 
 
-def update_stop_price(symbol: str, new_stop: float) -> None:
+def update_stop_price(symbol: str, new_stop: float, only_tighten: bool = False) -> bool:
     """
     Ratchet the stop_price for an open position (long or short) to lock in profit.
 
     For a long  : call only when new_stop > current stop_price (stop moves up).
     For a short : call only when new_stop < current stop_price (stop moves down).
 
-    The caller (bot.py) is responsible for the directional guard — this function
-    just writes whatever value it receives, so it stays side-agnostic and simple.
+    By default the caller (bot.py) is responsible for the directional guard and
+    this function just writes whatever value it receives. only_tighten=True
+    (bot.py passes V3_FIXES) enforces the guard in the SQL, against the stored
+    row and its side (anything but 'short', NULL included, is a long), so a
+    caller holding a stale snapshot can never loosen a stop that trail /
+    break-even already moved. A row with no stop (NULL/0) accepts any value.
+    Returns True if the row was written.
     """
+    sql = "UPDATE positions SET stop_price=? WHERE symbol=?"
+    params: tuple = (new_stop, symbol)
+    if only_tighten:
+        sql += (" AND (stop_price IS NULL OR stop_price <= 0"
+                " OR CASE WHEN side='short' THEN ? < stop_price ELSE ? > stop_price END)")
+        params += (new_stop, new_stop)
     with get_db() as conn:
-        conn.execute(
-            "UPDATE positions SET stop_price=? WHERE symbol=?",
-            (new_stop, symbol),
-        )
+        return conn.execute(sql, params).rowcount > 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
