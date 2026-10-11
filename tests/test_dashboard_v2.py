@@ -218,6 +218,8 @@ def test_breaker_drawdown_from_persisted_peak_and_distance_to_trip(clean_db):
     assert s["breaker_limit_pct"] == pytest.approx(dashboard.MAX_DRAWDOWN_PCT * 100)
     assert s["breaker_headroom_pct"] == pytest.approx(dashboard.MAX_DRAWDOWN_PCT * 100 - 12.0)
     assert s["breaker_trip_equity"] == pytest.approx(10_000 * (1 - dashboard.MAX_DRAWDOWN_PCT))
+    # the breaker clears itself at this drawdown (brain.check_circuit_breaker hysteresis)
+    assert s["breaker_clear_pct"] == pytest.approx((dashboard.MAX_DRAWDOWN_PCT - dashboard.CB_RECOVERY_PCT) * 100)
     assert dashboard._breaker_state(10_500.0)["breaker_drawdown_pct"] == 0.0   # bot ratchets the peak
 
 

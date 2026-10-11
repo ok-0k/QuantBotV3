@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from config import (
-    DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, MAX_DRAWDOWN_PCT, SSE_HEARTBEAT_SECS,
+    CB_RECOVERY_PCT, DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, MAX_DRAWDOWN_PCT, SSE_HEARTBEAT_SECS,
     STARTING_CASH, SYMBOLS, V3_FIXES,
 )
 import insights
@@ -191,12 +191,14 @@ def _curve_peak_since(rebase_ts: str | None) -> float:
 
 def _breaker_state(total_eq: float) -> dict[str, Any]:
     """Drawdown as the circuit breaker sees it: from its persisted peak, not
-    the page's. A trip halts new entries until scripts/reset_circuit_breaker.py
-    --confirm and a bot restart."""
+    the page's. A trip halts new entries until drawdown recovers to
+    MAX_DRAWDOWN_PCT - CB_RECOVERY_PCT (brain.check_circuit_breaker), or until
+    scripts/reset_circuit_breaker.py --confirm and a bot restart."""
     peak = _opt_float(load_brain_key(_BREAKER_PEAK_KEY, None))
+    clear_pct = round(max(0.0, MAX_DRAWDOWN_PCT - CB_RECOVERY_PCT) * 100, 2)
     if not peak or peak <= 0:
         return {"breaker_peak_equity": None, "breaker_drawdown_pct": None,
-                "breaker_limit_pct": round(MAX_DRAWDOWN_PCT * 100, 2),
+                "breaker_limit_pct": round(MAX_DRAWDOWN_PCT * 100, 2), "breaker_clear_pct": clear_pct,
                 "breaker_headroom_pct": None, "breaker_trip_equity": None}
     peak = max(peak, total_eq)        # the bot ratchets its peak on every check
     dd = (peak - total_eq) / peak
@@ -204,6 +206,7 @@ def _breaker_state(total_eq: float) -> dict[str, Any]:
         "breaker_peak_equity":  round(peak, 2),
         "breaker_drawdown_pct": round(-dd * 100, 3),      # same sign as drawdown_pct
         "breaker_limit_pct":    round(MAX_DRAWDOWN_PCT * 100, 2),
+        "breaker_clear_pct":    clear_pct,
         "breaker_headroom_pct": round((MAX_DRAWDOWN_PCT - dd) * 100, 3),
         "breaker_trip_equity":  round(peak * (1 - MAX_DRAWDOWN_PCT), 2),
     }
@@ -1443,8 +1446,8 @@ function renderStats(p){
     cards.push({label:'Drawdown (breaker)', value:fmtPct(p.breaker_drawdown_pct),
       cls: room < 5 ? 'neg' : room < 10 ? 'warn' : 'pos',
       sub:room.toFixed(1)+' pts to the '+p.breaker_limit_pct.toFixed(0)+'% trip · peak '+fmt$(p.breaker_peak_equity),
-      title:'Trips at '+fmt$(p.breaker_trip_equity)+'. A trip halts new entries until '
-        +'scripts/reset_circuit_breaker.py --confirm and a bot restart.',
+      title:'Trips at '+fmt$(p.breaker_trip_equity)+'. A trip halts new entries until drawdown recovers to '
+        +p.breaker_clear_pct.toFixed(0)+'%, or until scripts/reset_circuit_breaker.py --confirm and a bot restart.',
       bar:Math.max(0, Math.min(100, -p.breaker_drawdown_pct / p.breaker_limit_pct * 100)),
       barColor: room < 5 ? 'var(--neg)' : room < 10 ? 'var(--warn)' : 'var(--t2)'});
   } else {
@@ -1604,7 +1607,7 @@ function renderSystem(p, brain, marginHealth, health){
   const tiles = [];
   tiles.push({label:'Circuit Breaker', value: brain.circuit_open ? 'OPEN' : 'Clear',
     cls: brain.circuit_open ? 'neg' : 'pos',
-    sub: brain.circuit_open ? 'entries halted until reset_circuit_breaker.py --confirm + restart'
+    sub: brain.circuit_open ? 'entries halted until DD ≤ '+(p.breaker_clear_pct != null ? p.breaker_clear_pct : 10).toFixed(0)+'% or reset_circuit_breaker.py --confirm + restart'
       : (p.breaker_headroom_pct != null ? 'DD '+fmtPct(p.breaker_drawdown_pct, 1)+' · trips at '
          +fmt$(p.breaker_trip_equity, 0)+' (−'+p.breaker_limit_pct.toFixed(0)+'%)' : '')});
   tiles.push({label:'Bot Heartbeat', value:ageFmt(ages.bot), cls: stale.includes('bot') ? 'warn' : (ages.bot!=null?'pos':''),
@@ -1659,8 +1662,8 @@ function applyUpdate(d){
   const STALE_NAME = {bot:'Bot', exit_monitor:'Exit monitor', ws:'Websocket feed'};
   stale.forEach(k=>bannerParts.push(STALE_NAME[k] + ' not reporting for '
     + Math.max(1, Math.round(((health.ages_s||{})[k]||0)/60)) + ' min'));
-  if(brain.circuit_open) bannerParts.push('Circuit breaker tripped — new entries halted until '
-    + 'scripts/reset_circuit_breaker.py --confirm and a bot restart');
+  if(brain.circuit_open) bannerParts.push('Circuit breaker tripped — new entries halted until drawdown recovers to '
+    + (p.breaker_clear_pct != null ? p.breaker_clear_pct : 10).toFixed(0) + '%, or until scripts/reset_circuit_breaker.py --confirm and a bot restart');
   if(marginHealth.halt_new_entries) bannerParts.push('New entries halted' + (marginHealth.halt_reason ? ' — ' + marginHealth.halt_reason : ''));
   const banner = g('alert-banner');
   if(banner){
