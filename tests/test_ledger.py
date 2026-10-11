@@ -343,3 +343,32 @@ def test_set_ledger_anchor_confirm_zeroes_drift(fresh, monkeypatch, capsys):
     assert fresh.get_capital_adjustments() == pytest.approx(406.41)
     assert fresh.ledger_drift()["drift"] == pytest.approx(0.0, abs=1e-6)
     assert "drift now" in capsys.readouterr().out
+
+
+def test_set_cash_balance_records_capital_adjustment(fresh, monkeypatch):
+    # Flat, balanced books after heavy losses: cash 43.75, realised -9956.25.
+    fresh.set_portfolio_stat("realised_pnl_net", 43.75 - STARTING_CASH)
+    fresh.set_cash(43.75)
+    assert fresh.ledger_drift()["drift"] == pytest.approx(0.0, abs=1e-6)
+    script = _load_script("set_cash_balance", "set_cash_balance.py")
+
+    _run_main(script, monkeypatch, "--amount", "10000", "--confirm")
+
+    assert fresh.get_cash() == pytest.approx(10_000.0)
+    assert fresh.get_capital_adjustments() == pytest.approx(10_000.0 - 43.75)
+    assert fresh.ledger_drift()["drift"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_heal_equity_refuses_with_open_positions(fresh, monkeypatch, capsys):
+    fresh.open_short("BBBUSDT", 3.0, 50.0, "QF", 55.0, 45.0, margin_reserved=30.0)
+    fresh.set_cash(STARTING_CASH - 30.0)
+    fresh.record_equity(STARTING_CASH)
+    script = _load_script("heal_equity", "heal_equity.py")
+
+    with pytest.raises(SystemExit) as exc:
+        _run_main(script, monkeypatch, "--confirm")
+    assert exc.value.code == 1
+    assert fresh.get_cash() == pytest.approx(STARTING_CASH - 30.0)
+    out = capsys.readouterr().out
+    assert "REFUSING TO RUN" in out and "set_ledger_anchor.py" in out
+
