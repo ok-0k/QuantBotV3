@@ -204,7 +204,10 @@ _AUTH_COOKIE = "qb_auth"
 
 
 def _token_ok(candidate: str | None) -> bool:
-    return bool(candidate) and _hmac.compare_digest(candidate, _AUTH_TOKEN)
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str, which
+    # escaped the middleware as a 500 instead of a 401.
+    return bool(candidate) and _hmac.compare_digest(
+        candidate.encode("utf-8"), _AUTH_TOKEN.encode("utf-8"))
 
 
 @app.middleware("http")
