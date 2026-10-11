@@ -64,6 +64,7 @@ import math
 from dataclasses import dataclass
 
 from config import (
+    DATA_DIR, SAC_WEIGHTS, XGB_MODEL,
     BINANCE_REST, BINANCE_WS_BASE, CANDLE_LIMIT, CHECK_EVERY_SECS,
     CORRELATION_THRESHOLD, ENABLE_HARD_MAX_HOLD_EXIT,
     GLOBAL_POSITION_NOTIONAL_CAP,
@@ -115,6 +116,7 @@ from db import (
 )
 
 import asyncio
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -241,6 +243,7 @@ _cash_lock = asyncio.Lock()         # serialise cross-symbol cash read-modify-wr
 _strict_execution_lock = asyncio.Lock()
 _symbol_last_trade: dict[str, float] = {}   # cooldown tracker
 _exit_in_flight:    set[str] = set()
+_ws_heartbeat_last: float = 0.0     # epoch of the last ws_last_msg write (throttled)
 
 # V2: last margin / utilization snapshot for gating + dashboard
 _margin_health_cache: dict = {}
@@ -1146,14 +1149,25 @@ async def _handle_ws_message(raw_msg: str, loop: asyncio.AbstractEventLoop) -> N
     # in-memory cache still updates on every tick (that's the whole point of
     # tick-level reactivity for stops); SQLite is now only touched once per
     # symbol per closed candle, below.
-    if sym in _candles_cache:
-        cache = _candles_cache[sym]
-        if cache and cache[-1]["time"] == candle["time"]:
-            cache[-1] = candle
-        else:
-            cache.append(candle)
-            if len(cache) > CANDLE_LIMIT:
-                cache.pop(0)
+    # setdefault: a symbol whose startup history fetch failed used to get no
+    # cache entry at all, so exit_monitor skipped its open position until the
+    # next restart. Live candles now fill the cache from the first message.
+    cache = _candles_cache.setdefault(sym, [])
+    if cache and cache[-1]["time"] == candle["time"]:
+        cache[-1] = candle
+    else:
+        cache.append(candle)
+        if len(cache) > CANDLE_LIMIT:
+            cache.pop(0)
+
+    global _ws_heartbeat_last
+    _now_epoch = time.time()
+    if _now_epoch - _ws_heartbeat_last >= 10.0:
+        _ws_heartbeat_last = _now_epoch
+        try:
+            set_portfolio_stat("ws_last_msg", _now())
+        except Exception as _hb_exc:
+            log.debug("ws heartbeat write failed: %s", _hb_exc)
 
     asyncio.create_task(_tick_exit_check(sym, candle, loop))
 
@@ -2741,6 +2755,11 @@ async def housekeeping_loop() -> None:
         except asyncio.TimeoutError:
             pass
 
+        try:
+            set_portfolio_stat("housekeeping_last", _now())
+        except Exception as _hb_exc:
+            log.debug("housekeeping heartbeat write failed: %s", _hb_exc)
+
         # ── Edge profiles (brain long-term memory) ────────────────────────────
         try:
             brain.save()   # no-op in current Brain stub; safe to call
@@ -2766,8 +2785,73 @@ async def housekeeping_loop() -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 # ── Entry point ───────────────────────────────────────────────────────────────
-async def main() -> None:
+def _acquire_instance_lock():
+    """
+    Exclusive, non-blocking flock on <DATA_DIR>/bot.lock so a second bot.py
+    (a stray test run, a broken start.sh) can never write the same database.
+    The returned file object must stay referenced for the process lifetime.
+    """
+    path = DATA_DIR / "bot.lock"
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        log.critical("Another bot instance holds %s — refusing to start a second one.", path)
+        raise SystemExit(1)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _report_model_ages() -> None:
+    """Log model file ages at boot and publish them for the dashboard."""
+    for key, path in (("model_age_xgb_days", XGB_MODEL), ("model_age_sac_days", SAC_WEIGHTS)):
+        try:
+            age = (time.time() - os.path.getmtime(path)) / 86400.0
+        except OSError:
+            log.warning("Model file missing: %s", path)
+            continue
+        set_portfolio_stat(key, round(age, 1))
+        log.info("Model %s is %.1f days old", path, age)
+    log.info(
+        "Incremental XGB retraining is inactive: its candle counter is in memory "
+        "and resets at the daily restart before reaching ML_UPDATE_EVERY. The gate "
+        "model is static by design until it is retrained offline."
+    )
+
+
+async def _supervise(coros: dict) -> int:
+    """
+    Run the core loops as named tasks. They only finish on shutdown; if one
+    finishes or raises while the bot is meant to be running, that subsystem is
+    dead, so log CRITICAL and return 1 — main() exits non-zero and systemd
+    (Restart=always) brings the whole bot back. Returns 0 on a normal shutdown.
+    """
+    tasks = [asyncio.create_task(c, name=n) for n, c in coros.items()]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    code = 0
+    if not _shutdown_event.is_set():
+        code = 1
+        for t in done:
+            exc = None if t.cancelled() else t.exception()
+            log.critical(
+                "⚠ %s stopped unexpectedly (%r) — exiting so systemd restarts the bot",
+                t.get_name(), exc, exc_info=exc,
+            )
+        _shutdown_event.set()
+    if pending:
+        _, still = await asyncio.wait(pending, timeout=20)
+        for t in still:
+            t.cancel()
+        if still:
+            await asyncio.wait(still, timeout=5)
+    return code
+
+
+async def main() -> int:
     global _executor
+    _lock = _acquire_instance_lock()  # noqa: F841 — held for the process lifetime
 
     # V4: the dashboard is managed by its own systemd unit (quant-dashboard).
     # The old subprocess.Popen(dashboard.py) here always died on the port-8000
@@ -2775,6 +2859,7 @@ async def main() -> None:
     log.info("Quant Bot V4 — execution adapter (%s) + order journal — booting",
              _exec_adapter.name)
     init_db()
+    _report_model_ages()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -2782,32 +2867,22 @@ async def main() -> None:
 
     _executor = ProcessPoolExecutor(max_workers=PROCESS_POOL_WORKERS)
 
+    exit_code = 0
     try:
         await startup()
-        # Fix #20: return_exceptions=True is a second line of defense behind Fix #19
-        # — even an exception nobody anticipated in one of these three coroutines can
-        # no longer cancel its siblings and crash the process. It CAN still leave that
-        # one subsystem dead for the rest of the run, so a captured exception is
-        # always logged CRITICAL below rather than silently discarded.
-        _results = await asyncio.gather(
-            websocket_listener(loop),
-            exit_monitor(loop),
-            housekeeping_loop(),
-            return_exceptions=True,
-        )
-        for _name, _result in zip(
-            ("websocket_listener", "exit_monitor", "housekeeping_loop"), _results
-        ):
-            if isinstance(_result, BaseException):
-                log.critical(
-                    "⚠ %s terminated with an unhandled exception — this subsystem "
-                    "is DEAD until the next restart: %r",
-                    _name, _result, exc_info=_result,
-                )
+        # The old gather(return_exceptions=True) only surfaced a dead loop at
+        # shutdown, up to a day later, while the process kept running without
+        # it. _supervise fails fast instead and lets systemd restart the bot.
+        exit_code = await _supervise({
+            "websocket_listener": websocket_listener(loop),
+            "exit_monitor": exit_monitor(loop),
+            "housekeeping_loop": housekeeping_loop(),
+        })
     finally:
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)
-        log.info("Bot stopped cleanly.")
+        log.info("Bot stopped %s.", "cleanly" if exit_code == 0 else "after a subsystem failure")
+    return exit_code
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
