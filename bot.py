@@ -65,6 +65,7 @@ from dataclasses import dataclass
 
 from config import (
     BINANCE_REST, BINANCE_WS_BASE, CANDLE_LIMIT, CHECK_EVERY_SECS,
+    CB_RECOVERY_PCT, MAX_DRAWDOWN_PCT,
     CORRELATION_THRESHOLD, ENABLE_HARD_MAX_HOLD_EXIT,
     GLOBAL_POSITION_NOTIONAL_CAP,
     HARD_STOP_LOSS_USD, MAX_HOLD_OPEN_SECONDS,
@@ -80,6 +81,7 @@ from config import (
     MIN_EXPECTED_TP_NET_USD,
     MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
     STARTING_CASH,
+    V3_FIXES,
 )
 from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
@@ -243,8 +245,20 @@ _trade_locks:       dict[str, asyncio.Lock] = {}
 _cash_lock = asyncio.Lock()         # serialise cross-symbol cash read-modify-write
 # One portfolio commit at a time: risk reads + SQLite fills cannot race (WS burst / ticks / monitor).
 _strict_execution_lock = asyncio.Lock()
-_symbol_last_trade: dict[str, float] = {}   # cooldown tracker
+_symbol_last_trade: dict[str, float] = {}   # "cooldown": an evaluation throttle, see _evaluate_and_trade
 _exit_in_flight:    set[str] = set()
+# V3 (ENTRY-03): entries between _prepare_trade and booking, symbol ->
+# {action, arm, qty, price}. Counted by _short_slots_full and the exposure gate
+# so a same-minute burst cannot overshoot the caps while the strict lock is
+# released around the exchange call. Only ever populated when V3_FIXES is on.
+_entry_in_flight:   dict[str, dict] = {}
+# Entry blocks journaled before _prepare_trade: (symbol, reason) -> evaluation
+# time of the last row written (at most one per _ENTRY_BLOCK_JOURNAL_SECS).
+_ENTRY_BLOCK_JOURNAL_SECS = 300.0
+_entry_block_journaled: dict[tuple[str, str], float] = {}
+# Circuit breaker state as last seen after an evaluation (None = not evaluated
+# yet in this process); drives the one-time "entries halted" warning.
+_cb_last_open: Optional[bool] = None
 
 # V2: last margin / utilization snapshot for gating + dashboard
 _margin_health_cache: dict = {}
@@ -367,13 +381,43 @@ def _experiment_arm(symbol: str) -> Optional[str]:
 
 
 def _short_slots_full(symbol: str) -> bool:
-    """SHORT_MAX_OPEN check; split evenly per arm while an experiment runs."""
+    """SHORT_MAX_OPEN check; split evenly per arm while an experiment runs.
+
+    V3_FIXES: short entries still in flight (prepared, not yet booked) hold a
+    slot too, so a same-minute burst cannot overshoot the cap while the strict
+    lock is released around the exchange call. A symbol that is already booked
+    is not counted twice.
+    """
     arm = _experiment_arm(symbol)
+    pending_arms: list[Optional[str]] = []
+    if V3_FIXES and _entry_in_flight:
+        booked = {p["symbol"] for p in get_all_short_positions()}
+        pending_arms = [r["arm"] for s, r in _entry_in_flight.items()
+                        if r["action"] == "short" and s not in booked]
     if arm is None:
-        return open_short_count() >= SHORT_MAX_OPEN
+        return open_short_count() + len(pending_arms) >= SHORT_MAX_OPEN
     per_arm = math.ceil(SHORT_MAX_OPEN / 2)
     same_arm = sum(1 for p in get_all_short_positions() if _experiment_arm(p["symbol"]) == arm)
-    return same_arm >= per_arm
+    return same_arm + pending_arms.count(arm) >= per_arm
+
+
+def _note_circuit_breaker_state() -> None:
+    """
+    Call right after each brain.check_circuit_breaker(). On a closed -> open
+    transition, log ONE warning saying what the halt means and how to lift it.
+    """
+    global _cb_last_open
+    is_open = bool(brain.circuit_open)
+    if is_open and not _cb_last_open:
+        log.warning(
+            "⚠ CIRCUIT BREAKER OPEN — new entries (short and buy) are HALTED; exits "
+            "still run. It only re-arms by itself if drawdown recovers to <= %.0f%%, "
+            "and with no new entries only the positions still open can get it there, "
+            "so in practice this halt lasts until a manual reset: "
+            "scripts/reset_circuit_breaker.py --confirm, then restart the bot.",
+            max(0.0, MAX_DRAWDOWN_PCT - CB_RECOVERY_PCT) * 100,
+        )
+    _cb_last_open = is_open
 
 
 def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
@@ -753,10 +797,61 @@ def _entry_snapshot(
         for k in ("short_score", "adx", "pdi", "mdi", "rvol", "ret5", "ret20",
                   "ema_spread", "ml_component", "struct_component"):
             snap[k] = meta.get(k)
+        # Correlation gate's max |ρ| vs the open peers, when it ran (set by
+        # _evaluate_and_trade) — lets the 0.90 threshold be calibrated.
+        if ensemble.get("worst_rho") is not None:
+            snap["worst_rho"] = round(float(ensemble["worst_rho"]), 4)
         return snap
     except Exception as exc:   # pragma: no cover - defensive
         log.debug("entry snapshot failed (%s) — journaling without features", exc)
         return {"snapshot_error": str(exc)}
+
+
+def _journal_entry_block(
+    ensemble: dict, action: str, reason: str, eval_ts: float,
+    sac_fraction: Optional[float] = None, total_equity: Optional[float] = None,
+    **extra: object,
+) -> None:
+    """
+    Journal an entry refused before _prepare_trade (slots_full, circuit_breaker,
+    corr_block, exposure_block, margin_halt) as a skipped trades row carrying
+    the same decision snapshot as a _prepare_trade skip, so the signals these
+    gates drop can be counted per arm.
+
+    At most one row per (symbol, reason) per _ENTRY_BLOCK_JOURNAL_SECS, keyed on
+    the evaluation time so the 5-minute evaluation throttle cannot jitter rows
+    out. Telemetry only: never raises, and the caller returns either way.
+    """
+    try:
+        symbol = str(ensemble.get("symbol", ""))
+        key = (symbol, reason)
+        if eval_ts - _entry_block_journaled.get(key, float("-inf")) < _ENTRY_BLOCK_JOURNAL_SECS:
+            return
+        _entry_block_journaled[key] = eval_ts
+        if total_equity is None:
+            total_equity = _compute_total_equity(get_cash(), get_all_positions())
+        regime = ensemble.get("regime", "ranging")
+        strategy_name = _top_strategy(ensemble, action)
+        snap = _entry_snapshot(ensemble, action, regime, strategy_name, sac_fraction, total_equity)
+        snap.update(extra)
+        raw_price = float(ensemble.get("price") or 0.0)
+        exec_price = raw_price * (1 + SLIPPAGE_PCT) if action == "buy" else raw_price * (1 - SLIPPAGE_PCT)
+        log_trade({
+            "symbol":      symbol,         "action":     action,
+            "strategy":    strategy_name,  "regime":     regime,
+            "price":       raw_price,      "exec_price": exec_price,
+            "on_fire":     ensemble.get("on_fire", False),
+            "timestamp":   _now(),
+            "side":        "long" if action == "buy" else "short",
+            "slippage":    round(abs(exec_price - raw_price), 6),
+            "status":      "skipped",
+            "shares":      0.0,
+            "trade_value": 0.0,
+            "reason":      reason,
+            "entry_features": snap,
+        })
+    except Exception as exc:   # pragma: no cover - defensive
+        log.debug("entry-block journal failed for %s (%s): %s", ensemble.get("symbol"), reason, exc)
 
 
 def _initial_stop(pos: dict) -> Optional[float]:
@@ -1223,6 +1318,12 @@ async def _evaluate_and_trade(
 
     # Fix #4: use module-level `time` import; rename local var to _ts to avoid
     # shadowing the module-level _now() function.
+    # Despite its name this "cooldown" is an EVALUATION THROTTLE, not a trade
+    # cooldown (ENTRY-08): it is stamped on every closed candle before any
+    # signal is computed, so each symbol is evaluated on ~1 in 5 closed 1m
+    # candles (SYMBOL_COOLDOWN_SECS=300), and nothing stamps it on a fill or
+    # an exit, so there is no post-exit cooldown. Left as is on purpose:
+    # changing either changes trade frequency in both arms of decay_v2.
     _ts = time.time()
     if _ts - _symbol_last_trade.get(symbol, 0) < SYMBOL_COOLDOWN_SECS:
         return
@@ -1295,13 +1396,17 @@ async def _evaluate_and_trade(
     ensemble["position_size_mult"] = cm_authoritative
     ensemble["ml_prob"] = float(ml_prob)
 
-    if direction == "buy" and brain.circuit_open:
-        log.info("%s BUY blocked - circuit breaker open", symbol)
+    # The drawdown breaker gates entries in BOTH directions — this bot only
+    # shorts, so gating "buy" alone made the kill-switch inert. Exits never stop.
+    if direction in ("buy", "short") and brain.circuit_open:
+        log.info("%s %s blocked - circuit breaker open", symbol, direction.upper())
+        _journal_entry_block(ensemble, direction, "circuit_breaker", _ts)
         return
 
     if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
         return
     if direction == "short" and _short_slots_full(symbol):
+        _journal_entry_block(ensemble, direction, "slots_full", _ts, arm=_experiment_arm(symbol))
         return
     # Fix #22: a short already open on this symbol must never be re-opened —
     # open_short()'s INSERT OR REPLACE would silently orphan the first short's
@@ -1355,9 +1460,13 @@ async def _evaluate_and_trade(
         async with _trade_lock(symbol):
             async with _strict_execution_lock:
                 open_positions = get_all_positions()
+                if brain.circuit_open:
+                    _journal_entry_block(ensemble, direction, "circuit_breaker", _ts)
+                    return
                 if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
                     return
                 if direction == "short" and _short_slots_full(symbol):
+                    _journal_entry_block(ensemble, direction, "slots_full", _ts, arm=_experiment_arm(symbol))
                     return
                 # Fix #22 (re-check): close the TOCTOU window between the early
                 # gate above and acquiring this commit frame's lock.
@@ -1386,6 +1495,8 @@ async def _evaluate_and_trade(
                         "%s entry blocked — margin %s",
                         symbol, _margin_health_cache.get("halt_reason"),
                     )
+                    _journal_entry_block(ensemble, direction, "margin_halt", _ts,
+                                         sac_fraction, total_equity)
                     return
                 peer_syms = [p["symbol"] for p in open_positions if p["symbol"] != symbol]
                 if peer_syms:
@@ -1396,8 +1507,11 @@ async def _evaluate_and_trade(
                         rho_threshold=CORRELATION_THRESHOLD,
                         max_high_corr_peers=MAX_CORRELATED_OPEN_PEERS,
                     )
+                    ensemble["worst_rho"] = worst_rho   # journaled on fills and skips
                     if blocked_corr:
                         log.info("%s entry blocked — ρ-cluster (worst |ρ|=%.3f)", symbol, worst_rho)
+                        _journal_entry_block(ensemble, direction, "corr_block", _ts,
+                                             sac_fraction, total_equity)
                         return
                 sf = sac_fraction if sac_fraction is not None else _SAC_FALLBACK_PCT
                 proposed_frac = _entry_proposed_equity_frac(float(sf), cm_authoritative)
@@ -1407,6 +1521,12 @@ async def _evaluate_and_trade(
                     )
                     for p in open_positions
                 }
+                if V3_FIXES and _entry_in_flight and total_equity > 0:
+                    # In-flight entries are not booked yet; count their notional.
+                    _booked = {p["symbol"] for p in open_positions}
+                    proposed_frac += sum(
+                        r["qty"] * r["price"] for s_, r in _entry_in_flight.items() if s_ not in _booked
+                    ) / total_equity
                 blocked_exp, cur_exp = exposure_blocked(
                     open_positions,
                     marks,
@@ -1422,6 +1542,8 @@ async def _evaluate_and_trade(
                         proposed_frac * 100,
                         GLOBAL_POSITION_NOTIONAL_CAP * 100,
                     )
+                    _journal_entry_block(ensemble, direction, "exposure_block", _ts,
+                                         sac_fraction, total_equity)
                     return
 
                 prepared = await loop.run_in_executor(
@@ -1430,12 +1552,23 @@ async def _evaluate_and_trade(
                     ensemble, strategy_name, candles, sac_fraction, state_vec, total_equity,
                     cm_authoritative,
                 )
+                if prepared is not None and V3_FIXES:
+                    # Reserve the slot before the strict lock is released for
+                    # the exchange call (ENTRY-03); released in the finally below.
+                    _entry_in_flight[symbol] = {
+                        "action": direction, "arm": _experiment_arm(symbol),
+                        "qty": float(prepared.order_intent.qty),
+                        "price": float(prepared.order_intent.limit_price),
+                    }
             if prepared is None:
                 return
-            fill = await loop.run_in_executor(None, _exec_adapter.execute, prepared.order_intent)
-            async with _strict_execution_lock:
-                async with _cash_lock:
-                    await loop.run_in_executor(None, _commit_trade, prepared, fill)
+            try:
+                fill = await loop.run_in_executor(None, _exec_adapter.execute, prepared.order_intent)
+                async with _strict_execution_lock:
+                    async with _cash_lock:
+                        await loop.run_in_executor(None, _commit_trade, prepared, fill)
+            finally:
+                _entry_in_flight.pop(symbol, None)
         return
 
     prepared = None
@@ -1552,6 +1685,11 @@ def _prepare_trade(
         trade_rec["entry_features"] = _entry_snapshot(
             ensemble, action, regime, strategy_name, sac_fraction, total_equity,
         )
+        # Backstop for the drawdown breaker (the async caller gates first).
+        if brain.circuit_open:
+            trade_rec["reason"] = "circuit_breaker"
+            log_trade(trade_rec)
+            return None
 
     # ── HARD ML CONFIDENCE GATE (defense-in-depth) ────────────────────────────
     # Single source of truth for entries. brain.get_ensemble_signal already
@@ -2594,6 +2732,7 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
         eq = _compute_total_equity(cash, all_pos)
         record_equity(round(eq, 2))
         brain.check_circuit_breaker(eq)
+        _note_circuit_breaker_state()
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
