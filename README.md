@@ -154,7 +154,7 @@ per fill, plus 0.03%/day short borrow. Unit tests prove there is no lookahead.
 | Services | `quant-bot`, `quant-dashboard` (systemd; a drop-in at `/etc/systemd/system/quant-*.service.d/10-paths.conf` points them at this directory) |
 | Deploy | Commit, then `sudo systemctl restart quant-bot quant-dashboard`. Otherwise the 04:00 cron picks it up |
 | Logs | `/dev/shm/trading_logs/bot.log` (RAM, rotates, lost on reboot). The journal in the DB is the durable record |
-| Backups | Nightly, before the prune: `/home/admin/trading_data/backups/db/trading-<UTC>.db.gz`, newest 14 kept. To restore, stop the bot, then `gunzip -c <file> > /home/admin/trading_data/trading.db`, then start it. They live on the same SD card, so copy one off the Pi now and then |
+| Backups | Nightly, before the prune: `/home/admin/trading_data/backups/db/trading-<UTC>.db.gz`, newest 14 kept. Each is integrity-checked before rotation. To restore, stop **both** services (`sudo systemctl stop quant-bot quant-dashboard`), run `scripts/restore_db.sh <file>` (dry run verifies the backup) and then `scripts/restore_db.sh <file> --yes`, then start both. Never overwrite `trading.db` while either service runs: they hold the WAL open and the result can be corrupt. They live on the same SD card, so copy one off the Pi now and then |
 | Prune log | `/home/admin/trading_data/prune.log` (backup and prune results) |
 | Alerts | Discord alerts are off until `DISCORD_WEBHOOK_URL` is set in `~/.config/quant-bot/env` |
 | Dashboard | `http://<pi-ip>:8000` |
