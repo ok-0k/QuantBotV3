@@ -11,9 +11,16 @@ disabled via env and belt-and-suspenders monkeypatching.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+# A developer shell may export real exchange credentials; never let them reach
+# code under test (config.py would load them at import).
+for _k in list(os.environ):
+    if _k.startswith("BINANCE_") or _k.endswith(("_API_KEY", "_API_SECRET", "_SECRET")):
+        os.environ.pop(_k)
 
 _SESSION_TMP = tempfile.mkdtemp(prefix="quantbot-test-")
 os.environ["TRADING_DATA_DIR"] = str(Path(_SESSION_TMP) / "data")
@@ -123,3 +130,8 @@ def make_correlated_walk(
         })
         price = close
     return candles
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remove this session's throwaway data/log directory."""
+    shutil.rmtree(_SESSION_TMP, ignore_errors=True)
