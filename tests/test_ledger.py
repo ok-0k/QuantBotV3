@@ -126,6 +126,81 @@ def test_nested_get_db_inside_transaction_does_not_commit_early(fresh):
         other.close()
 
 
+# ── Atomic booking (LEDGER-6 / ACR-05 / EXIT-07) ─────────────────────────────
+
+def test_cover_failing_mid_booking_rolls_back_everything(fresh, monkeypatch):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    _open_short_via_bot(candles)
+    cov = _ensemble("cover", candles[-1]["close"] * 0.95, symbol="QFUSDT")
+    prepared = bot._prepare_trade(cov, "QF", candles, None, ZERO_STATE, STARTING_CASH)
+    assert prepared is not None
+    fill = bot._exec_adapter.execute(prepared.order_intent)
+    coid = prepared.order_intent.client_order_id
+    before = _book(fresh)
+
+    real_log_trade = bot.log_trade
+
+    def boom(_rec):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(bot, "log_trade", boom)       # last write in the booking
+    with pytest.raises(sqlite3.OperationalError):
+        bot._commit_trade(prepared, fill)
+
+    assert _book(fresh) == before                     # cash, short, stats untouched
+    assert coid in [o["client_order_id"] for o in fresh.get_open_orders()]
+    assert _rl_rows(fresh) == []
+
+    # The retry books exactly once.
+    monkeypatch.setattr(bot, "log_trade", real_log_trade)
+    bot._commit_trade(prepared, fill)
+    assert fresh.get_all_positions() == []
+    assert fresh.get_order(coid)["state"] == "FILLED"
+    margin = before["positions"][0][2]
+    net = float(fresh.get_portfolio_stat("realised_pnl_net"))
+    assert fresh.get_cash() == pytest.approx(before["cash"] + margin + net, rel=1e-9)
+
+
+def test_sell_failing_mid_booking_rolls_back_everything(fresh, monkeypatch):
+    candles = make_candles(n=120, start_price=110.0, amplitude=0.4)
+    fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
+    fresh.set_cash(STARTING_CASH - 200.0)
+    prepared = bot._prepare_trade(_ensemble("sell", 110.0), "TEST", candles, None,
+                                  ZERO_STATE, STARTING_CASH)
+    fill = bot._exec_adapter.execute(prepared.order_intent)
+    before = _book(fresh)
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(bot, "update_order", boom)    # after cash + close_position
+    with pytest.raises(sqlite3.OperationalError):
+        bot._commit_trade(prepared, fill)
+
+    assert _book(fresh) == before
+    assert prepared.order_intent.client_order_id in [
+        o["client_order_id"] for o in fresh.get_open_orders()]
+
+
+def test_short_entry_failing_mid_booking_rolls_back(fresh, monkeypatch):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    ens = _ensemble("short", candles[-1]["close"], symbol="QFUSDT", ml_prob=0.03)
+    prepared = bot._prepare_trade(ens, "QF", candles, 0.5, ENTRY_STATE, STARTING_CASH)
+    fill = bot._exec_adapter.execute(prepared.order_intent)
+    before = _book(fresh)
+
+    def boom(_rec):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(bot, "log_trade", boom)
+    with pytest.raises(OSError):
+        bot._commit_trade(prepared, fill)
+
+    assert _book(fresh) == before                     # no margin reserved, no cash debit
+    assert prepared.order_intent.client_order_id in [
+        o["client_order_id"] for o in fresh.get_open_orders()]
+
+
 # ── Ledger anchor + reconciliation (LEDGER-5 / LEDGER-1 / ACR-10 / IMPR-1) ───
 
 def _drifted_books(db, offset=396.41):
