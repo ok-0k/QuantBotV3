@@ -9,6 +9,10 @@ costs, ignoring basis (perp vs spot) drift — which inflated its Sharpe. This
 re-runs ONLY the two pre-registered thresholds (no new tuning) with the perp
 premium index added, and reports the economics that matter: how often capital
 is deployed and what it earns while deployed.
+
+Since 2026-10-11 a sleeve is only live while its spot pair trades
+(research.study.spot_tradable); the earlier figures were inflated by a
+phantom MATICUSDT hedge that outlived its spot delisting (see RESULTS.md).
 """
 
 import math
@@ -19,13 +23,15 @@ import pandas as pd
 from config import SYMBOLS
 from research import strategies as S
 from research.data import load_funding, load_premium
-from research.study import DATA_START, IS_START, OOS_START, funding_buckets
+from research.study import DATA_START, IS_START, OOS_START, funding_buckets, load_spot_tradable
 
 PERIODS_PER_YEAR = 1095
 
 
 def main() -> None:
     fund = funding_buckets(pd.DataFrame({s: load_funding(s, DATA_START) for s in SYMBOLS}).sort_index())
+    spot_ok = load_spot_tradable(SYMBOLS, DATA_START)
+    fund = fund[fund.index <= spot_ok.index.max()]
     prem = pd.DataFrame({s: load_premium(s, DATA_START) for s in SYMBOLS}).sort_index()
     prem = prem.reindex(fund.index)
     print(f"premium coverage on the funding grid: {prem.notna().values.sum() / fund.notna().values.sum():.1%}")
@@ -33,8 +39,8 @@ def main() -> None:
     print(f"{'theta/8h':>9} {'basis':>6} {'period':>6} {'active':>7} {'avg on':>7} {'deployed APR':>13} "
           f"{'basis APR':>10} {'deployed Sh':>12} {'portfolio CAGR':>15}")
     for th in (0.0001, 0.0002):
-        base = S.funding_carry(fund, th)
-        with_b = S.funding_carry(fund, th, premium=prem)
+        base = S.funding_carry(fund, th, tradable=spot_ok)
+        with_b = S.funding_carry(fund, th, premium=prem, tradable=spot_ok)
         on = base.notna() & (base != 0)
         for label, sl in (("no", base), ("yes", with_b)):
             for nm, a, b in (("IS", IS_START, OOS_START), ("OOS", OOS_START, None)):
