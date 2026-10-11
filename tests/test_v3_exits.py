@@ -37,6 +37,11 @@ def fresh(clean_db):
     return clean_db
 
 
+@pytest.fixture()
+def v3(monkeypatch):
+    monkeypatch.setattr(bot, "V3_FIXES", True)
+
+
 def _ago(minutes):
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
 
@@ -235,3 +240,66 @@ def test_exit_detail_suffix_leaves_classification_unchanged(fresh, reason, stop,
     assert detail.startswith(reason + " | mark=100.25 stop=")
     assert (bot._classify_exit_reason(detail, 100.0, stop, short, initial)
             == bot._classify_exit_reason(reason, 100.0, stop, short, initial))
+
+
+# ── V3: break-even / trailing stops survive time decay ───────────────────────
+
+@pytest.mark.parametrize("sym,arm,age,count", [(B_SYM, "B", 60, 0), (A_SYM, "A", 60, 60)])
+def test_v3_break_even_persists_across_ticks(fresh, v3, monkeypatch, sym, arm, age, count):
+    stale = _place_short(fresh, sym, arm=arm, age_min=age, count=count)
+    candles, atr = _history(sym)
+    writes = _spy_stop_writes(monkeypatch)
+    _tick(sym, candles, **_be_candle(atr))
+    assert _stop(fresh, sym) == ENTRY                       # decay did not overwrite it
+    _tick(sym, candles, **_be_candle(atr))
+    _tick(sym, candles, **_be_candle(atr), minute=2)
+    assert writes == [(ENTRY, True)]                        # armed once, never re-armed
+    assert _stop(fresh, sym) == ENTRY
+    bot._apply_ml_time_decay(sym, stale, candles)           # stale snapshot: guard refuses
+    assert _stop(fresh, sym) == ENTRY
+    assert fresh.get_short_position(sym) is not None
+
+
+def test_v3_off_legacy_decay_overwrites_break_even(fresh, monkeypatch):
+    """Known bug, kept while V3_FIXES is off: decay is fed the row read before
+    break-even moved, and writes its own loss-side level straight over it."""
+    assert bot.V3_FIXES is False
+    _place_short(fresh, B_SYM, arm="B", age_min=60)
+    candles, atr = _history(B_SYM)
+    writes = _spy_stop_writes(monkeypatch)
+    _tick(B_SYM, candles, **_be_candle(atr))
+    _tick(B_SYM, candles, **_be_candle(atr))
+    assert _stop(fresh, B_SYM) == pytest.approx(_designed_target_sl(60), abs=1e-3)
+    assert [w for w, _ in writes].count(ENTRY) == 2         # break-even re-armed every tick
+
+
+@pytest.mark.parametrize("v3_on", [True, False])
+def test_trailing_stop_persists_only_with_v3(fresh, monkeypatch, v3_on):
+    monkeypatch.setattr(bot, "V3_FIXES", v3_on)
+    tp = ENTRY * (1 - 0.0021)                               # fee-gated target, so no TP exit
+    _place_short(fresh, B_SYM, arm="B", age_min=60, tp=tp)
+    candles, atr = _history(B_SYM)
+    low = tp - 2.0 * atr
+    trail = low + atr
+    tick = dict(high=ENTRY - 0.5 * atr, low=low, close=trail - 0.1 * atr)
+    _tick(B_SYM, candles, **tick)
+    _tick(B_SYM, candles, **tick)
+    assert fresh.get_short_position(B_SYM) is not None
+    if v3_on:
+        assert _stop(fresh, B_SYM) == pytest.approx(trail, rel=1e-12)
+    else:
+        assert _stop(fresh, B_SYM) == pytest.approx(_designed_target_sl(60), abs=1e-3)
+
+
+def test_v3_monitor_rereads_position_before_decay(fresh, v3, monkeypatch):
+    """A break-even stored while exit_monitor awaited (cycle snapshot now
+    stale) must survive the monitor's decay."""
+    _place_short(fresh, B_SYM, arm="B", age_min=60)
+    candles, _ = _history(B_SYM)
+
+    async def moves_stop_meanwhile(*_a, **_k):
+        fresh.update_stop_price(B_SYM, ENTRY)               # tick path arms break-even
+        return {}
+    monkeypatch.setattr(bot, "_refresh_margin_health", moves_stop_meanwhile)
+    _one_monitor_cycle(monkeypatch, candles, ENTRY * 0.999)
+    assert _stop(fresh, B_SYM) == ENTRY

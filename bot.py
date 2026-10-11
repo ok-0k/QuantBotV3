@@ -79,7 +79,7 @@ from config import (
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
     MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
-    STARTING_CASH,
+    STARTING_CASH, V3_FIXES,
 )
 from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
@@ -401,14 +401,14 @@ def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
     target_sl = sl0 + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - sl0)
     if pos.get("side", "long") == "short":
         if tp < target_tp < entry - 1e-9:
-            update_tp_price(sym, target_tp)
+            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
         if entry + 1e-9 < target_sl < stop:
-            update_stop_price(sym, target_sl)
+            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
     else:
         if entry + 1e-9 < target_tp < tp:
-            update_tp_price(sym, target_tp)
+            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
         if stop < target_sl < entry - 1e-9:
-            update_stop_price(sym, target_sl)
+            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
 
 
 def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
@@ -452,16 +452,16 @@ def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
         new_tp = entry + (tp - entry) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
         new_sl = stop + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - stop)
         if new_tp < tp - 1e-12 and new_tp > entry + 1e-9:
-            update_tp_price(sym, new_tp)
+            update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
         if new_sl > stop + 1e-12 and new_sl < entry - 1e-9:
-            update_stop_price(sym, new_sl)
+            update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
     else:
         new_tp = entry - (entry - tp) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
         new_sl = stop - lam * DECAY_SL_TIGHTEN_STRENGTH * (stop - entry)
         if new_tp > tp + 1e-12 and new_tp < entry - 1e-9:
-            update_tp_price(sym, new_tp)
+            update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
         if new_sl < stop - 1e-12 and new_sl > entry + 1e-9:
-            update_stop_price(sym, new_sl)
+            update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
 
 
 # ── Pure helpers (Fix #15: defined before first use) ─────────────────────────
@@ -951,7 +951,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         if tp > 0 and candle_high > tp:
             new_stop = candle_high - _atr
             if new_stop > stop:
-                update_stop_price(sym, new_stop)
+                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
                 stop = new_stop
                 log.info(
                     "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
@@ -961,7 +961,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
         if tp > 0 and candle_low < tp:
             new_stop = candle_low + _atr
             if new_stop < stop:
-                update_stop_price(sym, new_stop)
+                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
                 stop = new_stop
                 log.info(
                     "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
@@ -989,7 +989,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 if avg_cost - _close_now >= _min_be_profit:
                     be_stop = avg_cost
                     if be_stop < stop:
-                        update_stop_price(sym, be_stop)
+                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
                         stop = be_stop
                         log.info(
                             "BREAK-EVEN STOP (short) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
@@ -1005,7 +1005,7 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 if _close_now - avg_cost >= _min_be_profit:
                     be_stop = avg_cost
                     if be_stop > stop:
-                        update_stop_price(sym, be_stop)
+                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
                         stop = be_stop
                         log.info(
                             "BREAK-EVEN STOP (long) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
@@ -1034,7 +1034,18 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 )
     # ── ML TIME-DECAY (also on tick so targets move with each bar) ────────────
     if _recent and len(_recent) > 20:
-        _apply_ml_time_decay(sym, pos, _recent)
+        if V3_FIXES:
+            # Decay starts from the levels trail / break-even just stored. Fed
+            # the row read at the top of this call, it wrote its own loss-side
+            # level straight over them on every tick.
+            _apply_ml_time_decay(sym, {**pos, "stop_price": stop, "tp_price": tp}, _recent)
+        else:
+            _apply_ml_time_decay(sym, pos, _recent)
+    if V3_FIXES:
+        # The exit checks below use the levels as stored after decay.
+        _row = _open_pos(sym)
+        if _row:
+            stop, tp = float(_row.get("stop_price") or 0.0), float(_row.get("tp_price") or 0.0)
     # ── END BREAK-EVEN / DECAY ────────────────────────────────────────────────
 
     # Fill model: a take-profit is a resting limit -> fills AT tp. A stop is a
@@ -2466,7 +2477,18 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
             if not candles:
                 continue
 
+            if V3_FIXES:
+                # The cycle-start snapshot predates the margin-refresh await and
+                # the earlier symbols' exits: the tick path may have moved this
+                # stop (trail / break-even) or closed the position since. Decay
+                # must start from the levels stored now.
+                pos = _open_pos(sym)
+                if not pos:
+                    continue
             _apply_ml_time_decay(sym, pos, candles)
+            if V3_FIXES:
+                # The exit checks below use the levels as stored after decay.
+                pos = _open_pos(sym) or pos
 
             current_price = candles[-1]["close"]
             count = increment_candle_count(sym)
