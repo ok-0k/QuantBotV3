@@ -274,3 +274,24 @@ def test_lifetime_trades_is_portfolio_total_trades(clean_db):
     html = dashboard.DASHBOARD_HTML
     for label in ("Win Rate · 7d", "Profit Factor · 7d", "Fees Paid · 7d", "closed (7d)"):
         assert label in html
+
+
+# ── Timezones: UTC epochs for the browser (DASH-4) ───────────────────────────
+
+def test_telemetry_sends_utc_epochs_for_chart_activity_and_positions(clean_db):
+    now = time.time()
+    with db.get_db() as conn:
+        conn.executemany("INSERT INTO equity_curve (ts, equity) VALUES (?,?)",
+                         [(_iso(now - 600), 9_990.0), (_iso(now - 300), 10_010.0)])
+        conn.execute("INSERT INTO trades (ts, symbol, action, status, pnl, net_pnl, trade_value) "
+                     "VALUES (?,?,?,?,?,?,?)", ("2026-10-11T19:05:00.250000+00:00", A_SYM, "cover", "filled", 1.0, 1.0, 100.0))
+    d = dashboard._build_telemetry(equity_tf="1H")
+    curve = d["equity_curve"]
+    assert [pt["t"] for pt in curve] == [int(now - 600), int(now - 300)]
+    assert curve[0]["time"] == dashboard._utc_to_van(_iso(now - 600)[:19])       # display string kept
+    trade = d["trades"][0]
+    assert trade["ts_epoch"] == datetime(2026, 10, 11, 19, 5, 0, 250000, tzinfo=timezone.utc).timestamp()
+    assert trade["ts"] == "2026-10-11 12:05:00"                                  # PDT wall clock
+    html = dashboard.DASHBOARD_HTML
+    assert "parseLocal" not in html and "timeZone:'America/Vancouver'" in html
+    assert "tickMarkFormatter" in html and "relTime(t.ts_epoch)" in html and "durFmt(p.opened_epoch)" in html

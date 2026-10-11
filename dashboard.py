@@ -281,6 +281,9 @@ def _format_trade_row(row: dict[str, Any]) -> dict[str, Any]:
     # MFE / MAE — map from new engine columns
     out["mfe"] = out.get("max_unrealized_pnl")   # peak profit while open
     out["mae"] = out.get("min_unrealized_pnl")   # max drawdown while open
+    # UTC epoch for the browser's relative times (the strings below are
+    # offset-less Vancouver wall-clock, which browsers parse as local time).
+    out["ts_epoch"] = _to_epoch(out.get("ts") or out.get("timestamp"))
     # Convert timestamps to Vancouver time
     for key in ("ts", "timestamp", "opened_ts", "opened_at"):
         if out.get(key):
@@ -416,6 +419,7 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "risk_per_share":    rm["risk_per_share"],
             "reward_per_share":  rm["reward_per_share"],
             "opened_ts":         _utc_to_van(opened_raw),
+            "opened_epoch":      _to_epoch(opened_raw),
         })
 
     realised     = float(get_portfolio_stat("realised_pnl",     "0.0"))
@@ -593,9 +597,12 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
 
     equity_curve_out = _downsample_equity(equity_window, max_pts)
 
-    # Convert equity curve timestamps to Vancouver
+    # Convert equity curve timestamps to Vancouver; "t" is the UTC epoch the
+    # chart plots (formatted in America/Vancouver by the page).
     for pt in equity_curve_out:
         if pt.get("time"):
+            ep = _to_epoch(pt["time"])
+            pt["t"] = int(ep) if ep is not None else None
             pt["time"] = _utc_to_van(pt["time"])
 
     # Fix 1 — equity curve fallback: if the table was wiped or has only one row,
@@ -603,9 +610,10 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     # flat baseline from the current equity so the chart renders immediately.
     if len(equity_curve_out) == 0:
         _now_van = datetime.datetime.now(tz=VAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        _now_ep = int(time.time())
         equity_curve_out = [
-            {"time": _now_van, "equity": round(total_eq, 2)},
-            {"time": _now_van, "equity": round(total_eq, 2)},
+            {"time": _now_van, "t": _now_ep, "equity": round(total_eq, 2)},
+            {"time": _now_van, "t": _now_ep, "equity": round(total_eq, 2)},
         ]
     elif len(equity_curve_out) == 1:
         equity_curve_out = equity_curve_out + [equity_curve_out[0]]
@@ -1213,12 +1221,17 @@ function pnlCls(v){ return v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim'; }
    unlike per-trade PnL, an exact-0% return is not meaningfully "flat". */
 function retCls(v){ return v >= 0 ? 'pos' : 'neg'; }
 
-function parseLocal(ts){
-  return new Date(String(ts).replace(' ', 'T'));
-}
-function relTime(ts){
-  if(!ts) return '—';
-  const ms = Date.now() - parseLocal(ts).getTime();
+/* Times arrive as UTC epoch seconds and are shown in Vancouver time whatever
+   the browser's zone (offset-less strings would be parsed as browser-local). */
+const vanFmt = opts => new Intl.DateTimeFormat('en-US', Object.assign({timeZone:'America/Vancouver'}, opts));
+const FMT_TIME = vanFmt({hour:'numeric', minute:'2-digit', hour12:true});
+const FMT_DAYTIME = vanFmt({month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true});
+const FMT_DAY = vanFmt({month:'short', day:'numeric'});
+const FMT_MONTH = vanFmt({month:'short'});
+const FMT_YEAR = vanFmt({year:'numeric'});
+function relTime(ep){
+  if(ep == null) return '—';
+  const ms = Date.now() - ep*1000;
   if(isNaN(ms)) return '—';
   if(ms < 0) return 'just now';
   const m = Math.floor(ms/60000);
@@ -1228,11 +1241,11 @@ function relTime(ts){
   if(h < 24) return h + 'h ago';
   const d = Math.floor(h/24);
   if(d < 7) return d + 'd ago';
-  return String(ts).slice(5,10);
+  return FMT_DAY.format(new Date(ep*1000));
 }
-function durFmt(ts){
-  if(!ts) return '—';
-  const ms = Date.now() - parseLocal(ts).getTime();
+function durFmt(ep){
+  if(ep == null) return '—';
+  const ms = Date.now() - ep*1000;
   if(isNaN(ms) || ms < 0) return '—';
   const m = Math.floor(ms/60000), h = Math.floor(m/60), d = Math.floor(h/24);
   if(d > 0) return d + 'd ' + (h%24) + 'h';
@@ -1263,8 +1276,8 @@ function toChartPoints(curve){
   const seen = new Set();
   const out = [];
   for(const pt of (curve||[])){
-    if(!pt || !pt.time) continue;
-    const t = Math.floor(parseLocal(pt.time).getTime()/1000);
+    if(!pt || pt.t == null) continue;
+    const t = Math.floor(pt.t);
     if(!t || isNaN(t) || seen.has(t)) continue;
     seen.add(t);
     out.push({time:t, value:Number(pt.equity)||0});
@@ -1281,7 +1294,13 @@ function ensureChart(){
     layout:{background:{color:'transparent'}, textColor:'#626269', fontFamily:'Inter, system-ui, sans-serif', fontSize:11},
     grid:{vertLines:{visible:false}, horzLines:{visible:false}},
     rightPriceScale:{borderVisible:false, textColor:'#626269'},
-    timeScale:{borderVisible:false, timeVisible:true, secondsVisible:false, fixLeftEdge:true, fixRightEdge:true},
+    localization:{timeFormatter: t => FMT_DAYTIME.format(new Date(t*1000))},
+    timeScale:{borderVisible:false, timeVisible:true, secondsVisible:false, fixLeftEdge:true, fixRightEdge:true,
+      /* TickMarkType: 0 year, 1 month, 2 day, 3+ time */
+      tickMarkFormatter:(t, type)=>{
+        const d = new Date(t*1000);
+        return (type===0 ? FMT_YEAR : type===1 ? FMT_MONTH : type===2 ? FMT_DAY : FMT_TIME).format(d);
+      }},
     crosshair:{
       mode:LightweightCharts.CrosshairMode.Magnet,
       vertLine:{color:'rgba(255,255,255,.18)', width:1, style:LightweightCharts.LineStyle.Solid, labelVisible:false},
@@ -1307,10 +1326,7 @@ function ensureChart(){
     if(!d || d.value == null){ tooltip.style.opacity = 0; return; }
     const dt = new Date(param.time * 1000);
     const intraday = activeTf === '1H' || activeTf === '24H';
-    const timeStr = new Intl.DateTimeFormat('en-US', intraday
-      ? {hour:'numeric', minute:'2-digit', hour12:true}
-      : {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true}
-    ).format(dt);
+    const timeStr = (intraday ? FMT_TIME : FMT_DAYTIME).format(dt);
     tooltip.querySelector('.tt-val').textContent = fmt$(d.value);
     tooltip.querySelector('.tt-time').textContent = timeStr;
     tooltip.style.opacity = 1;
@@ -1461,8 +1477,7 @@ function renderPositions(positions){
     if(tpPx>0) meta.push('Take '+fmtPrice(tpPx)+(p.tp_pct!=null?' (+'+Math.abs(p.tp_pct).toFixed(2)+'%)':''));
     if(rr!=null && rr>0) meta.push('<span class="rr">R∶R 1∶'+rr.toFixed(2)+'</span>');
     if(p.strategy) meta.push('<span class="strat">'+esc(p.strategy)+'</span>');
-    const openedTs = p.opened_ts || p.opened_at || '';
-    if(openedTs) meta.push(durFmt(openedTs)+' open');
+    if(p.opened_epoch != null) meta.push(durFmt(p.opened_epoch)+' open');
     return `<div class="pos-row">
       <div class="pos-top">
         <div>
@@ -1494,7 +1509,6 @@ function renderActivity(trades){
   el.innerHTML = trades.slice(0,50).map(t=>{
     const action = (t.action||'').toLowerCase();
     const net = t.net_pnl != null ? t.net_pnl : t.pnl;
-    const ts = t.ts || t.timestamp || '';
     const meta = [];
     if(t.strategy) meta.push(esc(t.strategy));
     if(t.regime) meta.push(t.regime);
@@ -1506,7 +1520,7 @@ function renderActivity(trades){
         <div class="act-id">
           <span class="act-chip ${action}">${action.toUpperCase()}</span>
           <span class="act-symbol">${t.symbol}</span>
-          <span class="act-time">${relTime(ts)}</span>
+          <span class="act-time">${relTime(t.ts_epoch)}</span>
         </div>
         <div class="act-pnl num ${net!=null?pnlCls(net):'dim'}">${net!=null?fmtSigned$(net):'—'}</div>
       </div>
