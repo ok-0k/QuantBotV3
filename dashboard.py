@@ -22,7 +22,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from config import DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, SSE_HEARTBEAT_SECS, STARTING_CASH, SYMBOLS
+from config import (
+    DASHBOARD_HOST, DASHBOARD_PORT, FEE_GATE_ROUND_TRIP, MAX_DRAWDOWN_PCT, SSE_HEARTBEAT_SECS,
+    STARTING_CASH, SYMBOLS, V3_FIXES,
+)
 import insights
 from db import (
     get_all_positions,
@@ -30,8 +33,8 @@ from db import (
     get_cash_curve_from_trades,
     get_equity_curve,
     get_equity_curve_since,
+    get_db,
     get_equity_rebase,
-    get_filled_trade_count,
     get_portfolio_stat,
     get_recent_trades,
     get_trades_last_7_days,
@@ -44,13 +47,19 @@ from accounting_v2 import position_equity_components
 VAN_TZ = zoneinfo.ZoneInfo("America/Vancouver")
 
 # Fix W4: the dashboard is strictly read-only -- bot.py is the sole writer of
-# persisted equity/PnL state. Peak equity used to be re-derived AND written
-# back to portfolio.peak_equity_all_time on every telemetry build, racing
-# bot.py's own writes to current_equity/return_pct. It now ratchets up in
-# this process's memory only; a dashboard restart re-seeds it (harmlessly)
-# from the read-only equity_curve/portfolio history the next call already
-# fetches, so no information is actually lost by not persisting it.
-_dashboard_peak_equity: float = 0.0
+# persisted equity/PnL state. The page's peak equity is read on every build
+# as SELECT MAX(equity) over the whole equity_curve since the rebase (5-minute
+# history is kept forever), so a dashboard restart loses nothing.
+
+# Circuit breaker high-water mark persisted by brain.check_circuit_breaker
+# (same key as brain._PEAK_EQUITY_BRAIN_KEY; not imported to keep brain.py and
+# its ML stack out of the dashboard process).
+_BREAKER_PEAK_KEY = "circuit_breaker_peak_equity_v1"
+
+# Health stats written by the bot (all optional: absent on an older bot).
+LIVENESS_STALE_SECS = 90      # bot heartbeat / exit monitor / websocket
+MODEL_STALE_DAYS = 30
+LEDGER_TOLERANCE_USD = 1.0
 
 
 def _utc_to_van(ts_str: str | None) -> str:
@@ -99,6 +108,120 @@ def _van_week_day_prefixes() -> list[tuple[str, str]]:
             label = f"{i}d ago"
         result.append((day.strftime("%Y-%m-%d"), label))
     return result
+
+
+def _to_epoch(raw: Any) -> float | None:
+    """Epoch seconds from an epoch number/string or an ISO-8601 timestamp
+    (offset-less means UTC, as the DB stores it); None if absent/unparseable."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def _age_secs(raw: Any, now: float) -> float | None:
+    ep = _to_epoch(raw)
+    return None if ep is None else round(max(0.0, now - ep), 1)
+
+
+def _opt_float(raw: Any) -> float | None:
+    try:
+        return None if raw is None or str(raw).strip() == "" else float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ledger_check(now: float) -> dict[str, Any]:
+    """Books-vs-ledger drift as computed by the bot (portfolio.ledger_drift)."""
+    drift = _opt_float(get_portfolio_stat("ledger_drift", None))
+    age = _age_secs(get_portfolio_stat("ledger_checked_at", None), now)
+    if drift is None:
+        return {"drift": None, "ok": None, "value": "—", "checked_age_s": age}
+    ok = abs(drift) <= LEDGER_TOLERANCE_USD
+    value = "Balanced" if ok else f"Drift {'+' if drift > 0 else '-'}${abs(drift):,.2f}"
+    return {"drift": round(drift, 2), "ok": ok, "value": value, "checked_age_s": age}
+
+
+def _liveness(now: float) -> dict[str, Any]:
+    """How long ago the bot last reported, from its own writes: equity_curve
+    (every 30 s), the exit monitor cycle, the websocket and housekeeping."""
+    with get_db() as conn:
+        last_equity_ts = conn.execute("SELECT MAX(ts) FROM equity_curve").fetchone()[0]
+    ages = {
+        "bot":          _age_secs(last_equity_ts, now),
+        "exit_monitor": _age_secs(get_portfolio_stat("exit_monitor_last_cycle", None), now),
+        "ws":           _age_secs(get_portfolio_stat("ws_last_msg", None), now),
+        "housekeeping": _age_secs(get_portfolio_stat("housekeeping_last", None), now),
+    }
+    xgb = _opt_float(get_portfolio_stat("model_age_xgb_days", None))
+    sac = _opt_float(get_portfolio_stat("model_age_sac_days", None))
+    return {
+        "ages_s":             ages,
+        "stale_after_s":      LIVENESS_STALE_SECS,
+        "stale":              [k for k in ("bot", "exit_monitor", "ws")
+                               if ages[k] is not None and ages[k] > LIVENESS_STALE_SECS],
+        "model_age_xgb_days": None if xgb is None else round(xgb, 1),
+        "model_age_sac_days": None if sac is None else round(sac, 1),
+        "model_stale_days":   MODEL_STALE_DAYS,
+        "models_stale":       any(v is not None and v > MODEL_STALE_DAYS for v in (xgb, sac)),
+        "v3_fixes":           bool(V3_FIXES),
+    }
+
+
+def _curve_peak_since(rebase_ts: str | None) -> float:
+    """Highest recorded equity since the rebase (whole curve if none)."""
+    since = _to_epoch(rebase_ts) if rebase_ts else None
+    with get_db() as conn:
+        if since is not None:
+            iso = datetime.datetime.fromtimestamp(since, datetime.timezone.utc).isoformat()
+            row = conn.execute("SELECT MAX(equity) FROM equity_curve WHERE ts >= ?", (iso,)).fetchone()
+        else:
+            row = conn.execute("SELECT MAX(equity) FROM equity_curve").fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
+def _breaker_state(total_eq: float) -> dict[str, Any]:
+    """Drawdown as the circuit breaker sees it: from its persisted peak, not
+    the page's. A trip halts new entries until scripts/reset_circuit_breaker.py
+    --confirm and a bot restart."""
+    peak = _opt_float(load_brain_key(_BREAKER_PEAK_KEY, None))
+    if not peak or peak <= 0:
+        return {"breaker_peak_equity": None, "breaker_drawdown_pct": None,
+                "breaker_limit_pct": round(MAX_DRAWDOWN_PCT * 100, 2),
+                "breaker_headroom_pct": None, "breaker_trip_equity": None}
+    peak = max(peak, total_eq)        # the bot ratchets its peak on every check
+    dd = (peak - total_eq) / peak
+    return {
+        "breaker_peak_equity":  round(peak, 2),
+        "breaker_drawdown_pct": round(-dd * 100, 3),      # same sign as drawdown_pct
+        "breaker_limit_pct":    round(MAX_DRAWDOWN_PCT * 100, 2),
+        "breaker_headroom_pct": round((MAX_DRAWDOWN_PCT - dd) * 100, 3),
+        "breaker_trip_equity":  round(peak * (1 - MAX_DRAWDOWN_PCT), 2),
+    }
+
+
+def _price_refs_1h(now_ms: int) -> dict[str, float]:
+    """Each symbol's close ~60 min ago from the candles table, in one query
+    (candles are kept 500 per symbol). Ignores references more than 15 min
+    older than that, so a stalled feed shows no change rather than a stale one."""
+    cutoff = now_ms - 3_600_000
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT c.symbol, c.close FROM candles c JOIN ("
+            "  SELECT symbol, MAX(ts) AS mts FROM candles WHERE ts <= ? AND ts >= ? GROUP BY symbol"
+            ") m ON c.symbol = m.symbol AND c.ts = m.mts",
+            (cutoff, cutoff - 900_000),
+        ).fetchall()
+    return {r[0]: float(r[1]) for r in rows}
 
 
 def _downsample_equity(curve: list[dict], max_points: int) -> list[dict]:
@@ -173,6 +296,9 @@ def _format_trade_row(row: dict[str, Any]) -> dict[str, Any]:
     # MFE / MAE — map from new engine columns
     out["mfe"] = out.get("max_unrealized_pnl")   # peak profit while open
     out["mae"] = out.get("min_unrealized_pnl")   # max drawdown while open
+    # UTC epoch for the browser's relative times (the strings below are
+    # offset-less Vancouver wall-clock, which browsers parse as local time).
+    out["ts_epoch"] = _to_epoch(out.get("ts") or out.get("timestamp"))
     # Convert timestamps to Vancouver time
     for key in ("ts", "timestamp", "opened_ts", "opened_at"):
         if out.get(key):
@@ -204,7 +330,10 @@ _AUTH_COOKIE = "qb_auth"
 
 
 def _token_ok(candidate: str | None) -> bool:
-    return bool(candidate) and _hmac.compare_digest(candidate, _AUTH_TOKEN)
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str, which
+    # escaped the middleware as a 500 instead of a 401.
+    return bool(candidate) and _hmac.compare_digest(
+        candidate.encode("utf-8"), _AUTH_TOKEN.encode("utf-8"))
 
 
 @app.middleware("http")
@@ -232,7 +361,6 @@ async def _require_token(request: Request, call_next):
 
 
 def _build_telemetry(equity_tf: str | None = None) -> dict:
-    global _dashboard_peak_equity
     try:
         init_db()
     except Exception:
@@ -306,6 +434,7 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "risk_per_share":    rm["risk_per_share"],
             "reward_per_share":  rm["reward_per_share"],
             "opened_ts":         _utc_to_van(opened_raw),
+            "opened_epoch":      _to_epoch(opened_raw),
         })
 
     realised     = float(get_portfolio_stat("realised_pnl",     "0.0"))
@@ -336,31 +465,23 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     # When a rebase is active, only equity observed AFTER the rebase counts
     # toward the peak -- otherwise pre-rebase curve history (inflated by the
     # since-fixed C3 capital leak) would immediately drag "peak since rebase"
-    # straight back up.
-    rebase_dt = _parse_equity_ts(rebase_ts) if rebase_ts else None
-    if rebase_dt is not None:
-        curve_equity_vals = [
-            float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw
-            if _parse_equity_ts(str(pt.get("time", ""))) >= rebase_dt
-        ]
-    else:
-        curve_equity_vals = [float(pt.get("equity", 0.0) or 0.0) for pt in equity_curve_raw]
-    # Fix W4: read the last-known persisted peak (harmless -- a read, not a
-    # write) as a floor, but hold the ratcheted result in process memory only.
-    # bot.py never writes this key, and neither do we anymore -- the previous
-    # set_portfolio_stat call here was racing bot.py's own current_equity /
-    # return_pct writes every ~2s.
-    stored_peak         = float(get_portfolio_stat("peak_equity_all_time", str(ref_equity)) or ref_equity)
-    _dashboard_peak_equity = max(_dashboard_peak_equity, stored_peak, total_eq, ref_equity, *curve_equity_vals)
-    peak_equity          = _dashboard_peak_equity
+    # straight back up. ref_equity and the persisted peak (read-only) stay
+    # as floors.
+    stored_peak  = float(get_portfolio_stat("peak_equity_all_time", str(ref_equity)) or ref_equity)
+    peak_equity  = max(_curve_peak_since(rebase_ts), stored_peak, total_eq, ref_equity)
     drawdown_pct = round((total_eq - peak_equity) / peak_equity * 100, 3) if peak_equity > 0 else 0.0
+    breaker      = _breaker_state(total_eq)
+    now_epoch    = time.time()
 
     # ── Prices ─────────────────────────────────────────────────────────────────
+    # 1h change vs the candle close ~60 min ago (prev_price_* keys are no longer
+    # written by the bot and held frozen baselines).
+    refs_1h = _price_refs_1h(int(now_epoch * 1000))
     prices = []
     for sym in SYMBOLS:
         price = float(get_portfolio_stat(f"last_price_{sym}", "0") or "0")
-        prev  = float(get_portfolio_stat(f"prev_price_{sym}", "0") or "0")
-        chg   = round((price - prev) / prev * 100, 2) if prev > 0 else 0.0
+        prev  = refs_1h.get(sym, 0.0)
+        chg   = round((price - prev) / prev * 100, 2) if prev > 0 and price > 0 else None
         prices.append({"symbol": sym.replace("USDT", ""), "price": price, "change": chg})
 
     # Fix 2: time-based window (7 days) instead of an arbitrary row count cap.
@@ -375,14 +496,13 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
 
     closed         = [t for t in all_trades if _trade_net_amt(t) is not None]
 
-    # ── Lifetime trade count — brain-snapshot + current DB count ───────────────
-    # The trades table may be pruned (prune_db.sh), so SELECT COUNT(*) alone
-    # understates the true total.  brain_state.total_trades holds the count at
-    # the time of the last manual snapshot (default: 6629, known pre-prune
-    # baseline).  db_count captures trades since that snapshot.
-    brain_snapshot   = int(load_brain_key("total_trades", 6629) or 0)
-    db_count         = get_filled_trade_count()
-    lifetime_trades  = brain_snapshot + db_count
+    # ── Lifetime trade count ──────────────────────────────────────────────────
+    # portfolio.total_trades is incremented by bot.py on every fill and survives
+    # trade-row pruning; the same figure Insights shows.
+    try:
+        lifetime_trades = int(float(get_portfolio_stat("total_trades", "0") or 0))
+    except (TypeError, ValueError):
+        lifetime_trades = 0
 
     # ── Session win rate from available trade window ──────────────────────────
     closed_wins      = sum(1 for t in closed if (_trade_net_amt(t) or 0) > 0)
@@ -495,9 +615,12 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
 
     equity_curve_out = _downsample_equity(equity_window, max_pts)
 
-    # Convert equity curve timestamps to Vancouver
+    # Convert equity curve timestamps to Vancouver; "t" is the UTC epoch the
+    # chart plots (formatted in America/Vancouver by the page).
     for pt in equity_curve_out:
         if pt.get("time"):
+            ep = _to_epoch(pt["time"])
+            pt["t"] = int(ep) if ep is not None else None
             pt["time"] = _utc_to_van(pt["time"])
 
     # Fix 1 — equity curve fallback: if the table was wiped or has only one row,
@@ -505,9 +628,10 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     # flat baseline from the current equity so the chart renders immediately.
     if len(equity_curve_out) == 0:
         _now_van = datetime.datetime.now(tz=VAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        _now_ep = int(time.time())
         equity_curve_out = [
-            {"time": _now_van, "equity": round(total_eq, 2)},
-            {"time": _now_van, "equity": round(total_eq, 2)},
+            {"time": _now_van, "t": _now_ep, "equity": round(total_eq, 2)},
+            {"time": _now_van, "t": _now_ep, "equity": round(total_eq, 2)},
         ]
     elif len(equity_curve_out) == 1:
         equity_curve_out = equity_curve_out + [equity_curve_out[0]]
@@ -553,12 +677,16 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             # realised_pnl_net deducts 0.12% round-trip fees (V2.3+).
             "realised_pnl_net":      round(realised_net, 2),
             "unrealised_pnl_total":  unrealised_pnl_total,
-            # lifetime_trades = brain_state.total_trades (pre-prune snapshot, default
-            # 6629) + get_filled_trade_count() (rows added since snapshot).
+            # lifetime_trades = portfolio.total_trades (every fill, bot-maintained).
+            # win_rate / profit_factor / fees / gross are over the 7-day window
+            # (closed_7d closed trades).
             "lifetime_trades":       lifetime_trades,
+            "closed_7d":             closed_total,
             "total_trades":          lifetime_trades,
             "drawdown_pct":          drawdown_pct,
             "peak_equity":           round(peak_equity, 2),
+            # Circuit breaker's own view (persisted peak) -- what actually trips.
+            **breaker,
             "win_rate":              win_rate_overall,
             "win_rate_long":         win_rate_long,
             "win_rate_short":        win_rate_short,
@@ -584,6 +712,8 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             "starting_cash":         round(ref_equity, 2),
         },
         "margin_health": margin_health,
+        # Bot-written health stats; every field is None until the bot writes it.
+        "health":       {"ledger": _ledger_check(now_epoch), **_liveness(now_epoch)},
         "positions":    pos_list,
         "trades":       trades_out,
         "equity_curve": equity_curve_out,
@@ -616,21 +746,49 @@ def _parse_equity_ts(ts_str: str) -> datetime.datetime:
     return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
-async def _sse_generator(request: Request) -> AsyncGenerator:
-    while True:
-        if await request.is_disconnected():
-            break
+# ── Shared telemetry builder ──────────────────────────────────────────────────
+# One build per interval, off the event loop, fanned out to every SSE client
+# (was: a blocking ~0.35 s build per client every SSE_HEARTBEAT_SECS). Runs
+# only while at least one client is connected; bot data changes every 30-60 s.
+TELEMETRY_INTERVAL_SECS = max(5.0, float(SSE_HEARTBEAT_SECS))
+_SSE_POLL_SECS = 0.5
+_telemetry: dict[str, Any] = {"payload": None, "seq": 0, "clients": 0}
+_builder_task: asyncio.Task | None = None
+
+
+async def _telemetry_builder() -> None:
+    while _telemetry["clients"] > 0:
         try:
-            data = _build_telemetry()
+            data = await asyncio.to_thread(_build_telemetry)
             # Strip heavy curve arrays from SSE — served by dedicated endpoints
             # so SSE payloads stay small and don't clobber the user's TF selection.
             data["equity_curve"] = []
             data["equity_tf"]    = None
             data["cash_curve"]   = []  # served by /api/cash
-            yield {"event": "update", "data": json.dumps(data)}
+            _telemetry["payload"] = {"event": "update", "data": json.dumps(data)}
         except Exception as exc:
-            yield {"event": "error", "data": json.dumps({"error": str(exc)})}
-        await asyncio.sleep(SSE_HEARTBEAT_SECS)
+            _telemetry["payload"] = {"event": "error", "data": json.dumps({"error": str(exc)})}
+        _telemetry["seq"] += 1
+        await asyncio.sleep(TELEMETRY_INTERVAL_SECS)
+    _telemetry["payload"] = None       # never serve a stale build to the next client
+
+
+async def _sse_generator(request: Request) -> AsyncGenerator:
+    global _builder_task
+    _telemetry["clients"] += 1
+    if _builder_task is None or _builder_task.done():
+        _builder_task = asyncio.get_running_loop().create_task(_telemetry_builder())
+    seen = -1
+    try:
+        while True:
+            if await request.is_disconnected():
+                break
+            if _telemetry["payload"] is not None and _telemetry["seq"] != seen:
+                seen = _telemetry["seq"]
+                yield _telemetry["payload"]
+            await asyncio.sleep(_SSE_POLL_SECS)
+    finally:
+        _telemetry["clients"] -= 1
 
 
 @app.get("/stream")
@@ -640,13 +798,13 @@ async def stream(request: Request):
 
 @app.get("/api/data")
 async def api_data():
-    return _build_telemetry()
+    return await asyncio.to_thread(_build_telemetry)
 
 
 @app.get("/api/equity")
 async def api_equity(tf: str = "24H"):
     """Lightweight endpoint for equity curve timeframe switching."""
-    data = _build_telemetry(equity_tf=tf.upper())
+    data = await asyncio.to_thread(_build_telemetry, tf.upper())
     return JSONResponse({"equity_curve": data["equity_curve"], "equity_tf": data["equity_tf"]})
 
 
@@ -914,6 +1072,7 @@ section.block{margin-top:36px;}
 .system-tile:nth-last-child(-n+2){border-bottom:none;}
 .system-label{font-size:11px;color:var(--t3);font-weight:500;margin-bottom:6px;}
 .system-value{font-size:14.5px;font-weight:700;color:var(--t1);}
+.system-sub{font-size:11px;color:var(--t3);margin-top:3px;}
 .ledger-ok{color:var(--pos);}
 .ledger-fail{color:var(--warn);}
 
@@ -1108,12 +1267,17 @@ function pnlCls(v){ return v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim'; }
    unlike per-trade PnL, an exact-0% return is not meaningfully "flat". */
 function retCls(v){ return v >= 0 ? 'pos' : 'neg'; }
 
-function parseLocal(ts){
-  return new Date(String(ts).replace(' ', 'T'));
-}
-function relTime(ts){
-  if(!ts) return '—';
-  const ms = Date.now() - parseLocal(ts).getTime();
+/* Times arrive as UTC epoch seconds and are shown in Vancouver time whatever
+   the browser's zone (offset-less strings would be parsed as browser-local). */
+const vanFmt = opts => new Intl.DateTimeFormat('en-US', Object.assign({timeZone:'America/Vancouver'}, opts));
+const FMT_TIME = vanFmt({hour:'numeric', minute:'2-digit', hour12:true});
+const FMT_DAYTIME = vanFmt({month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true});
+const FMT_DAY = vanFmt({month:'short', day:'numeric'});
+const FMT_MONTH = vanFmt({month:'short'});
+const FMT_YEAR = vanFmt({year:'numeric'});
+function relTime(ep){
+  if(ep == null) return '—';
+  const ms = Date.now() - ep*1000;
   if(isNaN(ms)) return '—';
   if(ms < 0) return 'just now';
   const m = Math.floor(ms/60000);
@@ -1123,11 +1287,11 @@ function relTime(ts){
   if(h < 24) return h + 'h ago';
   const d = Math.floor(h/24);
   if(d < 7) return d + 'd ago';
-  return String(ts).slice(5,10);
+  return FMT_DAY.format(new Date(ep*1000));
 }
-function durFmt(ts){
-  if(!ts) return '—';
-  const ms = Date.now() - parseLocal(ts).getTime();
+function durFmt(ep){
+  if(ep == null) return '—';
+  const ms = Date.now() - ep*1000;
   if(isNaN(ms) || ms < 0) return '—';
   const m = Math.floor(ms/60000), h = Math.floor(m/60), d = Math.floor(h/24);
   if(d > 0) return d + 'd ' + (h%24) + 'h';
@@ -1158,8 +1322,8 @@ function toChartPoints(curve){
   const seen = new Set();
   const out = [];
   for(const pt of (curve||[])){
-    if(!pt || !pt.time) continue;
-    const t = Math.floor(parseLocal(pt.time).getTime()/1000);
+    if(!pt || pt.t == null) continue;
+    const t = Math.floor(pt.t);
     if(!t || isNaN(t) || seen.has(t)) continue;
     seen.add(t);
     out.push({time:t, value:Number(pt.equity)||0});
@@ -1176,7 +1340,13 @@ function ensureChart(){
     layout:{background:{color:'transparent'}, textColor:'#626269', fontFamily:'Inter, system-ui, sans-serif', fontSize:11},
     grid:{vertLines:{visible:false}, horzLines:{visible:false}},
     rightPriceScale:{borderVisible:false, textColor:'#626269'},
-    timeScale:{borderVisible:false, timeVisible:true, secondsVisible:false, fixLeftEdge:true, fixRightEdge:true},
+    localization:{timeFormatter: t => FMT_DAYTIME.format(new Date(t*1000))},
+    timeScale:{borderVisible:false, timeVisible:true, secondsVisible:false, fixLeftEdge:true, fixRightEdge:true,
+      /* TickMarkType: 0 year, 1 month, 2 day, 3+ time */
+      tickMarkFormatter:(t, type)=>{
+        const d = new Date(t*1000);
+        return (type===0 ? FMT_YEAR : type===1 ? FMT_MONTH : type===2 ? FMT_DAY : FMT_TIME).format(d);
+      }},
     crosshair:{
       mode:LightweightCharts.CrosshairMode.Magnet,
       vertLine:{color:'rgba(255,255,255,.18)', width:1, style:LightweightCharts.LineStyle.Solid, labelVisible:false},
@@ -1202,10 +1372,7 @@ function ensureChart(){
     if(!d || d.value == null){ tooltip.style.opacity = 0; return; }
     const dt = new Date(param.time * 1000);
     const intraday = activeTf === '1H' || activeTf === '24H';
-    const timeStr = new Intl.DateTimeFormat('en-US', intraday
-      ? {hour:'numeric', minute:'2-digit', hour12:true}
-      : {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true}
-    ).format(dt);
+    const timeStr = (intraday ? FMT_TIME : FMT_DAYTIME).format(dt);
     tooltip.querySelector('.tt-val').textContent = fmt$(d.value);
     tooltip.querySelector('.tt-time').textContent = timeStr;
     tooltip.style.opacity = 1;
@@ -1269,20 +1436,34 @@ function renderStats(p){
   cards.push({label:'Total Return', value:fmtPct(p.return_pct||0), cls:retCls(p.return_pct||0), sub:'vs '+fmt$(p.starting_cash||0)});
   cards.push({label:'Net PnL (all-time)', value:fmtSigned$(p.total_net_pnl||0), cls:pnlCls(p.total_net_pnl||0),
     sub:'R '+fmtSigned$(p.realised_pnl_net||0)+' · U '+fmtSigned$(p.unrealised_pnl_total||0)});
-  const dd = p.drawdown_pct || 0;
-  cards.push({label:'Drawdown', value:fmtPct(dd), cls: dd < -5 ? 'neg' : dd < -2 ? 'warn' : 'pos',
-    sub:'from peak '+fmt$(p.peak_equity||0)});
+  /* Drawdown as the circuit breaker sees it (its persisted peak), falling back
+     to the page's own peak when the bot has not persisted one yet. */
+  if(p.breaker_drawdown_pct != null){
+    const room = p.breaker_headroom_pct;
+    cards.push({label:'Drawdown (breaker)', value:fmtPct(p.breaker_drawdown_pct),
+      cls: room < 5 ? 'neg' : room < 10 ? 'warn' : 'pos',
+      sub:room.toFixed(1)+' pts to the '+p.breaker_limit_pct.toFixed(0)+'% trip · peak '+fmt$(p.breaker_peak_equity),
+      title:'Trips at '+fmt$(p.breaker_trip_equity)+'. A trip halts new entries until '
+        +'scripts/reset_circuit_breaker.py --confirm and a bot restart.',
+      bar:Math.max(0, Math.min(100, -p.breaker_drawdown_pct / p.breaker_limit_pct * 100)),
+      barColor: room < 5 ? 'var(--neg)' : room < 10 ? 'var(--warn)' : 'var(--t2)'});
+  } else {
+    const dd = p.drawdown_pct || 0;
+    cards.push({label:'Drawdown', value:fmtPct(dd), cls: dd < -5 ? 'neg' : dd < -2 ? 'warn' : 'pos',
+      sub:'from peak '+fmt$(p.peak_equity||0)});
+  }
   const lifetimeTrades = p.lifetime_trades || p.total_trades || 0;
-  cards.push({label:'Win Rate', value:(p.win_rate||0).toFixed(1)+'%',
-    sub:lifetimeTrades.toLocaleString()+' trades · L '+(p.win_rate_long!=null?p.win_rate_long.toFixed(0)+'%':'—')
+  const closed7 = (p.closed_7d||0).toLocaleString() + ' closed (7d)';
+  cards.push({label:'Win Rate · 7d', value:(p.win_rate||0).toFixed(1)+'%',
+    sub:closed7+' · L '+(p.win_rate_long!=null?p.win_rate_long.toFixed(0)+'%':'—')
       +' / S '+(p.win_rate_short!=null?p.win_rate_short.toFixed(0)+'%':'—'),
     bar:Math.max(0,Math.min(100,p.win_rate||0)), barColor:'var(--pos)'});
   cards.push({label:'Tickets Traded', value:lifetimeTrades.toLocaleString(), sub:'lifetime executions (all symbols)'});
   const pf = p.profit_factor;
-  cards.push({label:'Profit Factor', value: pf==null?'—':pf.toFixed(2)+'×',
-    cls: pf==null?'':(pf>=1.5?'pos':pf>=1?'warn':'neg'), sub:'gross '+fmtSigned$(p.gross_pnl||0)});
-  cards.push({label:'Fees Paid', value:fmt$(-(p.total_fees_paid||0)), cls:(p.total_fees_paid||0)>0?'neg':'dim',
-    sub: p.fee_efficiency!=null ? p.fee_efficiency.toFixed(1)+'% net/gross' : 'no closed trades'});
+  cards.push({label:'Profit Factor · 7d', value: pf==null?'—':pf.toFixed(2)+'×',
+    cls: pf==null?'':(pf>=1.5?'pos':pf>=1?'warn':'neg'), sub:'gross '+fmtSigned$(p.gross_pnl||0)+' · '+closed7});
+  cards.push({label:'Fees Paid · 7d', value:fmt$(-(p.total_fees_paid||0)), cls:(p.total_fees_paid||0)>0?'neg':'dim',
+    sub: p.fee_efficiency!=null ? p.fee_efficiency.toFixed(1)+'% net/gross · '+closed7 : 'no closed trades (7d)'});
   cards.push({label:'Today', value:fmtSigned$(p.daily_equity_pnl!=null?p.daily_equity_pnl:p.daily_pnl||0),
     cls:pnlCls(p.daily_equity_pnl!=null?p.daily_equity_pnl:p.daily_pnl||0),
     sub:(p.daily_trades||0)+' trades'});
@@ -1290,7 +1471,7 @@ function renderStats(p){
     bar:deployedPct, barColor: deployedPct>95?'var(--neg)':deployedPct>80?'var(--warn)':'var(--t2)'});
 
   g('stats-grid').innerHTML = cards.map(c=>`
-    <div class="stat-card">
+    <div class="stat-card"${c.title ? ` title="${esc(c.title)}"` : ''}>
       <div class="stat-label">${c.label}</div>
       <span class="stat-value num ${c.cls||''}">${c.value}</span>
       <span class="stat-sub">${c.sub||''}</span>
@@ -1342,8 +1523,7 @@ function renderPositions(positions){
     if(tpPx>0) meta.push('Take '+fmtPrice(tpPx)+(p.tp_pct!=null?' (+'+Math.abs(p.tp_pct).toFixed(2)+'%)':''));
     if(rr!=null && rr>0) meta.push('<span class="rr">R∶R 1∶'+rr.toFixed(2)+'</span>');
     if(p.strategy) meta.push('<span class="strat">'+esc(p.strategy)+'</span>');
-    const openedTs = p.opened_ts || p.opened_at || '';
-    if(openedTs) meta.push(durFmt(openedTs)+' open');
+    if(p.opened_epoch != null) meta.push(durFmt(p.opened_epoch)+' open');
     return `<div class="pos-row">
       <div class="pos-top">
         <div>
@@ -1375,7 +1555,6 @@ function renderActivity(trades){
   el.innerHTML = trades.slice(0,50).map(t=>{
     const action = (t.action||'').toLowerCase();
     const net = t.net_pnl != null ? t.net_pnl : t.pnl;
-    const ts = t.ts || t.timestamp || '';
     const meta = [];
     if(t.strategy) meta.push(esc(t.strategy));
     if(t.regime) meta.push(t.regime);
@@ -1387,7 +1566,7 @@ function renderActivity(trades){
         <div class="act-id">
           <span class="act-chip ${action}">${action.toUpperCase()}</span>
           <span class="act-symbol">${t.symbol}</span>
-          <span class="act-time">${relTime(ts)}</span>
+          <span class="act-time">${relTime(t.ts_epoch)}</span>
         </div>
         <div class="act-pnl num ${net!=null?pnlCls(net):'dim'}">${net!=null?fmtSigned$(net):'—'}</div>
       </div>
@@ -1401,17 +1580,42 @@ function renderTicker(prices){
   if(!prices || !prices.length) return;
   const all = [...prices, ...prices];
   g('ticker-track').innerHTML = all.map(p=>{
-    const cls = p.change > 0 ? 'pos' : p.change < 0 ? 'neg' : '';
-    const arr = p.change > 0 ? '▲' : p.change < 0 ? '▼' : '—';
-    return `<div class="t-item"><span class="t-sym">${p.symbol}</span><span class="num">${fmtPrice(p.price)}</span><span class="t-chg ${cls}">${arr} ${Math.abs(p.change).toFixed(2)}%</span></div>`;
+    const has = p.change != null;
+    const cls = !has ? 'dim' : p.change > 0 ? 'pos' : p.change < 0 ? 'neg' : '';
+    const arr = has && p.change > 0 ? '▲' : has && p.change < 0 ? '▼' : '—';
+    const chg = has ? Math.abs(p.change).toFixed(2)+'%' : '';
+    return `<div class="t-item"><span class="t-sym">${p.symbol}</span><span class="num">${fmtPrice(p.price)}</span><span class="t-chg ${cls}">${arr} ${chg} 1h</span></div>`;
   }).join('');
 }
 
 /* ══════════════════════════════ SYSTEM ══════════════════════════════ */
-function renderSystem(p, brain, marginHealth){
+function ageFmt(s){
+  if(s == null) return '—';
+  if(s < 90) return Math.round(s) + 's ago';
+  const m = Math.round(s/60);
+  if(m < 120) return m + ' min ago';
+  const h = Math.round(m/60);
+  return h < 48 ? h + ' h ago' : Math.round(h/24) + ' d ago';
+}
+function renderSystem(p, brain, marginHealth, health){
+  health = health || {};
+  const ages = health.ages_s || {};
+  const stale = health.stale || [];
   const tiles = [];
   tiles.push({label:'Circuit Breaker', value: brain.circuit_open ? 'OPEN' : 'Clear',
-    cls: brain.circuit_open ? 'neg' : 'pos'});
+    cls: brain.circuit_open ? 'neg' : 'pos',
+    sub: brain.circuit_open ? 'entries halted until reset_circuit_breaker.py --confirm + restart'
+      : (p.breaker_headroom_pct != null ? 'DD '+fmtPct(p.breaker_drawdown_pct, 1)+' · trips at '
+         +fmt$(p.breaker_trip_equity, 0)+' (−'+p.breaker_limit_pct.toFixed(0)+'%)' : '')});
+  tiles.push({label:'Bot Heartbeat', value:ageFmt(ages.bot), cls: stale.includes('bot') ? 'warn' : (ages.bot!=null?'pos':''),
+    sub:'last equity snapshot'});
+  tiles.push({label:'Exit Monitor', value:ageFmt(ages.exit_monitor), cls: stale.includes('exit_monitor') ? 'warn' : ''});
+  tiles.push({label:'Websocket', value:ageFmt(ages.ws), cls: stale.includes('ws') ? 'warn' : ''});
+  tiles.push({label:'Housekeeping', value:ageFmt(ages.housekeeping), cls: ages.housekeeping > 180 ? 'warn' : ''});
+  const mAge = v => v == null ? '—' : Math.round(v) + 'd';
+  tiles.push({label:'Model Age', value:'XGB '+mAge(health.model_age_xgb_days)+' · SAC '+mAge(health.model_age_sac_days),
+    cls: health.models_stale ? 'warn' : '', sub: health.models_stale ? 'older than '+health.model_stale_days+' days' : ''});
+  tiles.push({label:'V3 Fixes', value: health.v3_fixes == null ? '—' : (health.v3_fixes ? 'On' : 'Off')});
   const sm = brain.current_size_mult != null ? brain.current_size_mult : 1.0;
   const smPct = Math.round(sm*100);
   tiles.push({label:'AI Sizing', value: smPct>=100 ? '100% nominal' : ('Penalized to '+smPct+'%'),
@@ -1422,20 +1626,17 @@ function renderSystem(p, brain, marginHealth){
   if(mh.margin_level != null) marginParts.push('ML '+mh.margin_level.toFixed(3));
   tiles.push({label:'Margin ('+(mh.source||'—')+')', value: marginParts.length?marginParts.join(' · '):'—',
     cls: mh.halt_new_entries ? 'neg' : ''});
-  let ledgerVal = '—', ledgerCls = '';
-  if(p.starting_cash != null && p.total_net_pnl != null && p.total_equity != null){
-    const computed = Number((p.starting_cash + p.total_net_pnl).toFixed(2));
-    const diff = Math.abs(computed - p.total_equity);
-    const ok = diff < 0.02;
-    ledgerVal = ok ? 'Balanced' : ('Drift ' + fmt$(diff));
-    ledgerCls = ok ? 'ledger-ok' : 'ledger-fail';
-  }
-  tiles.push({label:'Ledger Check', value:ledgerVal, cls:ledgerCls});
+  /* Books vs ledger, as checked by the bot (portfolio.ledger_drift) */
+  const lg = health.ledger || {};
+  tiles.push({label:'Ledger Check', value: lg.value || '—',
+    cls: lg.ok == null ? '' : (lg.ok ? 'ledger-ok' : 'ledger-fail'),
+    sub: lg.checked_age_s != null ? 'checked ' + ageFmt(lg.checked_age_s) : ''});
 
   g('system-grid').innerHTML = tiles.map(t=>`
     <div class="system-tile">
       <div class="system-label">${t.label}</div>
-      <div class="system-value num ${t.cls||''}">${t.value}</div>
+      <div class="system-value num ${t.cls||''}">${esc(t.value)}</div>
+      ${t.sub ? `<div class="system-sub">${esc(t.sub)}</div>` : ''}
     </div>
   `).join('');
 }
@@ -1445,15 +1646,21 @@ function applyUpdate(d){
   const p = d.portfolio || {};
   const brain = d.brain || {};
   const marginHealth = d.margin_health || {};
+  const health = d.health || {};
+  const stale = health.stale || [];
 
   /* Status dot + regime pill + alert banner */
   const dot = g('status-dot');
-  if(dot) dot.className = 'brand-mark' + (brain.circuit_open ? ' cb' : '');
+  if(dot) dot.className = 'brand-mark' + (brain.circuit_open || stale.length ? ' cb' : '');
   const regimeEl = g('regime-pill');
   if(regimeEl) regimeEl.textContent = regimeLabel(brain.current_regime);
 
   const bannerParts = [];
-  if(brain.circuit_open) bannerParts.push('Circuit breaker engaged — new entries paused after drawdown limit');
+  const STALE_NAME = {bot:'Bot', exit_monitor:'Exit monitor', ws:'Websocket feed'};
+  stale.forEach(k=>bannerParts.push(STALE_NAME[k] + ' not reporting for '
+    + Math.max(1, Math.round(((health.ages_s||{})[k]||0)/60)) + ' min'));
+  if(brain.circuit_open) bannerParts.push('Circuit breaker tripped — new entries halted until '
+    + 'scripts/reset_circuit_breaker.py --confirm and a bot restart');
   if(marginHealth.halt_new_entries) bannerParts.push('New entries halted' + (marginHealth.halt_reason ? ' — ' + marginHealth.halt_reason : ''));
   const banner = g('alert-banner');
   if(banner){
@@ -1486,7 +1693,7 @@ function applyUpdate(d){
   renderPositions(d.positions || []);
   renderActivity(d.trades || []);
   if(d.prices && d.prices.length) renderTicker(d.prices);
-  renderSystem(p, brain, marginHealth);
+  renderSystem(p, brain, marginHealth, health);
 
   /* Chart: SSE strips equity_curve (equity_tf=null); re-fetch active TF, throttled */
   if(d.equity_curve && d.equity_curve.length && (!d.equity_tf || d.equity_tf === activeTf)){
@@ -1543,7 +1750,7 @@ function renderInsights(d){
     {label:'Avg per trade', value:insPct(w.avg_pct), cls: w.avg_pct==null?'':(w.avg_pct>0?'pos':'neg'),
      sub:'round-trip cost ≈ '+cost.toFixed(2)+'%'},
     {label:'Cleared costs', value: w.cleared_cost_share==null?'—':w.cleared_cost_share.toFixed(0)+'%',
-     sub:'trades whose best moment beat '+cost.toFixed(2)+'%'},
+     sub:'trades whose best moment beat '+(w.peak_breakeven_pct || cost).toFixed(2)+'% (fee + exit slippage)'},
     {label:'Typical hold', value:insMin(w.median_hold_min), sub:'median · mean '+insMin(w.mean_hold_min)},
     {label:'Last 24 hours', value:fmtSigned$(day.net||0), cls:pnlCls(day.net||0),
      sub:(day.closed||0)+' trades · '+insPct(day.avg_pct)+'/trade'},
@@ -1571,18 +1778,34 @@ function renderInsights(d){
   }
   g('exp-name').textContent = e.name;
   const names = {A:'Group A · current', B:'Group B · as designed'};
-  const ecards = ['A','B'].filter(k=>e.arms[k]).map(k=>{
+  const ecards = [];
+  /* Headline: net P&L per symbol-day (assignment unit = symbol), day-bootstrap CI */
+  const psd = e.per_symbol_day;
+  if(psd){
+    const pcls = psd.verdict.startsWith('Keep A') ? 'neg' : psd.verdict.startsWith('Adopt B') ? 'pos' : 'warn';
+    ecards.push({label:'B − A per symbol-day', value:fmtSigned$(psd.diff, 3), cls:pcls,
+      sub:(psd.ci_lo==null ? '' : '95% CI '+fmtSigned$(psd.ci_lo, 2)+' … '+fmtSigned$(psd.ci_hi, 2)+' · ')
+        + psd.days+' days · '+psd.verdict});
+    ['A','B'].forEach(k=>ecards.push({label:(names[k]||('Group '+k))+' · per symbol-day',
+      value:fmtSigned$(psd.mean[k], 3), cls:pnlCls(psd.mean[k]),
+      sub:psd.symbols[k]+' symbols · '+fmtSigned$(psd.net_per_symbol[k])+'/symbol'}));
+  }
+  /* Secondary: per-trade economics */
+  ['A','B'].filter(k=>e.arms[k]).forEach(k=>{
     const a = e.arms[k];
-    return {label:names[k] || ('Group '+k), value:insPct(a.avg_pct)+'/trade',
+    ecards.push({label:(names[k] || ('Group '+k))+' · per trade', value:insPct(a.avg_pct)+'/trade',
       cls: a.avg_pct==null?'':(a.avg_pct>0?'pos':'neg'),
-      sub:(a.closed||0)+' closed · '+fmtSigned$(a.net||0)+' · hold '+insMin(a.median_hold_min)};
+      sub:(a.closed||0)+' closed · '+fmtSigned$(a.net||0)+' · hold '+insMin(a.median_hold_min)});
   });
   const vcls = e.verdict==='B better' ? 'pos' : e.verdict==='A better' ? 'neg' : 'warn';
   ecards.push({label:'B − A per trade', value: e.diff==null?'—':insPct(e.diff, 3), cls:vcls,
     sub: e.diff==null ? e.verdict : '95% CI '+insPct(e.ci_lo,2)+' … '+insPct(e.ci_hi,2)+' · '+e.verdict});
   g('experiment-grid').innerHTML = statCards(ecards);
   g('exp-note').textContent = 'Symbols alternate between groups. A keeps the legacy time decay; '
-    + 'B applies it as designed. A winner is only called when the 95% range excludes zero.';
+    + 'B applies it as designed. Headline: net P&L per symbol per day (zero-trade symbols count, '
+    + 'delisted excluded), 95% CI by resampling days. '
+    + (psd ? 'Pre-registered rule: ' + psd.rule + ' ' : '')
+    + (e.note ? 'Note: ' + e.note : '');
 }
 
 function loadInsights(){
