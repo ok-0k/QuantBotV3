@@ -1999,18 +1999,12 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
 
         # LEDGER-6: one atomic booking (cash, position, journal, trade row);
         # an exception rolls it all back and leaves the order non-terminal.
+        # DB writes only inside: no logging, alerts or brain calls.
         with transaction():
             # Fix C4: fresh cash read at commit time, not a prepare-phase
             # snapshot — the network call above ran with the global lock
             # released, so other symbols' trades may have already spent cash.
             cash = get_cash()
-            if cash < trade_value:
-                log.warning(
-                    "BUY %s committing with cash=$%.2f < trade_value=$%.2f — the "
-                    "fill already executed and cannot be undone; other symbols' "
-                    "trades likely consumed cash during this order's round-trip",
-                    symbol, cash, trade_value,
-                )
             set_cash(cash - trade_value)
             open_position(
                 symbol, shares, exec_price, strategy_name,
@@ -2032,6 +2026,13 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             })
             log_trade(trade_rec)
 
+        if cash < trade_value:
+            log.warning(
+                "BUY %s committed with cash=$%.2f < trade_value=$%.2f — the "
+                "fill already executed and cannot be undone; other symbols' "
+                "trades likely consumed cash during this order's round-trip",
+                symbol, cash, trade_value,
+            )
         alert_sniper_shot(symbol, "buy", exec_price, strategy_name)
 
         log.info(
@@ -2078,7 +2079,9 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
 
         # LEDGER-6: one atomic booking (cash, realised stats, position,
         # journal, trade row); an exception rolls it all back, so the retry
-        # cannot credit twice and the order stays non-terminal.
+        # cannot credit twice and the order stays non-terminal. DB writes
+        # only inside: no logging, alerts or brain calls.
+        _partial = shares < pos_shares * (1.0 - 1e-9)
         with transaction():
             # Fix 1 — DYNAMIC MARGIN REFUND (long side): already read cash fresh
             # here in the original code — unaffected by the C4 split.
@@ -2089,14 +2092,10 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
                 "realised_pnl_net",
                 float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
             )
-            if shares >= pos_shares * (1.0 - 1e-9):
+            if not _partial:
                 close_position(symbol)
             else:
                 reduce_position(symbol, shares)
-                log.warning(
-                    "SELL %s PARTIAL fill %.8f of %.8f — %.8f remains open",
-                    symbol, shares, pos_shares, pos_shares - shares,
-                )
             if _journaled:
                 update_order(_coid, state=fill.status, filled_qty=shares,
                              avg_fill_price=exec_price,
@@ -2118,6 +2117,11 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             })
             log_trade(trade_rec)
 
+        if _partial:
+            log.warning(
+                "SELL %s PARTIAL fill %.8f of %.8f — %.8f remains open",
+                symbol, shares, pos_shares, pos_shares - shares,
+            )
         entry_state_arr, entry_action = _rl_entry()
         new_cash = get_cash()
         exit_state = brain.compute_sac_state(
@@ -2194,6 +2198,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
 
         # LEDGER-6: one atomic booking (position, cash, journal, trade row);
         # an exception rolls it all back and leaves the order non-terminal.
+        # DB writes only inside: no logging, alerts or brain calls.
+        _dup_short_exc = None
         with transaction():
             # Fix #22: open_short() before set_cash(), and guarded. open_short()
             # raises ValueError instead of silently overwriting an already-active
@@ -2206,52 +2212,54 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
                     entry_state=pre_state.tolist() if pre_state is not None else None,
                     entry_features=prepared.entry_features,
                 )
-            except ValueError as _dup_short_exc:
+            except ValueError as _exc:
+                _dup_short_exc = _exc
                 trade_rec["reason"] = "short_already_open"
-                log.critical(
-                    "⚠ SHORT %s FILLED but BLOCKED from booking — %s — "
-                    "no cash moved, manual review required",
-                    symbol, _dup_short_exc,
-                )
                 update_order(
                     _coid, state=fill.status, filled_qty=shares,
                     avg_fill_price=exec_price, exchange_order_id=fill.exchange_order_id,
                     note=f"BLOCKED: {_dup_short_exc}",
                 )
                 log_trade(trade_rec)
-                return
+            else:
+                # Fix C4: fresh cash read at commit time (see BUY above).
+                cash = get_cash()
+                set_cash(cash - margin_reserved)
+                update_order(_coid, state=fill.status, filled_qty=shares,
+                             avg_fill_price=exec_price,
+                             exchange_order_id=fill.exchange_order_id, note=fill.note)
+                set_portfolio_stat("total_trades", int(
+                    get_portfolio_stat("total_trades", "0")) + 1)
 
-            # Fix C4: fresh cash read at commit time (see BUY above).
-            cash = get_cash()
-            if cash < margin_reserved:
-                log.warning(
-                    "SHORT %s committing with cash=$%.2f < margin=$%.2f — the "
-                    "fill already executed and cannot be undone; other symbols' "
-                    "trades likely consumed cash during this order's round-trip",
-                    symbol, cash, margin_reserved,
-                )
-            set_cash(cash - margin_reserved)
-            update_order(_coid, state=fill.status, filled_qty=shares,
-                         avg_fill_price=exec_price,
-                         exchange_order_id=fill.exchange_order_id, note=fill.note)
-            set_portfolio_stat("total_trades", int(
-                get_portfolio_stat("total_trades", "0")) + 1)
+                trade_rec.update({
+                    "status":      "filled",
+                    "shares":      round(float(shares or 0.0), 8),
+                    "trade_value": round(float(trade_value or 0.0), 2),
+                    "margin":      round(float(margin_reserved or 0.0), 2),
+                    "stop_price":  stop_price,
+                    "tp_price":    tp_price,
+                    "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
+                    "entry_features": (
+                        json.dumps(prepared.entry_features, default=str, sort_keys=True)
+                        if prepared.entry_features is not None else None
+                    ),
+                })
+                log_trade(trade_rec)
 
-            trade_rec.update({
-                "status":      "filled",
-                "shares":      round(float(shares or 0.0), 8),
-                "trade_value": round(float(trade_value or 0.0), 2),
-                "margin":      round(float(margin_reserved or 0.0), 2),
-                "stop_price":  stop_price,
-                "tp_price":    tp_price,
-                "allocated_equity_pct": round(100.0 * float(trade_value or 0.0) / max(total_equity, 1e-9), 4),
-                "entry_features": (
-                    json.dumps(prepared.entry_features, default=str, sort_keys=True)
-                    if prepared.entry_features is not None else None
-                ),
-            })
-            log_trade(trade_rec)
-
+        if _dup_short_exc is not None:
+            log.critical(
+                "⚠ SHORT %s FILLED but BLOCKED from booking — %s — "
+                "no cash moved, manual review required",
+                symbol, _dup_short_exc,
+            )
+            return
+        if cash < margin_reserved:
+            log.warning(
+                "SHORT %s committed with cash=$%.2f < margin=$%.2f — the "
+                "fill already executed and cannot be undone; other symbols' "
+                "trades likely consumed cash during this order's round-trip",
+                symbol, cash, margin_reserved,
+            )
         alert_sniper_shot(symbol, "short", exec_price, strategy_name)
         log.info(
             "SHORT %s @ $%.4f  val=$%.0f (%.1f%% of eq=$%.0f) (margin=$%.0f) [%s]  sac=%s  cm=%.2f  stop=$%.4f  tp=$%.4f",
@@ -2303,7 +2311,8 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         # LEDGER-6 / EXIT-07: one atomic booking (cash, realised stats,
         # position, journal, trade row); an exception rolls it all back, so
         # the retry cannot credit margin + PnL twice and the order stays
-        # non-terminal.
+        # non-terminal. DB writes only inside: no logging, alerts or brain calls.
+        _partial = shares < pos_shares * (1.0 - 1e-9)
         with transaction():
             # Fix 1 — DYNAMIC MARGIN REFUND (short side): already read cash fresh
             # here in the original code — unaffected by the C4 split.
@@ -2315,14 +2324,10 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
                 "realised_pnl_net",
                 float(get_portfolio_stat("realised_pnl_net", "0.0")) + net_pnl,
             )
-            if shares >= pos_shares * (1.0 - 1e-9):
+            if not _partial:
                 close_short(symbol)
             else:
                 reduce_position(symbol, shares, margin_released=margin_res)
-                log.warning(
-                    "COVER %s PARTIAL fill %.8f of %.8f — %.8f remains open",
-                    symbol, shares, pos_shares, pos_shares - shares,
-                )
             if _journaled:
                 update_order(_coid, state=fill.status, filled_qty=shares,
                              avg_fill_price=exec_price,
@@ -2347,6 +2352,11 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             })
             log_trade(trade_rec)
 
+        if _partial:
+            log.warning(
+                "COVER %s PARTIAL fill %.8f of %.8f — %.8f remains open",
+                symbol, shares, pos_shares, pos_shares - shares,
+            )
         alert_sniper_shot(
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )

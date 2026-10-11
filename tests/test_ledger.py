@@ -200,6 +200,98 @@ def test_cover_failing_mid_booking_rolls_back_everything(fresh, monkeypatch):
     assert fresh.get_cash() == pytest.approx(before["cash"] + margin + net, rel=1e-9)
 
 
+def test_real_cover_books_in_one_transaction_nothing_mocked(fresh):
+    """Every helper inside the booking joins the transaction's connection: a
+    helper opening its own connection would block on BEGIN IMMEDIATE and fail
+    with 'database is locked'. Runs in a worker thread, as run_in_executor does."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    short = _open_short_via_bot(candles)
+    cov = _ensemble("cover", candles[-1]["close"] * 0.95, symbol="QFUSDT")
+    prepared = bot._prepare_trade(cov, "QF", candles, None, ZERO_STATE, STARTING_CASH)
+    fill = bot._exec_adapter.execute(prepared.order_intent)
+    coid = prepared.order_intent.client_order_id
+    cash_before = fresh.get_cash()
+
+    def commit_and_report():
+        bot._commit_trade(prepared, fill)
+        return getattr(fresh._local, "tx_depth", 0), fresh._get_conn().in_transaction
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        depth, open_tx = pool.submit(commit_and_report).result(timeout=15)
+    assert (depth, open_tx) == (0, False)               # committed, nothing left open
+
+    other = sqlite3.connect(str(config.DB_PATH), timeout=5.0)  # sees committed state only
+    try:
+        stat = dict(other.execute("SELECT key, value FROM portfolio").fetchall())
+        n_pos = other.execute("SELECT COUNT(*) FROM positions"
+                              " WHERE shares > 0 OR margin_reserved > 0").fetchone()[0]
+        order_state = other.execute("SELECT state FROM orders WHERE client_order_id=?",
+                                    (coid,)).fetchone()[0]
+        cover_rows = other.execute(
+            "SELECT net_pnl FROM trades WHERE action='cover' AND status='filled'").fetchall()
+    finally:
+        other.close()
+    net = float(stat["realised_pnl_net"])
+    assert n_pos == 0 and order_state == "FILLED"
+    assert len(cover_rows) == 1 and cover_rows[0][0] == pytest.approx(round(net, 2))
+    assert float(stat["cash"]) == pytest.approx(
+        cash_before + short["margin_reserved"] + net, rel=1e-9)
+    assert stat["total_trades"] == "2"
+
+
+def test_no_logging_alerts_or_brain_calls_inside_booking_transaction(fresh, monkeypatch):
+    """Keep the write lock short: log I/O, alerts and brain calls run after commit."""
+    from execution.base import Fill
+
+    depths = []
+    seen = lambda tag: depths.append((tag, getattr(fresh._local, "tx_depth", 0)))  # noqa: E731
+
+    class _Probe(logging.Handler):
+        def emit(self, record):
+            seen(f"log:{record.getMessage()[:60]}")
+
+    probe = _Probe(level=logging.DEBUG)
+    bot.log.addHandler(probe)
+    monkeypatch.setattr(bot, "alert_sniper_shot", lambda *a, **k: seen("alert"))
+    real_reward = bot.brain.reward
+    monkeypatch.setattr(bot.brain, "reward", lambda *a, **k: (seen("reward"), real_reward(*a, **k))[1])
+
+    class PartialAdapter:
+        name = "paper"
+
+        def execute(self, intent):
+            return Fill(status="PARTIALLY_FILLED", qty=intent.qty * 0.5,
+                        price=intent.limit_price, note="partial")
+
+    paper = bot._exec_adapter
+    try:
+        # Partial exit fill (PARTIAL warning).
+        monkeypatch.setattr(bot, "_exec_adapter", PartialAdapter())
+        fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
+        fresh.set_cash(STARTING_CASH - 200.0)
+        bot._execute_trade(_ensemble("sell", 110.0), "TEST",
+                           make_candles(n=120, start_price=110.0), None,
+                           ZERO_STATE, STARTING_CASH)
+        monkeypatch.setattr(bot, "_exec_adapter", paper)
+
+        # Duplicate short filled but blocked from booking (CRITICAL).
+        candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+        ens = _ensemble("short", candles[-1]["close"], symbol="QFUSDT", ml_prob=0.03)
+        prepared = bot._prepare_trade(ens, "QF", candles, 0.5, ENTRY_STATE, STARTING_CASH)
+        fill = bot._exec_adapter.execute(prepared.order_intent)
+        fresh.open_short("QFUSDT", 1.0, 100.0, "QF", 105.0, 95.0, margin_reserved=20.0)
+        bot._commit_trade(prepared, fill)
+    finally:
+        bot.log.removeHandler(probe)
+
+    tags = [t for t, _ in depths]
+    assert any("PARTIAL" in t for t in tags) and any("BLOCKED" in t for t in tags)
+    assert "alert" in tags and "reward" in tags
+    assert [d for d in depths if d[1] != 0] == []
+
+
 def test_sell_failing_mid_booking_rolls_back_everything(fresh, monkeypatch):
     candles = make_candles(n=120, start_price=110.0, amplitude=0.4)
     fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0)
