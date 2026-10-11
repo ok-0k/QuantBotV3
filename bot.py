@@ -105,7 +105,7 @@ from risk_engine import (
 )
 from db import (
     close_position, delete_position, get_all_positions, get_candles, get_cash,
-    get_entry_state, get_portfolio_stat, increment_candle_count, transaction,
+    get_portfolio_stat, increment_candle_count, transaction,
     init_db, load_brain_key, log_trade, log_rl_experience,
     open_position, open_position_count,
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
@@ -1950,6 +1950,29 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
     raw_price     = prepared.order_intent.ref_price
     exec_price    = prepared.order_intent.limit_price
 
+    def _rl_entry() -> tuple[Optional[np.ndarray], float]:
+        """
+        (state, action) at entry of the position being closed, for the RL
+        transition (logging only: brain.reward does not use them). Read from
+        the snapshot _prepare_trade loaded, because close_position/close_short
+        have deleted the row by then; re-reading it logged zeros (ENTRY-09).
+        """
+        pos_snap = prepared.pos or {}
+        state = pre_state
+        try:
+            raw = pos_snap.get("entry_state")
+            stored = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(stored, list) and stored:
+                state = np.array(stored, dtype=np.float32)
+        except (TypeError, ValueError):
+            pass
+        try:
+            feats = json.loads(pos_snap.get("entry_features") or "{}")
+            entry_action = float(feats.get("sac_fraction") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            entry_action = 0.0
+        return state, entry_action
+
     if action == "buy":
         if not fill.executed:
             update_order(_coid, state=fill.status if fill.status in
@@ -2095,11 +2118,11 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             })
             log_trade(trade_rec)
 
-        stored_entry_state = get_entry_state(symbol)
-        entry_state_arr = np.array(stored_entry_state, dtype=np.float32) if stored_entry_state is not None else pre_state
-
+        entry_state_arr, entry_action = _rl_entry()
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(
+            symbol, candles, new_cash, 0.0, _compute_total_equity(new_cash, get_all_positions()),
+        )
 
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, cost)
         if 0.0 < net_pnl < MICRO_WIN_USD:
@@ -2108,7 +2131,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         brain.reward(
             strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
             state=entry_state_arr,
-            action=sac_fraction if sac_fraction is not None else 0.0,
+            action=entry_action,
             next_state=exit_state, trade_value=cost, side="long",
         )
         _persist_adaptive_edge_profiles()
@@ -2126,7 +2149,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             log_rl_experience(
                 symbol=symbol,
                 state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
-                action=float(sac_fraction) if sac_fraction is not None else 0.0,
+                action=entry_action,
                 reward=float(shaped_reward),
                 next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
                 done=True,
@@ -2328,13 +2351,11 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             symbol, f"cover (Net: ${net_pnl:.2f})", exec_price, pos.get("strategy", strategy_name)
         )
 
-        stored_entry_state = get_entry_state(symbol)
-        entry_state_arr = (
-            np.array(stored_entry_state, dtype=np.float32)
-            if stored_entry_state is not None else pre_state
-        )
+        entry_state_arr, entry_action = _rl_entry()
         new_cash = get_cash()
-        exit_state = brain.compute_sac_state(symbol, candles, new_cash, 0.0, new_cash)
+        exit_state = brain.compute_sac_state(
+            symbol, candles, new_cash, 0.0, _compute_total_equity(new_cash, get_all_positions()),
+        )
 
         hold_candles = pos.get("candle_count", 1)
         shaped_reward = _shaped_reward_v2(pnl_gross, hold_candles, entry_cost)
@@ -2344,7 +2365,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
         brain.reward(
             strategy_name=pos.get("strategy", strategy_name), pnl=shaped_reward, regime=regime,
             state=entry_state_arr,
-            action=sac_fraction if sac_fraction is not None else 0.0,
+            action=entry_action,
             next_state=exit_state, trade_value=entry_cost, side="short",
         )
         _persist_adaptive_edge_profiles()
@@ -2358,7 +2379,7 @@ def _commit_trade(prepared: _PreparedTrade, fill) -> None:
             log_rl_experience(
                 symbol=symbol,
                 state=entry_state_arr.tolist() if entry_state_arr is not None else [0.0] * 13,
-                action=float(sac_fraction) if sac_fraction is not None else 0.0,
+                action=entry_action,
                 reward=float(shaped_reward),
                 next_state=exit_state.tolist() if exit_state is not None else [0.0] * 13,
                 done=True,

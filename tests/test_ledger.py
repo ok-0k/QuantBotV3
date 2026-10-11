@@ -89,6 +89,45 @@ def _book(db):
     }
 
 
+# ── RL experience logging (LEDGER-9 / ENTRY-09 / EXIT-04) ────────────────────
+
+def test_cover_rl_row_uses_stored_entry_state_and_action(fresh):
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    _open_short_via_bot(candles, sac=0.5)
+    # Another open short so total equity != cash (next_state must use equity).
+    fresh.open_short("LEDGERXUSDT", 1.0, 40.0, "QF", 44.0, 36.0, margin_reserved=8.0)
+    fresh.set_cash(fresh.get_cash() - 8.0)
+
+    cov = _ensemble("cover", candles[-1]["close"] * 0.95, symbol="QFUSDT")
+    bot._execute_trade(cov, "QF", candles, None, ZERO_STATE, STARTING_CASH)
+
+    rows = _rl_rows(fresh)
+    assert len(rows) == 1
+    assert json.loads(rows[0]["state"]) == pytest.approx(ENTRY_STATE.tolist())
+    assert rows[0]["action"] == pytest.approx(0.5)
+    cash = fresh.get_cash()
+    next_state = json.loads(rows[0]["next_state"])
+    assert next_state[1] == pytest.approx(cash / (cash + 8.0), rel=1e-5)
+
+
+def test_sell_rl_row_uses_stored_entry_state_and_action(fresh):
+    candles = make_candles(n=120, start_price=110.0, amplitude=0.4)
+    fresh.open_position("AAAUSDT", 2.0, 100.0, "TEST", 95.0, 130.0,
+                        entry_state=ENTRY_STATE.tolist())
+    with fresh.get_db() as conn:
+        conn.execute("UPDATE positions SET entry_features=? WHERE symbol='AAAUSDT'",
+                     (json.dumps({"sac_fraction": 0.3}),))
+    fresh.set_cash(STARTING_CASH - 200.0)
+
+    bot._execute_trade(_ensemble("sell", 110.0), "TEST", candles, None,
+                       ZERO_STATE, STARTING_CASH)
+
+    rows = _rl_rows(fresh)
+    assert len(rows) == 1
+    assert json.loads(rows[0]["state"]) == pytest.approx(ENTRY_STATE.tolist())
+    assert rows[0]["action"] == pytest.approx(0.3)
+
+
 # ── db.transaction() (LEDGER-6) ──────────────────────────────────────────────
 
 def test_nested_get_db_inside_transaction_does_not_commit_early(fresh):
