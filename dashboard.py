@@ -746,21 +746,49 @@ def _parse_equity_ts(ts_str: str) -> datetime.datetime:
     return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
-async def _sse_generator(request: Request) -> AsyncGenerator:
-    while True:
-        if await request.is_disconnected():
-            break
+# ── Shared telemetry builder ──────────────────────────────────────────────────
+# One build per interval, off the event loop, fanned out to every SSE client
+# (was: a blocking ~0.35 s build per client every SSE_HEARTBEAT_SECS). Runs
+# only while at least one client is connected; bot data changes every 30-60 s.
+TELEMETRY_INTERVAL_SECS = max(5.0, float(SSE_HEARTBEAT_SECS))
+_SSE_POLL_SECS = 0.5
+_telemetry: dict[str, Any] = {"payload": None, "seq": 0, "clients": 0}
+_builder_task: asyncio.Task | None = None
+
+
+async def _telemetry_builder() -> None:
+    while _telemetry["clients"] > 0:
         try:
-            data = _build_telemetry()
+            data = await asyncio.to_thread(_build_telemetry)
             # Strip heavy curve arrays from SSE — served by dedicated endpoints
             # so SSE payloads stay small and don't clobber the user's TF selection.
             data["equity_curve"] = []
             data["equity_tf"]    = None
             data["cash_curve"]   = []  # served by /api/cash
-            yield {"event": "update", "data": json.dumps(data)}
+            _telemetry["payload"] = {"event": "update", "data": json.dumps(data)}
         except Exception as exc:
-            yield {"event": "error", "data": json.dumps({"error": str(exc)})}
-        await asyncio.sleep(SSE_HEARTBEAT_SECS)
+            _telemetry["payload"] = {"event": "error", "data": json.dumps({"error": str(exc)})}
+        _telemetry["seq"] += 1
+        await asyncio.sleep(TELEMETRY_INTERVAL_SECS)
+    _telemetry["payload"] = None       # never serve a stale build to the next client
+
+
+async def _sse_generator(request: Request) -> AsyncGenerator:
+    global _builder_task
+    _telemetry["clients"] += 1
+    if _builder_task is None or _builder_task.done():
+        _builder_task = asyncio.get_running_loop().create_task(_telemetry_builder())
+    seen = -1
+    try:
+        while True:
+            if await request.is_disconnected():
+                break
+            if _telemetry["payload"] is not None and _telemetry["seq"] != seen:
+                seen = _telemetry["seq"]
+                yield _telemetry["payload"]
+            await asyncio.sleep(_SSE_POLL_SECS)
+    finally:
+        _telemetry["clients"] -= 1
 
 
 @app.get("/stream")
@@ -770,13 +798,13 @@ async def stream(request: Request):
 
 @app.get("/api/data")
 async def api_data():
-    return _build_telemetry()
+    return await asyncio.to_thread(_build_telemetry)
 
 
 @app.get("/api/equity")
 async def api_equity(tf: str = "24H"):
     """Lightweight endpoint for equity curve timeframe switching."""
-    data = _build_telemetry(equity_tf=tf.upper())
+    data = await asyncio.to_thread(_build_telemetry, tf.upper())
     return JSONResponse({"equity_curve": data["equity_curve"], "equity_tf": data["equity_tf"]})
 
 

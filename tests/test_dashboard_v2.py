@@ -313,3 +313,39 @@ def test_ticker_change_is_1h_from_candles_not_frozen_prev_price(clean_db):
     assert prices[A_SYM.replace("USDT", "")] == pytest.approx(10.0)
     assert prices[B_SYM.replace("USDT", "")] is None
     assert "1h</span>" in dashboard.DASHBOARD_HTML
+
+
+# ── SSE: one shared background build fanned out to all clients (DASH-2) ──────
+
+def test_sse_clients_share_one_background_build(monkeypatch):
+    import threading
+    calls = []
+
+    def fake_build(equity_tf=None):
+        calls.append(threading.get_ident())
+        return {"portfolio": {"n": len(calls)}, "equity_curve": [1], "cash_curve": [1], "equity_tf": "24H"}
+
+    monkeypatch.setattr(dashboard, "_build_telemetry", fake_build)
+    monkeypatch.setattr(dashboard, "TELEMETRY_INTERVAL_SECS", 60)
+    monkeypatch.setattr(dashboard, "_SSE_POLL_SECS", 0.01)
+    monkeypatch.setattr(dashboard, "_telemetry", {"payload": None, "seq": 0, "clients": 0})
+    monkeypatch.setattr(dashboard, "_builder_task", None)
+
+    class Req:
+        async def is_disconnected(self):
+            return False
+
+    async def main():
+        gens = [dashboard._sse_generator(Req()) for _ in range(3)]
+        firsts = await asyncio.gather(*(g.__anext__() for g in gens))
+        clients = dashboard._telemetry["clients"]
+        for g in gens:
+            await g.aclose()
+        return firsts, clients
+
+    firsts, clients = asyncio.run(main())
+    assert clients == 3 and dashboard._telemetry["clients"] == 0
+    assert len(calls) == 1 and calls[0] != threading.get_ident()      # one build, off the event loop
+    assert firsts[0] == firsts[1] == firsts[2]
+    data = json.loads(firsts[0]["data"])
+    assert data["equity_curve"] == [] and data["cash_curve"] == [] and data["equity_tf"] is None
