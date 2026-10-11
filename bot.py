@@ -262,6 +262,7 @@ _entry_block_journaled: dict[tuple[str, str], float] = {}
 # yet in this process); drives the one-time "entries halted" warning.
 _cb_last_open: Optional[bool] = None
 _ws_heartbeat_last: float = 0.0     # epoch of the last ws_last_msg write (throttled)
+_no_candle_warned: dict[str, float] = {}   # exit_monitor: last 'no candles' warning per symbol
 # V3 tick path: the stop stored when each 1m candle was first seen, per position:
 # sym -> ((opened_ts, candle open time), stop). See _tick_exit_check.
 _tick_minute_stop:  dict[str, tuple] = {}
@@ -2649,6 +2650,216 @@ def _execute_trade(
 
 # ── Periodic exit monitor ─────────────────────────────────────────────────────
 
+async def _monitor_position(pos: dict, loop: asyncio.AbstractEventLoop) -> None:
+    """One open position's checks for an exit_monitor cycle: decay, candle
+    count, excursions, survival / stop / take-profit / 4h exit, and the exit
+    itself. exit_monitor isolates each call, so one bad row or a transient
+    sqlite error can't stop the other positions' checks."""
+    sym = pos["symbol"]
+
+    # ── FIX 2: ZOMBIE SHELL GUARD ─────────────────────────────────────
+    # _seed_portfolio() inserts placeholder rows with shares=0 for every
+    # symbol at first boot.  If any of those rows slip through the
+    # get_all_positions() WHERE filter (float precision, race condition,
+    # or schema migration edge case), they must be nuked here before any
+    # math runs on them — bad shares values cause division-by-zero and
+    # phantom PnL that corrupts the cash balance.
+    _pos_shares = float(pos.get("shares") or 0.0)
+    if _pos_shares <= 0.0:
+        log.warning(
+            "ZOMBIE SHELL detected for %s (shares=%s, margin=%s) — hard-deleting row",
+            sym, pos.get("shares"), pos.get("margin_reserved"),
+        )
+        try:
+            delete_position(sym)
+        except Exception as _z_exc:
+            log.error("Failed to delete zombie position %s: %s", sym, _z_exc)
+        return
+    # ── END ZOMBIE GUARD ──────────────────────────────────────────────
+
+    candles = _candles_cache.get(sym)
+    if not candles:
+        if time.time() - _no_candle_warned.get(sym, 0.0) > 600:
+            _no_candle_warned[sym] = time.time()
+            log.warning("exit_monitor: open position %s has no candle data yet — "
+                        "monitor checks skipped until candles arrive", sym)
+        return
+
+    if V3_FIXES:
+        # The cycle-start snapshot predates the margin-refresh await and
+        # the earlier symbols' exits: the tick path may have moved this
+        # stop (trail / break-even) or closed the position since. Decay
+        # must start from the levels stored now.
+        pos = _open_pos(sym)
+        if not pos:
+            return
+    _apply_ml_time_decay(sym, pos, candles)
+    if V3_FIXES:
+        # The exit checks below use the levels as stored after decay.
+        pos = _open_pos(sym) or pos
+
+    current_price = candles[-1]["close"]
+    count = increment_candle_count(sym)
+    stop = pos.get("stop_price", 0)
+    tp = pos.get("tp_price",   float("inf"))
+
+    reason:   Optional[str] = None
+    is_short = pos.get("side", "long") == "short"
+
+    # ── MFE / MAE RATCHET (every monitor cycle, ~30 s) ────────────────
+    # Uses the last full candle's high/low rather than tick close, so
+    # intra-bar excursions are captured even if no exit fires this cycle.
+    try:
+        _last_c = candles[-1]
+        update_mfe_mae(
+            sym,
+            float(_last_c.get("high", current_price)),
+            float(_last_c.get("low",  current_price)),
+            is_short,
+        )
+    except Exception as _mfe_exc:
+        log.debug("MFE/MAE update skipped for %s: %s", sym, _mfe_exc)
+    # ── END MFE / MAE RATCHET ─────────────────────────────────────────
+
+    # ── SURVIVAL KILL-SWITCH (Upgrade 1) ──────────────────────────────
+    # Evaluated first — bypasses every downstream gate including the fee
+    # gate.  _exit_in_flight and _trade_lock are still acquired below to
+    # preserve DB atomicity; we just don't skip on a hard-loss position.
+    _open_pnl_m = _hard_stop_open_pnl(pos, current_price)
+    if _open_pnl_m < HARD_STOP_LOSS_USD:
+        reason = (
+            f"hard_stop_survival "
+            f"(open_pnl=${_open_pnl_m:.2f} < floor=${HARD_STOP_LOSS_USD:.2f})"
+        )
+        log.critical(
+            "⚠ SURVIVAL KILL-SWITCH (monitor) %s — open_pnl=$%.2f < $%.2f — "
+            "bypassing all gates",
+            sym, _open_pnl_m, HARD_STOP_LOSS_USD,
+        )
+    # ── END SURVIVAL KILL-SWITCH ──────────────────────────────────────
+
+    if not reason:
+        if not is_short:
+            if stop > 0 and current_price <= stop:
+                reason = f"stop_loss (${current_price:,.4f} <= ${stop:,.4f})"
+            elif tp < float("inf") and current_price >= tp:
+                reason = f"take_profit (${current_price:,.4f} >= ${tp:,.4f})"
+        else:
+            if stop > 0 and current_price >= stop:
+                reason = f"stop_loss_short (${current_price:,.4f} >= ${stop:,.4f})"
+            elif tp < float("inf") and current_price <= tp:
+                reason = f"take_profit_short (${current_price:,.4f} <= ${tp:,.4f})"
+
+        # ── TIME-FREEZE FIX (Upgrade 2) ───────────────────────────────
+        # candle_count freezes when the WS drops and no bars close.
+        # Use wall-clock time from opened_ts as a second independent timer.
+        # Only closes losing positions — winners are left to trail/TP.
+        if not reason:
+            _opened_ts_raw = pos.get("opened_ts") or ""
+            _open_secs = 0.0
+            if _opened_ts_raw:
+                try:
+                    _opened_dt = datetime.fromisoformat(
+                        _opened_ts_raw.replace("Z", "+00:00")
+                    )
+                    _open_secs = time.time() - _opened_dt.timestamp()
+                except Exception:
+                    _open_secs = 0.0
+            if _open_secs >= MAX_HOLD_OPEN_SECONDS and _open_pnl_m < 0:
+                reason = (
+                    f"time_hold_exit "
+                    f"({_open_secs / 3600:.1f}h open, in_red=${_open_pnl_m:.2f})"
+                )
+                log.warning(
+                    "TIME-FREEZE EXIT %s — held %.1fh, open PnL=$%.2f < 0",
+                    sym, _open_secs / 3600, _open_pnl_m,
+                )
+        # ── END TIME-FREEZE FIX ───────────────────────────────────────
+
+        if not reason and ENABLE_HARD_MAX_HOLD_EXIT and count >= MAX_HOLD_CANDLES:
+            reason = f"max_hold_time ({count} candles)"
+
+    # ── FEE-BLEED GATE (monitor path) ─────────────────────────────────
+    # Take-profit exits are held until they would book a positive net
+    # (exit slippage + round-trip fee). Stops of every kind always fire
+    # — see the tick-path gate for why trailed stops are not gated.
+    _fee_gate_applies = reason and not any(
+        k in reason for k in (
+            "hard_stop_survival", "time_hold_exit", "max_hold_time",
+        )
+    )
+    if _fee_gate_applies:
+        _avg_cost_m = float(pos.get("avg_cost", 0.0))
+        _shares_m   = float(pos.get("shares", 0.0))
+        if "take_profit" in reason:
+            if not _profit_clears_fees(_avg_cost_m, _shares_m, current_price, is_short):
+                log.info(
+                    "FEE GATE blocked %s for %s — net after %.2f%% fees + %.2f%% exit slippage would be <= 0",
+                    reason, sym, FEE_GATE_ROUND_TRIP * 100, SLIPPAGE_PCT * 100,
+                )
+                reason = None
+    # ── END FEE-BLEED GATE ────────────────────────────────────────────
+
+    if reason:
+        log.info("EXIT %s - %s", sym, reason)
+        fake_ensemble = {
+            "signal":             "cover" if is_short else "sell",
+            "exit_reason":        _classify_exit_reason(
+                reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short,
+                _initial_stop(pos)),
+            "exit_detail":        _exit_detail(reason, sym, current_price),
+            "symbol":             sym,
+            "price":              current_price,
+            "regime":             brain.current_regime,
+            "position_regime":    _position_regime(pos),
+            "on_fire":            False,
+            "position_size_mult": 1.0,
+            "buy_weight":         0.0,
+            "sell_weight":        0.0,
+            "breakdown":          [],
+            "time":               _now(),
+        }
+        # Fix #5: strict commit ordering + cash lock (matches tick exit / evaluate).
+        # Fix #19: one bad exit must never take down the whole 24/7 process.
+        # exit_monitor is awaited directly inside main()'s asyncio.gather (not
+        # via create_task like the tick/evaluate paths), so an uncaught exception
+        # here previously propagated all the way out and killed every symbol's
+        # risk monitoring, not just this one.
+        # Fix C4: _trade_lock(sym) outermost, _strict_execution_lock released
+        # around the exchange call — see _tick_exit_check for the full rationale.
+        try:
+            prepared = None
+            async with _trade_lock(sym):
+                async with _strict_execution_lock:
+                    cash = get_cash()
+                    open_pos = get_all_positions()
+                    total_eq = _compute_total_equity(cash, open_pos)
+                    prepared = await loop.run_in_executor(
+                        None, _prepare_trade, fake_ensemble,
+                        pos.get("strategy", "EXIT"), candles,
+                        # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
+                        None,
+                        np.zeros(13, dtype=np.float32),
+                        total_eq,
+                        None,
+                    )
+                if prepared is not None:
+                    fill = await loop.run_in_executor(
+                        None, _exec_adapter.execute, prepared.order_intent,
+                    )
+                    async with _strict_execution_lock:
+                        async with _cash_lock:
+                            await loop.run_in_executor(None, _commit_trade, prepared, fill)
+        except Exception:
+            log.error(
+                "exit_monitor: trade execution failed for %s (%s) — "
+                "position left open, will retry next cycle",
+                sym, reason, exc_info=True,
+            )
+            return
+
+
+
 async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
     while not _shutdown_event.is_set():
         try:
@@ -2657,9 +2868,16 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
         except asyncio.TimeoutError:
             pass
 
-        positions = get_all_positions()
-        cash_m = get_cash()
-        te_m = _compute_total_equity(cash_m, positions)
+        # Every step is guarded: an exception here used to kill the monitor
+        # (and with it the 4h exit, equity snapshots and the breaker) for the
+        # rest of the run.
+        try:
+            positions = get_all_positions()
+            cash_m = get_cash()
+            te_m = _compute_total_equity(cash_m, positions)
+        except Exception:
+            log.exception("exit_monitor: position snapshot failed — skipping this cycle")
+            continue
         try:
             async with aiohttp.ClientSession() as _s:
                 await _refresh_margin_health(_s, cash_m, te_m)
@@ -2667,212 +2885,24 @@ async def exit_monitor(loop: asyncio.AbstractEventLoop) -> None:
             log.warning("margin refresh: %s", exc)
 
         for pos in positions:
-            sym = pos["symbol"]
-
-            # ── FIX 2: ZOMBIE SHELL GUARD ─────────────────────────────────────
-            # _seed_portfolio() inserts placeholder rows with shares=0 for every
-            # symbol at first boot.  If any of those rows slip through the
-            # get_all_positions() WHERE filter (float precision, race condition,
-            # or schema migration edge case), they must be nuked here before any
-            # math runs on them — bad shares values cause division-by-zero and
-            # phantom PnL that corrupts the cash balance.
-            _pos_shares = float(pos.get("shares") or 0.0)
-            if _pos_shares <= 0.0:
-                log.warning(
-                    "ZOMBIE SHELL detected for %s (shares=%s, margin=%s) — hard-deleting row",
-                    sym, pos.get("shares"), pos.get("margin_reserved"),
-                )
-                try:
-                    delete_position(sym)
-                except Exception as _z_exc:
-                    log.error("Failed to delete zombie position %s: %s", sym, _z_exc)
-                continue
-            # ── END ZOMBIE GUARD ──────────────────────────────────────────────
-
-            candles = _candles_cache.get(sym)
-            if not candles:
-                continue
-
-            if V3_FIXES:
-                # The cycle-start snapshot predates the margin-refresh await and
-                # the earlier symbols' exits: the tick path may have moved this
-                # stop (trail / break-even) or closed the position since. Decay
-                # must start from the levels stored now.
-                pos = _open_pos(sym)
-                if not pos:
-                    continue
-            _apply_ml_time_decay(sym, pos, candles)
-            if V3_FIXES:
-                # The exit checks below use the levels as stored after decay.
-                pos = _open_pos(sym) or pos
-
-            current_price = candles[-1]["close"]
-            count = increment_candle_count(sym)
-            stop = pos.get("stop_price", 0)
-            tp = pos.get("tp_price",   float("inf"))
-
-            reason:   Optional[str] = None
-            is_short = pos.get("side", "long") == "short"
-
-            # ── MFE / MAE RATCHET (every monitor cycle, ~30 s) ────────────────
-            # Uses the last full candle's high/low rather than tick close, so
-            # intra-bar excursions are captured even if no exit fires this cycle.
             try:
-                _last_c = candles[-1]
-                update_mfe_mae(
-                    sym,
-                    float(_last_c.get("high", current_price)),
-                    float(_last_c.get("low",  current_price)),
-                    is_short,
-                )
-            except Exception as _mfe_exc:
-                log.debug("MFE/MAE update skipped for %s: %s", sym, _mfe_exc)
-            # ── END MFE / MAE RATCHET ─────────────────────────────────────────
+                await _monitor_position(pos, loop)
+            except Exception:
+                log.exception("exit_monitor: %s failed this cycle — continuing with the others",
+                              pos.get("symbol"))
 
-            # ── SURVIVAL KILL-SWITCH (Upgrade 1) ──────────────────────────────
-            # Evaluated first — bypasses every downstream gate including the fee
-            # gate.  _exit_in_flight and _trade_lock are still acquired below to
-            # preserve DB atomicity; we just don't skip on a hard-loss position.
-            _open_pnl_m = _hard_stop_open_pnl(pos, current_price)
-            if _open_pnl_m < HARD_STOP_LOSS_USD:
-                reason = (
-                    f"hard_stop_survival "
-                    f"(open_pnl=${_open_pnl_m:.2f} < floor=${HARD_STOP_LOSS_USD:.2f})"
-                )
-                log.critical(
-                    "⚠ SURVIVAL KILL-SWITCH (monitor) %s — open_pnl=$%.2f < $%.2f — "
-                    "bypassing all gates",
-                    sym, _open_pnl_m, HARD_STOP_LOSS_USD,
-                )
-            # ── END SURVIVAL KILL-SWITCH ──────────────────────────────────────
+        try:
+            # Fix #6: use shared helper for equity snapshot
+            cash = get_cash()
+            all_pos = get_all_positions()
+            eq = _compute_total_equity(cash, all_pos)
+            record_equity(round(eq, 2))
+            brain.check_circuit_breaker(eq)
+            _note_circuit_breaker_state()
+            set_portfolio_stat("exit_monitor_last_cycle", _now())
+        except Exception:
+            log.exception("exit_monitor: equity / circuit-breaker step failed this cycle")
 
-            if not reason:
-                if not is_short:
-                    if stop > 0 and current_price <= stop:
-                        reason = f"stop_loss (${current_price:,.4f} <= ${stop:,.4f})"
-                    elif tp < float("inf") and current_price >= tp:
-                        reason = f"take_profit (${current_price:,.4f} >= ${tp:,.4f})"
-                else:
-                    if stop > 0 and current_price >= stop:
-                        reason = f"stop_loss_short (${current_price:,.4f} >= ${stop:,.4f})"
-                    elif tp < float("inf") and current_price <= tp:
-                        reason = f"take_profit_short (${current_price:,.4f} <= ${tp:,.4f})"
-
-                # ── TIME-FREEZE FIX (Upgrade 2) ───────────────────────────────
-                # candle_count freezes when the WS drops and no bars close.
-                # Use wall-clock time from opened_ts as a second independent timer.
-                # Only closes losing positions — winners are left to trail/TP.
-                if not reason:
-                    _opened_ts_raw = pos.get("opened_ts") or ""
-                    _open_secs = 0.0
-                    if _opened_ts_raw:
-                        try:
-                            _opened_dt = datetime.fromisoformat(
-                                _opened_ts_raw.replace("Z", "+00:00")
-                            )
-                            _open_secs = time.time() - _opened_dt.timestamp()
-                        except Exception:
-                            _open_secs = 0.0
-                    if _open_secs >= MAX_HOLD_OPEN_SECONDS and _open_pnl_m < 0:
-                        reason = (
-                            f"time_hold_exit "
-                            f"({_open_secs / 3600:.1f}h open, in_red=${_open_pnl_m:.2f})"
-                        )
-                        log.warning(
-                            "TIME-FREEZE EXIT %s — held %.1fh, open PnL=$%.2f < 0",
-                            sym, _open_secs / 3600, _open_pnl_m,
-                        )
-                # ── END TIME-FREEZE FIX ───────────────────────────────────────
-
-                if not reason and ENABLE_HARD_MAX_HOLD_EXIT and count >= MAX_HOLD_CANDLES:
-                    reason = f"max_hold_time ({count} candles)"
-
-            # ── FEE-BLEED GATE (monitor path) ─────────────────────────────────
-            # Take-profit exits are held until they would book a positive net
-            # (exit slippage + round-trip fee). Stops of every kind always fire
-            # — see the tick-path gate for why trailed stops are not gated.
-            _fee_gate_applies = reason and not any(
-                k in reason for k in (
-                    "hard_stop_survival", "time_hold_exit", "max_hold_time",
-                )
-            )
-            if _fee_gate_applies:
-                _avg_cost_m = float(pos.get("avg_cost", 0.0))
-                _shares_m   = float(pos.get("shares", 0.0))
-                if "take_profit" in reason:
-                    if not _profit_clears_fees(_avg_cost_m, _shares_m, current_price, is_short):
-                        log.info(
-                            "FEE GATE blocked %s for %s — net after %.2f%% fees + %.2f%% exit slippage would be <= 0",
-                            reason, sym, FEE_GATE_ROUND_TRIP * 100, SLIPPAGE_PCT * 100,
-                        )
-                        reason = None
-            # ── END FEE-BLEED GATE ────────────────────────────────────────────
-
-            if reason:
-                log.info("EXIT %s - %s", sym, reason)
-                fake_ensemble = {
-                    "signal":             "cover" if is_short else "sell",
-                    "exit_reason":        _classify_exit_reason(
-                        reason, float(pos.get("avg_cost") or 0.0), float(stop or 0.0), is_short,
-                        _initial_stop(pos)),
-                    "exit_detail":        _exit_detail(reason, sym, current_price),
-                    "symbol":             sym,
-                    "price":              current_price,
-                    "regime":             brain.current_regime,
-                    "position_regime":    _position_regime(pos),
-                    "on_fire":            False,
-                    "position_size_mult": 1.0,
-                    "buy_weight":         0.0,
-                    "sell_weight":        0.0,
-                    "breakdown":          [],
-                    "time":               _now(),
-                }
-                # Fix #5: strict commit ordering + cash lock (matches tick exit / evaluate).
-                # Fix #19: one bad exit must never take down the whole 24/7 process.
-                # exit_monitor is awaited directly inside main()'s asyncio.gather (not
-                # via create_task like the tick/evaluate paths), so an uncaught exception
-                # here previously propagated all the way out and killed every symbol's
-                # risk monitoring, not just this one.
-                # Fix C4: _trade_lock(sym) outermost, _strict_execution_lock released
-                # around the exchange call — see _tick_exit_check for the full rationale.
-                try:
-                    prepared = None
-                    async with _trade_lock(sym):
-                        async with _strict_execution_lock:
-                            cash = get_cash()
-                            open_pos = get_all_positions()
-                            total_eq = _compute_total_equity(cash, open_pos)
-                            prepared = await loop.run_in_executor(
-                                None, _prepare_trade, fake_ensemble,
-                                pos.get("strategy", "EXIT"), candles,
-                                # sac_fraction=None -> 2% fallback (exit sizing irrelevant)
-                                None,
-                                np.zeros(13, dtype=np.float32),
-                                total_eq,
-                                None,
-                            )
-                        if prepared is not None:
-                            fill = await loop.run_in_executor(
-                                None, _exec_adapter.execute, prepared.order_intent,
-                            )
-                            async with _strict_execution_lock:
-                                async with _cash_lock:
-                                    await loop.run_in_executor(None, _commit_trade, prepared, fill)
-                except Exception:
-                    log.error(
-                        "exit_monitor: trade execution failed for %s (%s) — "
-                        "position left open, will retry next cycle",
-                        sym, reason, exc_info=True,
-                    )
-                    continue
-
-        # Fix #6: use shared helper for equity snapshot
-        cash = get_cash()
-        all_pos = get_all_positions()
-        eq = _compute_total_equity(cash, all_pos)
-        record_equity(round(eq, 2))
-        brain.check_circuit_breaker(eq)
-        _note_circuit_breaker_state()
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────

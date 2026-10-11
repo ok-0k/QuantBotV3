@@ -119,3 +119,47 @@ def test_crash_loop_backoff_sleeps_only_on_repeat(fresh, monkeypatch):
     marker.write_text(str(time.time() - 3600))
     bot._crash_loop_backoff()                 # an hour later: no pause
     assert slept == [bot._CRASH_LOOP_SLEEP_SECS]
+
+
+def test_exit_monitor_isolates_a_failing_position_and_writes_heartbeat(fresh, monkeypatch):
+    """One position raising inside its checks must not stop the other
+    positions' exits or the cycle's equity snapshot / heartbeat."""
+    import numpy as np
+    from config import STARTING_CASH
+    from conftest import make_candles
+    sym_bad, sym_ok = SYMBOLS[0], SYMBOLS[2]
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    for sym in (sym_bad, sym_ok):
+        ens = {"signal": "short", "symbol": sym, "price": candles[-1]["close"], "regime": "ranging",
+               "on_fire": False, "position_size_mult": 1.0, "buy_weight": 0.0, "sell_weight": 0.6,
+               "ml_prob": 0.05, "breakdown": [], "time": "2026-10-11T00:00:00Z", "meta": {}}
+        bot._execute_trade(ens, "QF", candles, 0.5, np.zeros(13, dtype=np.float32), STARTING_CASH)
+    ok = fresh.get_short_position(sym_ok)
+    stop = ok["avg_cost"] * 1.004
+    with fresh.get_db() as conn:
+        conn.execute("UPDATE positions SET stop_price=? WHERE symbol=?", (stop, sym_ok))
+    price = stop * 1.001
+    last = dict(candles[-1], close=price, high=price, low=min(price, candles[-1]["low"]))
+    bot._candles_cache.clear()
+    bot._candles_cache.update({sym_bad: candles, sym_ok: candles[:-1] + [last]})
+
+    real_decay = bot._apply_ml_time_decay
+
+    def decay(sym, pos, c):
+        if sym == sym_bad:
+            raise RuntimeError("database is locked")
+        return real_decay(sym, pos, c)
+    monkeypatch.setattr(bot, "_apply_ml_time_decay", decay)
+
+    async def run():
+        async def no_margin(*a, **k):
+            return {}
+        monkeypatch.setattr(bot, "_refresh_margin_health", no_margin)
+        monkeypatch.setattr(bot, "CHECK_EVERY_SECS", 0.01)
+        real_record = bot.record_equity
+        monkeypatch.setattr(bot, "record_equity", lambda eq: (real_record(eq), bot._shutdown_event.set()))
+        await asyncio.wait_for(bot.exit_monitor(asyncio.get_running_loop()), 10)
+    asyncio.run(run())
+    assert fresh.get_short_position(sym_ok) is None              # the healthy position still exited
+    assert fresh.get_short_position(sym_bad) is not None         # the failing one is retried next cycle
+    assert fresh.get_portfolio_stat("exit_monitor_last_cycle")
