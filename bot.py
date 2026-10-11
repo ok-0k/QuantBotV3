@@ -105,7 +105,7 @@ from risk_engine import (
 )
 from db import (
     close_position, delete_position, get_all_positions, get_candles, get_cash,
-    get_portfolio_stat, increment_candle_count, transaction,
+    get_portfolio_stat, increment_candle_count, record_ledger_check, transaction,
     init_db, load_brain_key, log_trade, log_rl_experience,
     open_position, open_position_count,
     record_equity, save_brain_key, save_ml_cache, set_cash, set_portfolio_stat,
@@ -2676,37 +2676,54 @@ def _reconcile_orders_on_boot() -> None:
             log.error("Reconcile failed for %s (%s): %s — left for next boot", coid, sym, exc)
 
 
-def _report_cash_invariant() -> None:
+def _report_cash_invariant(periodic: bool = False) -> Optional[dict]:
     """
     V4 restart protection: verify the books still balance after a restart.
 
     Invariant: cash + Σ(long cost basis) + Σ(short margin reserved)
-               == STARTING_CASH + realised_pnl_net
-    Report-only — drift is surfaced loudly, never auto-'healed' (heal_equity.py
-    exists for deliberate, backed-up repair).
+               == STARTING_CASH + capital_adjustments + realised_pnl_net
+    (db.ledger_drift). Every booking moves both sides equally, so the drift
+    is constant; capital_adjustments records deliberate out-of-band cash
+    changes. Report-only — drift is surfaced loudly and recorded as
+    ledger_drift / ledger_checked_at for the dashboard, never auto-'healed'.
+
+    periodic=True is the housekeeping loop's once-a-minute check (IMPR-1):
+    it warns only when the drift moved by more than $1 since the previous
+    check, so a known, explained offset does not warn every minute.
     """
     try:
-        cash = get_cash()
-        deployed_cost = 0.0
-        for p in get_all_positions():
-            if p.get("side", "long") == "short":
-                deployed_cost += float(p.get("margin_reserved") or 0.0)
-            else:
-                deployed_cost += float(p.get("shares") or 0.0) * float(p.get("avg_cost") or 0.0)
-        realised_net = float(get_portfolio_stat("realised_pnl_net", "0.0") or 0.0)
-        expected = STARTING_CASH + realised_net - deployed_cost
-        drift = cash - expected
+        led = record_ledger_check()
+        drift, prev = led["drift"], led["previous"]
         msg = (
-            f"Cash invariant: cash=${cash:,.2f} deployed=${deployed_cost:,.2f} "
-            f"realised_net=${realised_net:,.2f} -> expected cash=${expected:,.2f} "
+            f"Cash invariant: cash=${led['cash']:,.2f} deployed=${led['deployed']:,.2f} "
+            f"realised_net=${led['realised_net']:,.2f} "
+            f"adjustments=${led['capital_adjustments']:,.2f} "
+            f"-> expected cash=${led['expected'] - led['deployed']:,.2f} "
             f"drift=${drift:+.2f}"
         )
-        if abs(drift) > 1.00:
-            log.warning("⚠ %s — books drifted (heal_equity.py --confirm after review)", msg)
+        if periodic:
+            if (abs(drift) > 1.00 if prev is None else abs(drift - prev) > 1.00):
+                log.warning(
+                    "⚠ %s — ledger drift moved from $%s: cash moved without a "
+                    "matching booking (leak or out-of-band edit), investigate",
+                    msg, "n/a" if prev is None else f"{prev:+.2f}",
+                )
+        elif abs(drift) > 1.00:
+            log.warning(
+                "⚠ %s — books drifted from the ledger anchor (STARTING_CASH + "
+                "capital_adjustments + realised_pnl_net). A drift that stays "
+                "constant between checks is an unrecorded out-of-band cash "
+                "change (e.g. the 2026-09-30 top-up): review it, then record "
+                "it with scripts/set_ledger_anchor.py (dry-run, then --confirm "
+                "--amount %.2f). A drift that changes means a booking leak.",
+                msg, drift,
+            )
         else:
             log.info("✅ %s", msg)
+        return led
     except Exception as exc:
         log.error("Cash invariant check failed: %s", exc)
+        return None
 
 
 async def _load_history_for_all_symbols() -> dict[str, list[dict]]:
@@ -2793,6 +2810,9 @@ async def housekeeping_loop() -> None:
             set_portfolio_stat("circuit_open", "1" if brain.circuit_open else "0")
         except Exception as _hk_reg_exc:
             log.error("❌ Housekeeping — regime persist FAILED: %s", _hk_reg_exc)
+
+        # ── Ledger reconciliation (IMPR-1): ledger_drift for the dashboard ────
+        _report_cash_invariant(periodic=True)   # report-only; never raises
 
         # ── Confirmation log (only emitted when both succeed) ─────────────────
         n_buckets = len(getattr(brain, "_edge_profiles", {}))

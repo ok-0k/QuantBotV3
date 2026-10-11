@@ -247,3 +247,99 @@ def _drifted_books(db, offset=396.41):
     db.open_short("BBBUSDT", 3.0, 50.0, "QF", 55.0, 45.0, margin_reserved=30.0)
     db.set_portfolio_stat("realised_pnl_net", -50.0)
     db.set_cash(STARTING_CASH - 50.0 - 30.0 + offset)
+
+
+def test_ledger_drift_formula_and_capital_adjustments(fresh):
+    _drifted_books(fresh)
+    assert fresh.ledger_drift()["drift"] == pytest.approx(396.41)
+    fresh.set_portfolio_stat("capital_adjustments", 396.41)
+    led = fresh.ledger_drift()
+    assert led["drift"] == pytest.approx(0.0, abs=1e-6)
+    assert led["deployed"] == pytest.approx(30.0)
+
+
+def test_boot_check_records_drift_and_points_to_anchor_not_heal(fresh, caplog):
+    _drifted_books(fresh)
+    with caplog.at_level(logging.INFO):
+        bot._report_cash_invariant()
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1 and "drifted" in warns[0]
+    assert "set_ledger_anchor.py" in warns[0]
+    assert "heal_equity" not in warns[0]
+    assert float(fresh.get_portfolio_stat("ledger_drift")) == pytest.approx(396.41)
+    assert fresh.get_portfolio_stat("ledger_checked_at")
+
+    fresh.set_portfolio_stat("capital_adjustments", 396.41)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        bot._report_cash_invariant()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert float(fresh.get_portfolio_stat("ledger_drift")) == 0.0
+
+
+def test_periodic_check_warns_only_when_drift_moves(fresh, caplog):
+    _drifted_books(fresh)
+    bot._report_cash_invariant()                        # boot: records +396.41
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        bot._report_cash_invariant(periodic=True)       # same known offset
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    fresh.set_cash(fresh.get_cash() + 5.0)              # a $5 leak
+    with caplog.at_level(logging.INFO):
+        bot._report_cash_invariant(periodic=True)
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1 and "+396.41" in warns[0]
+    assert float(fresh.get_portfolio_stat("ledger_drift")) == pytest.approx(401.41)
+
+
+def test_housekeeping_loop_writes_ledger_drift(fresh, monkeypatch):
+    _drifted_books(fresh, offset=12.5)
+
+    class _OneCycle:
+        """First wait times out (one housekeeping pass), second returns."""
+        calls = 0
+
+        def is_set(self):
+            return self.calls >= 2
+
+        async def wait(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncio.TimeoutError
+            return True
+
+    monkeypatch.setattr(bot, "_shutdown_event", _OneCycle())
+    assert fresh.get_portfolio_stat("ledger_drift") is None
+    asyncio.run(bot.housekeeping_loop())
+    assert float(fresh.get_portfolio_stat("ledger_drift")) == pytest.approx(12.5)
+    assert fresh.get_portfolio_stat("ledger_checked_at")
+
+
+def test_set_ledger_anchor_confirm_zeroes_drift(fresh, monkeypatch, capsys):
+    _drifted_books(fresh)
+    cash_before = fresh.get_cash()
+    script = _load_script("set_ledger_anchor", "scripts/set_ledger_anchor.py")
+
+    _run_main(script, monkeypatch)                      # dry-run writes nothing
+    assert fresh.get_portfolio_stat("capital_adjustments") is None
+    for argv in (["--confirm"], ["--confirm", "--amount", "396.39"]):
+        with pytest.raises(SystemExit) as exc:          # no blind plug, no near-miss
+            _run_main(script, monkeypatch, *argv)
+        assert exc.value.code == 1
+        assert fresh.get_portfolio_stat("capital_adjustments") is None
+
+    _run_main(script, monkeypatch, "--confirm", "--amount", "396.41")
+    assert fresh.ledger_drift()["drift"] == pytest.approx(0.0, abs=1e-6)
+    assert fresh.get_capital_adjustments() == pytest.approx(396.41)
+    assert fresh.get_cash() == pytest.approx(cash_before)        # books untouched
+    assert len(fresh.get_all_positions()) == 1
+    backups = sorted((config.DATA_DIR / "backups").glob("ledger-anchor-pre-*.json"))
+    assert backups and json.loads(backups[-1].read_text())["old_capital_adjustments"] == 0.0
+
+    # A later unrecorded change is folded on top of the existing anchor.
+    fresh.set_cash(fresh.get_cash() + 10.0)
+    _run_main(script, monkeypatch, "--confirm", "--amount", "10.00")
+    assert fresh.get_capital_adjustments() == pytest.approx(406.41)
+    assert fresh.ledger_drift()["drift"] == pytest.approx(0.0, abs=1e-6)
+    assert "drift now" in capsys.readouterr().out
