@@ -3210,9 +3210,11 @@ async def main() -> int:
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)
         log.info("Bot stopped %s.", "cleanly" if exit_code == 0 else "after a subsystem failure")
-    if exit_code:
-        _crash_loop_backoff()
     return exit_code
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    _code = asyncio.run(main())
+    if _code:
+        # After the event loop has closed, so SIGTERM is never blocked by the pause.
+        _crash_loop_backoff()
+    sys.exit(_code)
