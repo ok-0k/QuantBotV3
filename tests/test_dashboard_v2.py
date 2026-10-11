@@ -151,3 +151,10 @@ def test_experiment_report_prints_per_symbol_day_and_verdict(clean_db, monkeypat
     out = capsys.readouterr().out
     assert "per symbol-day" in out and "day bootstrap, 2000 resamples" in out
     assert insights.DECISION_RULE in out and "Verdict: Adopt B" in out
+
+
+def test_experiment_card_headlines_per_symbol_day():
+    html = dashboard.DASHBOARD_HTML
+    assert "e.per_symbol_day" in html and "B − A per symbol-day" in html
+    assert html.index("B − A per symbol-day") < html.index("B − A per trade")   # per-trade is secondary
+    assert "psd.rule" in html and "e.note" in html

@@ -1574,18 +1574,34 @@ function renderInsights(d){
   }
   g('exp-name').textContent = e.name;
   const names = {A:'Group A · current', B:'Group B · as designed'};
-  const ecards = ['A','B'].filter(k=>e.arms[k]).map(k=>{
+  const ecards = [];
+  /* Headline: net P&L per symbol-day (assignment unit = symbol), day-bootstrap CI */
+  const psd = e.per_symbol_day;
+  if(psd){
+    const pcls = psd.verdict.startsWith('Keep A') ? 'neg' : psd.verdict.startsWith('Adopt B') ? 'pos' : 'warn';
+    ecards.push({label:'B − A per symbol-day', value:fmtSigned$(psd.diff, 3), cls:pcls,
+      sub:(psd.ci_lo==null ? '' : '95% CI '+fmtSigned$(psd.ci_lo, 2)+' … '+fmtSigned$(psd.ci_hi, 2)+' · ')
+        + psd.days+' days · '+psd.verdict});
+    ['A','B'].forEach(k=>ecards.push({label:(names[k]||('Group '+k))+' · per symbol-day',
+      value:fmtSigned$(psd.mean[k], 3), cls:pnlCls(psd.mean[k]),
+      sub:psd.symbols[k]+' symbols · '+fmtSigned$(psd.net_per_symbol[k])+'/symbol'}));
+  }
+  /* Secondary: per-trade economics */
+  ['A','B'].filter(k=>e.arms[k]).forEach(k=>{
     const a = e.arms[k];
-    return {label:names[k] || ('Group '+k), value:insPct(a.avg_pct)+'/trade',
+    ecards.push({label:(names[k] || ('Group '+k))+' · per trade', value:insPct(a.avg_pct)+'/trade',
       cls: a.avg_pct==null?'':(a.avg_pct>0?'pos':'neg'),
-      sub:(a.closed||0)+' closed · '+fmtSigned$(a.net||0)+' · hold '+insMin(a.median_hold_min)};
+      sub:(a.closed||0)+' closed · '+fmtSigned$(a.net||0)+' · hold '+insMin(a.median_hold_min)});
   });
   const vcls = e.verdict==='B better' ? 'pos' : e.verdict==='A better' ? 'neg' : 'warn';
   ecards.push({label:'B − A per trade', value: e.diff==null?'—':insPct(e.diff, 3), cls:vcls,
     sub: e.diff==null ? e.verdict : '95% CI '+insPct(e.ci_lo,2)+' … '+insPct(e.ci_hi,2)+' · '+e.verdict});
   g('experiment-grid').innerHTML = statCards(ecards);
   g('exp-note').textContent = 'Symbols alternate between groups. A keeps the legacy time decay; '
-    + 'B applies it as designed. A winner is only called when the 95% range excludes zero.';
+    + 'B applies it as designed. Headline: net P&L per symbol per day (zero-trade symbols count, '
+    + 'delisted excluded), 95% CI by resampling days. '
+    + (psd ? 'Pre-registered rule: ' + psd.rule + ' ' : '')
+    + (e.note ? 'Note: ' + e.note : '');
 }
 
 function loadInsights(){
