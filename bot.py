@@ -208,11 +208,15 @@ _REWARD_CANDLE_COST = 0.00005  # per-candle opportunity cost (tune in research)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _log_file = LOG_DIR / "bot.log"
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
+        # systemd sends stdout to the persistent journal on the SD card, so only
+        # WARNING+ goes there; routine INFO stays in the tmpfs file below.
+        _stdout_handler,
         logging.handlers.RotatingFileHandler(
             str(_log_file), maxBytes=5_000_000, backupCount=2),
     ],
