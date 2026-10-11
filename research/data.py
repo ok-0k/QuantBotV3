@@ -10,6 +10,9 @@ with backoff, so a study run never competes with the live bot for rate limit.
 Panels are indexed by bar CLOSE time (UTC): the row labelled T holds the bar
 covering (T - interval, T], so a signal computed at row T only uses data
 known at T.
+
+RESEARCH_OFFLINE=1 serves only what is already cached: no requests and no
+cache writes (re-running a study on exactly the data it saw before).
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(os.getenv("RESEARCH_DATA_DIR", "/home/admin/trading_data/research"))
+OFFLINE = os.getenv("RESEARCH_OFFLINE", "").strip().lower() in ("1", "true", "yes")
 SPOT_KLINES = "https://api.binance.com/api/v3/klines"
 PERP_FUNDING = "https://fapi.binance.com/fapi/v1/fundingRate"
 INTERVAL_MS = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
@@ -95,10 +99,11 @@ def load_klines(symbol: str, interval: str, start, end=None) -> dict[str, np.nda
     start = to_ms(start) // step * step
     end = min(to_ms(end) if end is not None else now, now // step * step)
     path = ROOT / f"klines_{interval}" / f"{symbol}.npz"
-    path.parent.mkdir(parents=True, exist_ok=True)
     have = dict(np.load(path)) if path.exists() else {k: np.array([]) for k in _FIELDS}
     chunks = []
-    if have["t"].size == 0:
+    if OFFLINE:
+        pass                                       # cache only
+    elif have["t"].size == 0:
         chunks.append(_fetch_klines(symbol, interval, start, end))
     else:
         first, last = int(have["t"][0]), int(have["t"][-1])
@@ -112,6 +117,7 @@ def load_klines(symbol: str, interval: str, start, end=None) -> dict[str, np.nda
         _, keep = np.unique(merged["t"], return_index=True)
         merged = {k: v[keep] for k, v in merged.items()}
         merged = {k: v[merged["t"] + step <= now] for k, v in merged.items()}
+        path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(path, **merged)
         have = merged
     sel = (have["t"] >= start) & (have["t"] < end)
@@ -122,12 +128,11 @@ def load_funding(symbol: str, start, end=None) -> pd.Series:
     """USDT-M perpetual funding rates (per 8h settlement), indexed by UTC time."""
     start, end = to_ms(start), to_ms(end) if end is not None else int(time.time() * 1000)
     path = ROOT / "funding" / f"{symbol}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
     have: dict[int, float] = {int(k): v for k, v in json.loads(path.read_text()).items()} if path.exists() else {}
     t = max(have) + 1 if have else start
     if have and min(have) > start + 8 * 3_600_000:
         t = start                                   # need older history too
-    while t < end:
+    while t < end and not OFFLINE:
         rows = _get(f"{PERP_FUNDING}?symbol={symbol}&startTime={t}&endTime={end}&limit=1000")
         time.sleep(_THROTTLE_S)
         if not rows:
@@ -138,7 +143,9 @@ def load_funding(symbol: str, start, end=None) -> pd.Series:
         if nxt <= t:
             break
         t = nxt
-    path.write_text(json.dumps({str(k): v for k, v in sorted(have.items())}))
+    if not OFFLINE:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({str(k): v for k, v in sorted(have.items())}))
     s = pd.Series(have, dtype=float).sort_index()
     s = s[(s.index >= start) & (s.index < end)]
     s.index = pd.to_datetime(s.index, unit="ms", utc=True)
@@ -156,11 +163,10 @@ def load_premium(symbol: str, start, end=None) -> pd.Series:
     start = to_ms(start) // step * step
     end = min(to_ms(end) if end is not None else now, now // step * step)
     path = ROOT / "premium_8h" / f"{symbol}.npz"
-    path.parent.mkdir(parents=True, exist_ok=True)
     have = dict(np.load(path)) if path.exists() else {"t": np.array([], np.int64), "c": np.array([])}
     t = start if have["t"].size == 0 or have["t"][0] > start else int(have["t"][-1]) + step
     new_t, new_c = [], []
-    while t < end:
+    while t < end and not OFFLINE:
         rows = _get(f"{PERP_PREMIUM}?symbol={symbol}&interval=8h&startTime={t}&endTime={end - 1}&limit=1500")
         time.sleep(_THROTTLE_S)
         if not rows:
@@ -178,6 +184,7 @@ def load_premium(symbol: str, start, end=None) -> pd.Series:
         cc = cc[keep]
         done = tt + step <= now
         have = {"t": tt[done], "c": cc[done]}
+        path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(path, **have)
     sel = (have["t"] >= start) & (have["t"] < end)
     return pd.Series(have["c"][sel], index=pd.to_datetime(have["t"][sel] + step, unit="ms", utc=True))

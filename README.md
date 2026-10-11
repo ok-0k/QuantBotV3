@@ -18,10 +18,12 @@ offline research toolkit with a cost-aware backtester.
 - **An experiment is running.** `decay_v2` splits the symbols into two groups to
   compare the legacy time decay with the decay as designed. Check it with
   `scripts/experiment_report.py`.
-- **One real edge was found: perpetual-futures funding carry.** It is
-  market-neutral and depends on the regime: about 18% APR on deployed capital in
-  2023–25, but rarely active now. A forward test was frozen on 2026-10-07 in
-  `research/carry_forward.py`.
+- **Funding carry fails out of sample too, so no strategy passes.** Its earlier
+  out-of-sample "confirmation" came from a phantom hedge in delisted MATICUSDT,
+  which an audit found on 2026-10-11. With hedges limited to hours when the spot
+  pair trades, carry earned about 18% APR on deployed capital in sample (2023–24
+  bull-market funding) but lost money out of sample (OOS Sharpe −2.4). The frozen
+  forward test in `research/carry_forward.py` keeps tracking it.
 
 ---
 
