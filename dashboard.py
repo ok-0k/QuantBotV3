@@ -209,6 +209,21 @@ def _breaker_state(total_eq: float) -> dict[str, Any]:
     }
 
 
+def _price_refs_1h(now_ms: int) -> dict[str, float]:
+    """Each symbol's close ~60 min ago from the candles table, in one query
+    (candles are kept 500 per symbol). Ignores references more than 15 min
+    older than that, so a stalled feed shows no change rather than a stale one."""
+    cutoff = now_ms - 3_600_000
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT c.symbol, c.close FROM candles c JOIN ("
+            "  SELECT symbol, MAX(ts) AS mts FROM candles WHERE ts <= ? AND ts >= ? GROUP BY symbol"
+            ") m ON c.symbol = m.symbol AND c.ts = m.mts",
+            (cutoff, cutoff - 900_000),
+        ).fetchall()
+    return {r[0]: float(r[1]) for r in rows}
+
+
 def _downsample_equity(curve: list[dict], max_points: int) -> list[dict]:
     """
     Keep at most max_points, evenly spaced in TIME (first point of each equal
@@ -459,11 +474,14 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
     now_epoch    = time.time()
 
     # ── Prices ─────────────────────────────────────────────────────────────────
+    # 1h change vs the candle close ~60 min ago (prev_price_* keys are no longer
+    # written by the bot and held frozen baselines).
+    refs_1h = _price_refs_1h(int(now_epoch * 1000))
     prices = []
     for sym in SYMBOLS:
         price = float(get_portfolio_stat(f"last_price_{sym}", "0") or "0")
-        prev  = float(get_portfolio_stat(f"prev_price_{sym}", "0") or "0")
-        chg   = round((price - prev) / prev * 100, 2) if prev > 0 else 0.0
+        prev  = refs_1h.get(sym, 0.0)
+        chg   = round((price - prev) / prev * 100, 2) if prev > 0 and price > 0 else None
         prices.append({"symbol": sym.replace("USDT", ""), "price": price, "change": chg})
 
     # Fix 2: time-based window (7 days) instead of an arbitrary row count cap.
@@ -1534,9 +1552,11 @@ function renderTicker(prices){
   if(!prices || !prices.length) return;
   const all = [...prices, ...prices];
   g('ticker-track').innerHTML = all.map(p=>{
-    const cls = p.change > 0 ? 'pos' : p.change < 0 ? 'neg' : '';
-    const arr = p.change > 0 ? '▲' : p.change < 0 ? '▼' : '—';
-    return `<div class="t-item"><span class="t-sym">${p.symbol}</span><span class="num">${fmtPrice(p.price)}</span><span class="t-chg ${cls}">${arr} ${Math.abs(p.change).toFixed(2)}%</span></div>`;
+    const has = p.change != null;
+    const cls = !has ? 'dim' : p.change > 0 ? 'pos' : p.change < 0 ? 'neg' : '';
+    const arr = has && p.change > 0 ? '▲' : has && p.change < 0 ? '▼' : '—';
+    const chg = has ? Math.abs(p.change).toFixed(2)+'%' : '';
+    return `<div class="t-item"><span class="t-sym">${p.symbol}</span><span class="num">${fmtPrice(p.price)}</span><span class="t-chg ${cls}">${arr} ${chg} 1h</span></div>`;
   }).join('');
 }
 

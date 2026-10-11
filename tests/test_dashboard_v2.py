@@ -295,3 +295,21 @@ def test_telemetry_sends_utc_epochs_for_chart_activity_and_positions(clean_db):
     html = dashboard.DASHBOARD_HTML
     assert "parseLocal" not in html and "timeZone:'America/Vancouver'" in html
     assert "tickMarkFormatter" in html and "relTime(t.ts_epoch)" in html and "durFmt(p.opened_epoch)" in html
+
+
+# ── Ticker: 1h change from candles (DASH-5) ──────────────────────────────────
+
+def test_ticker_change_is_1h_from_candles_not_frozen_prev_price(clean_db):
+    now_ms = int(time.time() * 1000)
+    db.set_portfolio_stat(f"last_price_{A_SYM}", "110")
+    db.set_portfolio_stat(f"prev_price_{A_SYM}", "27")                 # stale key: ignored
+    db.set_portfolio_stat(f"last_price_{B_SYM}", "50")
+    with db.get_db() as conn:
+        conn.executemany("INSERT INTO candles (symbol, ts, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)",
+                         [(A_SYM, now_ms - 3_660_000, 1, 1, 1, 100.0, 1),    # ~61 min ago: reference
+                          (A_SYM, now_ms - 3_000_000, 1, 1, 1, 105.0, 1),    # 50 min ago: too recent
+                          (B_SYM, now_ms - 9_000_000, 1, 1, 1, 10.0, 1)])    # 2.5 h ago: too stale
+    prices = {p["symbol"]: p["change"] for p in dashboard._build_telemetry()["prices"]}
+    assert prices[A_SYM.replace("USDT", "")] == pytest.approx(10.0)
+    assert prices[B_SYM.replace("USDT", "")] is None
+    assert "1h</span>" in dashboard.DASHBOARD_HTML
