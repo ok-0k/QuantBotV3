@@ -2992,6 +2992,35 @@ async def _supervise(coros: dict) -> int:
     return code
 
 
+_CRASH_LOOP_WINDOW_SECS = 900
+_CRASH_LOOP_SLEEP_SECS = 120
+
+
+def _crash_loop_backoff() -> None:
+    """
+    After an unexpected exit, systemd (Restart=always, RestartSec=10) restarts
+    the bot with no limit. If the previous unexpected exit was under 15 minutes
+    ago, pause before exiting so a persistent fault can't turn into a tight
+    restart loop that re-downloads history for every symbol each time.
+    """
+    marker = DATA_DIR / "last_unexpected_exit"
+    now = time.time()
+    try:
+        prev = float(marker.read_text().strip())
+    except (OSError, ValueError):
+        prev = 0.0
+    try:
+        marker.write_text(str(now))
+    except OSError as exc:
+        log.warning("could not record unexpected exit time: %s", exc)
+    if now - prev < _CRASH_LOOP_WINDOW_SECS:
+        log.critical(
+            "Second unexpected exit within %d min — sleeping %d s before exiting "
+            "to avoid a restart loop.", _CRASH_LOOP_WINDOW_SECS // 60, _CRASH_LOOP_SLEEP_SECS,
+        )
+        time.sleep(_CRASH_LOOP_SLEEP_SECS)
+
+
 async def main() -> int:
     global _executor
     _lock = _acquire_instance_lock()  # noqa: F841 — held for the process lifetime
@@ -3025,6 +3054,8 @@ async def main() -> int:
         log.info("Shutting down ProcessPoolExecutor...")
         _executor.shutdown(wait=True, cancel_futures=True)
         log.info("Bot stopped %s.", "cleanly" if exit_code == 0 else "after a subsystem failure")
+    if exit_code:
+        _crash_loop_backoff()
     return exit_code
 
 if __name__ == "__main__":

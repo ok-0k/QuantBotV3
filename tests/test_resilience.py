@@ -105,3 +105,17 @@ def test_model_ages_published(fresh):
     for path in (config.XGB_MODEL, config.SAC_WEIGHTS):
         path.unlink()
     assert str(DATA_DIR).startswith("/tmp")                   # sandboxed by conftest
+
+
+def test_crash_loop_backoff_sleeps_only_on_repeat(fresh, monkeypatch):
+    slept = []
+    monkeypatch.setattr(bot.time, "sleep", lambda s: slept.append(s))
+    marker = DATA_DIR / "last_unexpected_exit"
+    marker.unlink(missing_ok=True)
+    bot._crash_loop_backoff()                 # first unexpected exit: no pause
+    assert slept == []
+    bot._crash_loop_backoff()                 # again within 15 min: pause
+    assert slept == [bot._CRASH_LOOP_SLEEP_SECS]
+    marker.write_text(str(time.time() - 3600))
+    bot._crash_loop_backoff()                 # an hour later: no pause
+    assert slept == [bot._CRASH_LOOP_SLEEP_SECS]
