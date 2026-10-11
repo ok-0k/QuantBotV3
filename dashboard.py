@@ -35,7 +35,6 @@ from db import (
     get_equity_curve_since,
     get_db,
     get_equity_rebase,
-    get_filled_trade_count,
     get_portfolio_stat,
     get_recent_trades,
     get_trades_last_7_days,
@@ -475,14 +474,13 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
 
     closed         = [t for t in all_trades if _trade_net_amt(t) is not None]
 
-    # ── Lifetime trade count — brain-snapshot + current DB count ───────────────
-    # The trades table may be pruned (prune_db.sh), so SELECT COUNT(*) alone
-    # understates the true total.  brain_state.total_trades holds the count at
-    # the time of the last manual snapshot (default: 6629, known pre-prune
-    # baseline).  db_count captures trades since that snapshot.
-    brain_snapshot   = int(load_brain_key("total_trades", 6629) or 0)
-    db_count         = get_filled_trade_count()
-    lifetime_trades  = brain_snapshot + db_count
+    # ── Lifetime trade count ──────────────────────────────────────────────────
+    # portfolio.total_trades is incremented by bot.py on every fill and survives
+    # trade-row pruning; the same figure Insights shows.
+    try:
+        lifetime_trades = int(float(get_portfolio_stat("total_trades", "0") or 0))
+    except (TypeError, ValueError):
+        lifetime_trades = 0
 
     # ── Session win rate from available trade window ──────────────────────────
     closed_wins      = sum(1 for t in closed if (_trade_net_amt(t) or 0) > 0)
@@ -653,9 +651,11 @@ def _build_telemetry(equity_tf: str | None = None) -> dict:
             # realised_pnl_net deducts 0.12% round-trip fees (V2.3+).
             "realised_pnl_net":      round(realised_net, 2),
             "unrealised_pnl_total":  unrealised_pnl_total,
-            # lifetime_trades = brain_state.total_trades (pre-prune snapshot, default
-            # 6629) + get_filled_trade_count() (rows added since snapshot).
+            # lifetime_trades = portfolio.total_trades (every fill, bot-maintained).
+            # win_rate / profit_factor / fees / gross are over the 7-day window
+            # (closed_7d closed trades).
             "lifetime_trades":       lifetime_trades,
+            "closed_7d":             closed_total,
             "total_trades":          lifetime_trades,
             "drawdown_pct":          drawdown_pct,
             "peak_equity":           round(peak_equity, 2),
@@ -1391,16 +1391,17 @@ function renderStats(p){
       sub:'from peak '+fmt$(p.peak_equity||0)});
   }
   const lifetimeTrades = p.lifetime_trades || p.total_trades || 0;
-  cards.push({label:'Win Rate', value:(p.win_rate||0).toFixed(1)+'%',
-    sub:lifetimeTrades.toLocaleString()+' trades · L '+(p.win_rate_long!=null?p.win_rate_long.toFixed(0)+'%':'—')
+  const closed7 = (p.closed_7d||0).toLocaleString() + ' closed (7d)';
+  cards.push({label:'Win Rate · 7d', value:(p.win_rate||0).toFixed(1)+'%',
+    sub:closed7+' · L '+(p.win_rate_long!=null?p.win_rate_long.toFixed(0)+'%':'—')
       +' / S '+(p.win_rate_short!=null?p.win_rate_short.toFixed(0)+'%':'—'),
     bar:Math.max(0,Math.min(100,p.win_rate||0)), barColor:'var(--pos)'});
   cards.push({label:'Tickets Traded', value:lifetimeTrades.toLocaleString(), sub:'lifetime executions (all symbols)'});
   const pf = p.profit_factor;
-  cards.push({label:'Profit Factor', value: pf==null?'—':pf.toFixed(2)+'×',
-    cls: pf==null?'':(pf>=1.5?'pos':pf>=1?'warn':'neg'), sub:'gross '+fmtSigned$(p.gross_pnl||0)});
-  cards.push({label:'Fees Paid', value:fmt$(-(p.total_fees_paid||0)), cls:(p.total_fees_paid||0)>0?'neg':'dim',
-    sub: p.fee_efficiency!=null ? p.fee_efficiency.toFixed(1)+'% net/gross' : 'no closed trades'});
+  cards.push({label:'Profit Factor · 7d', value: pf==null?'—':pf.toFixed(2)+'×',
+    cls: pf==null?'':(pf>=1.5?'pos':pf>=1?'warn':'neg'), sub:'gross '+fmtSigned$(p.gross_pnl||0)+' · '+closed7});
+  cards.push({label:'Fees Paid · 7d', value:fmt$(-(p.total_fees_paid||0)), cls:(p.total_fees_paid||0)>0?'neg':'dim',
+    sub: p.fee_efficiency!=null ? p.fee_efficiency.toFixed(1)+'% net/gross · '+closed7 : 'no closed trades (7d)'});
   cards.push({label:'Today', value:fmtSigned$(p.daily_equity_pnl!=null?p.daily_equity_pnl:p.daily_pnl||0),
     cls:pnlCls(p.daily_equity_pnl!=null?p.daily_equity_pnl:p.daily_pnl||0),
     sub:(p.daily_trades||0)+' trades'});

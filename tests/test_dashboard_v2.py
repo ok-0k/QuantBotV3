@@ -259,3 +259,18 @@ def test_liveness_fresh_bot_is_not_stale(clean_db):
     assert lv["stale"] == [] and lv["ages_s"]["ws"] == pytest.approx(2, abs=1)
     assert lv["models_stale"] is False and lv["model_age_xgb_days"] is None
     assert "not reporting for" in dashboard.DASHBOARD_HTML
+
+
+# ── Labels: lifetime trades and 7-day cards (DASH-6) ─────────────────────────
+
+def test_lifetime_trades_is_portfolio_total_trades(clean_db):
+    db.set_portfolio_stat("total_trades", "10459")
+    with db.get_db() as conn:
+        conn.execute("INSERT INTO trades (ts, symbol, action, status, pnl, net_pnl, trade_value) "
+                     "VALUES (?,?,?,?,?,?,?)", (_iso(time.time() - 60), A_SYM, "cover", "filled", 1.0, 1.0, 100.0))
+    p = dashboard._build_telemetry()["portfolio"]
+    assert p["lifetime_trades"] == p["total_trades"] == 10459      # not 6629 + row count
+    assert p["closed_7d"] == 1
+    html = dashboard.DASHBOARD_HTML
+    for label in ("Win Rate · 7d", "Profit Factor · 7d", "Fees Paid · 7d", "closed (7d)"):
+        assert label in html
