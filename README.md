@@ -147,13 +147,14 @@ fills are identical to the pre-audit code.
 
 The entry signal has shown no edge (see Research), so every trade it opens is
 a guess that pays fees. With the gate on, a new entry is allowed only if its
-strategy family is in `VALIDATED_STRATEGIES`: signals that passed a
+exact strategy name is in `VALIDATED_STRATEGIES`: signals that passed a
 pre-registered out-of-sample test. Every other signal is journaled as a skipped
 row with reason `no_validated_edge`, at most one per symbol every 5 minutes, so
 its features and forward returns can still be studied at no cost. Exits are
 never gated. The list is empty today, so turning the gate on means the bot
 opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=true`
-turns it on.
+turns it on. The dashboard's System section shows an Evidence Gate tile, and
+the bot logs one warning at startup while the gate is on with nothing validated.
 
 ## Trade journal
 

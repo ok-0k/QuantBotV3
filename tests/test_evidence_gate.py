@@ -96,12 +96,20 @@ def test_gate_on_journal_is_throttled_per_symbol(harness, fresh, monkeypatch):
     assert [r["reason"] for r in _rows(fresh)] == ["no_validated_edge"]
 
 
-def test_gate_on_allows_a_validated_family(harness, fresh, monkeypatch):
+def test_gate_on_allows_a_validated_strategy(harness, fresh, monkeypatch):
     monkeypatch.setattr(bot, "ENTRY_EVIDENCE_GATE", True)
-    monkeypatch.setattr(bot, "VALIDATED_STRATEGIES", frozenset({"QF"}))
+    monkeypatch.setattr(bot, "VALIDATED_STRATEGIES", frozenset({"QF_RA_S7_M87"}))
     harness(SYM)
     assert fresh.get_short_position(SYM) is not None
     assert [r["status"] for r in _rows(fresh)] == ["filled"]
+
+
+def test_gate_on_refuses_an_untested_variant_of_a_validated_strategy(harness, fresh, monkeypatch):
+    monkeypatch.setattr(bot, "ENTRY_EVIDENCE_GATE", True)
+    monkeypatch.setattr(bot, "VALIDATED_STRATEGIES", frozenset({"QF_RA_S7_M87"}))
+    harness(SYM, strategy="QF_RA_S7_M90")
+    assert fresh.get_short_position(SYM) is None
+    assert [r["reason"] for r in _rows(fresh)] == ["no_validated_edge"]
 
 
 def test_gate_on_never_blocks_covers(fresh, monkeypatch):
@@ -116,14 +124,38 @@ def test_gate_on_never_blocks_covers(fresh, monkeypatch):
 
 
 @pytest.mark.parametrize("name, validated, ok", [
-    ("QF_RA_S7_M87", {"QF"}, True),
-    ("QF", {"QF"}, True),
-    ("QFX_1", {"QF"}, False),
-    ("QF_RA_S7_M87", {"Q"}, False),
     ("QF_RA_S7_M87", {"QF_RA_S7_M87"}, True),
-    (None, {"QF"}, False),
+    ("QF_RA_S7_M87", {"QF"}, False),                 # no family / prefix matching
+    ("QF_RA_S7_M87", {"QF_RA_S7"}, False),
+    ("QF", {"QF_RA_S7_M87"}, False),
+    ("QF_RA_S7_M87", set(), False),
+    (None, {"QF_RA_S7_M87"}, False),
 ])
-def test_validated_family_matching(monkeypatch, name, validated, ok):
+def test_validated_exact_name_matching(monkeypatch, name, validated, ok):
     monkeypatch.setattr(bot, "VALIDATED_STRATEGIES", frozenset(validated))
     bd = [{"signal": "sell", "strategy": name, "alloc": 0.7}] if name else []
     assert bot._has_validated_edge({"breakdown": bd}, "short") is ok
+
+
+# ── visibility: boot report and dashboard tile ───────────────────────────────
+
+@pytest.mark.parametrize("on, validated", [(True, set()), (True, {"QF_RA_S7_M87"}), (False, set())])
+def test_boot_report_publishes_gate_state(fresh, monkeypatch, caplog, on, validated):
+    monkeypatch.setattr(bot, "ENTRY_EVIDENCE_GATE", on)
+    monkeypatch.setattr(bot, "VALIDATED_STRATEGIES", frozenset(validated))
+    with caplog.at_level("INFO"):
+        bot._report_evidence_gate()
+    assert fresh.get_portfolio_stat("evidence_gate") == ("1" if on else "0")
+    assert fresh.get_portfolio_stat("evidence_gate_validated") == str(len(validated))
+    warned = [r for r in caplog.records if "Evidence gate ON, 0 validated" in r.message]
+    assert len(warned) == (1 if on and not validated else 0)
+    assert any("Evidence gate ON" in r.message for r in caplog.records) is on
+
+
+def test_dashboard_health_reads_the_bots_gate_state(fresh):
+    import dashboard
+    assert dashboard._build_telemetry()["health"]["evidence_gate"] is None    # bot never reported
+    fresh.set_portfolio_stat("evidence_gate", "1")
+    fresh.set_portfolio_stat("evidence_gate_validated", 0)
+    h = dashboard._build_telemetry()["health"]
+    assert h["evidence_gate"] is True and h["evidence_gate_validated"] == 0

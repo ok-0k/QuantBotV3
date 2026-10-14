@@ -164,6 +164,8 @@ def _liveness(now: float) -> dict[str, Any]:
     }
     xgb = _opt_float(get_portfolio_stat("model_age_xgb_days", None))
     sac = _opt_float(get_portfolio_stat("model_age_sac_days", None))
+    gate = get_portfolio_stat("evidence_gate", None)
+    n_valid = _opt_float(get_portfolio_stat("evidence_gate_validated", None))
     return {
         "ages_s":             ages,
         "stale_after_s":      LIVENESS_STALE_SECS,
@@ -174,6 +176,9 @@ def _liveness(now: float) -> dict[str, Any]:
         "model_stale_days":   MODEL_STALE_DAYS,
         "models_stale":       any(v is not None and v > MODEL_STALE_DAYS for v in (xgb, sac)),
         "v3_fixes":           bool(V3_FIXES),
+        # Written by the bot at boot, so this is what the bot is running.
+        "evidence_gate":      None if gate is None else str(gate) == "1",
+        "evidence_gate_validated": None if n_valid is None else int(n_valid),
     }
 
 
@@ -1654,6 +1659,10 @@ function renderSystem(p, brain, marginHealth, health){
   tiles.push({label:'Model Age', value:'XGB '+mAge(health.model_age_xgb_days)+' · SAC '+mAge(health.model_age_sac_days),
     cls: health.models_stale ? 'warn' : '', sub: health.models_stale ? 'older than '+health.model_stale_days+' days' : ''});
   tiles.push({label:'V3 Fixes', value: health.v3_fixes == null ? '—' : (health.v3_fixes ? 'On' : 'Off')});
+  const nVal = health.evidence_gate_validated || 0;
+  tiles.push({label:'Evidence Gate', value: health.evidence_gate == null ? '—' : (health.evidence_gate ? 'On' : 'Off'),
+    cls: health.evidence_gate ? 'warn' : '',
+    sub: health.evidence_gate ? nVal+' validated'+(nVal === 0 ? ' · no new entries' : '') : ''});
   const sm = brain.current_size_mult != null ? brain.current_size_mult : 1.0;
   const smPct = Math.round(sm*100);
   tiles.push({label:'AI Sizing', value: smPct>=100 ? '100% nominal' : ('Penalized to '+smPct+'%'),

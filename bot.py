@@ -604,14 +604,11 @@ def _top_strategy(ensemble: dict, direction: str) -> str:
 
 
 def _has_validated_edge(ensemble: dict, direction: str) -> bool:
-    """True if the entry's strategy family passed a pre-registered
-    out-of-sample test (config.VALIDATED_STRATEGIES). A family matches the
-    whole name or the part before its first "_" ("QF" clears "QF_RA_S7_M87",
-    not "QFX_1")."""
+    """True if the entry's strategy passed a pre-registered out-of-sample
+    test: its exact name is in config.VALIDATED_STRATEGIES. No prefix or
+    family matching — a pass covers one tested config, not its variants."""
     name = _top_strategy(ensemble, direction)
-    if not name:
-        return False
-    return name in VALIDATED_STRATEGIES or name.split("_", 1)[0] in VALIDATED_STRATEGIES
+    return bool(name) and name in VALIDATED_STRATEGIES
 
 
 def _handle_signal(signame: str) -> None:
@@ -3196,6 +3193,19 @@ def _acquire_instance_lock():
     return fh
 
 
+def _report_evidence_gate() -> None:
+    """Publish the evidence gate's state for the dashboard (what this process
+    runs, not the dashboard's own env) and say so in the log when it is on."""
+    n = len(VALIDATED_STRATEGIES)
+    set_portfolio_stat("evidence_gate", "1" if ENTRY_EVIDENCE_GATE else "0")
+    set_portfolio_stat("evidence_gate_validated", n)
+    if ENTRY_EVIDENCE_GATE:
+        if n:
+            log.info("Evidence gate ON, %d validated: entries only from %s", n, ", ".join(sorted(VALIDATED_STRATEGIES)))
+        else:
+            log.warning("Evidence gate ON, 0 validated: no new entries (exits still run)")
+
+
 def _report_model_ages() -> None:
     """Log model file ages at boot and publish them for the dashboard."""
     for key, path in (("model_age_xgb_days", XGB_MODEL), ("model_age_sac_days", SAC_WEIGHTS)):
@@ -3281,6 +3291,7 @@ async def main() -> int:
              _exec_adapter.name)
     init_db()
     _report_model_ages()
+    _report_evidence_gate()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
