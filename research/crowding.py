@@ -295,7 +295,7 @@ def verdict(rows: dict[str, dict]) -> dict[str, dict]:
             "borrow_alpha": _gt(r["oos_borrow"], "alpha_yr", PASS["borrow_alpha"]),
             "coverage": r["skipped_oos"] <= PASS["max_skipped_oos"],
         }
-        if all(checks.values()):                    # drop-one re-runs only for otherwise-passing configs
+        if all(cand.values()) and all(checks.values()):     # drop-one runs only for otherwise-passing configs
             checks["drop_one"] = _gt(r, "drop_one_min_alpha", PASS["drop_one_alpha"])
         failed = [k for k, ok in {**cand, **checks}.items() if not ok]
         if not all(cand.values()):

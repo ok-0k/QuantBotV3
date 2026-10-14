@@ -314,6 +314,14 @@ def test_verdict_each_new_and_kept_rule_can_fail_a_candidate(override, check):
     assert v["verdict"] == "candidate (failed OOS)" and check in v["failed"]
 
 
+def test_verdict_never_lists_drop_one_for_a_config_that_failed_the_is_gate():
+    rows = _rows()
+    rows["fund_lvl_so_k3_24h"]["is"] = {"sharpe": 0.5, "alpha_t": 3.0, "alpha_yr": 0.3}   # IS gate fails
+    del rows["fund_lvl_so_k3_24h"]["drop_one_min_alpha"]                                # so it never ran
+    v = C.verdict(rows)["fund_lvl_so_k3_24h"]
+    assert v == {"verdict": "rejected", "failed": ["is_sharpe"]}
+
+
 def test_verdict_neighbour_needs_is_sharpe_and_oos_alpha():
     rows = _rows()
     rows["fund_lvl_so_k5_24h"]["oos"] = {"sharpe": 2.0, "alpha_t": 3.0, "alpha_yr": -0.01}
