@@ -430,7 +430,7 @@ def _note_circuit_breaker_state() -> None:
 
 def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
     """
-    Time decay as designed (experiment decay_v2, arm B): λ = 1 − e^(−t/τ) with
+    Time decay as designed (decay_v2 arm B, the default since): λ = 1 − e^(−t/τ) with
     t = wall-clock minutes since entry (INTERVAL is 1m, so τ in candles == τ
     in minutes), applied to the INITIAL stop/target recorded at entry. Being a
     pure function of age it is idempotent however often it is called; it only
@@ -474,16 +474,17 @@ def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
     Pulls TP toward entry (sooner monetisation) and tightens stop — variance
     collapses when edge does not materialise (optional stopping / real-options view).
 
-    Positions entered in arm B of experiment decay_v2 use the as-designed
-    implementation; everything else (arm A, pre-experiment positions) keeps
-    the legacy path below, which compounds on every call — see config.py.
+    decay_v2 adopted arm B: every position with its initial levels recorded
+    uses the as-designed implementation. Only arm A of decay_v2 (kept so the
+    experiment can be re-run) and positions without initial levels keep the
+    legacy path below, which compounds on every call — see config.py.
     """
     try:
         feats = json.loads(pos.get("entry_features") or "{}")
     except (TypeError, ValueError):
         feats = {}
-    if (feats.get("experiment") == "decay_v2" and feats.get("arm") == "B"
-            and feats.get("initial_tp") and feats.get("initial_stop")):
+    legacy_arm = feats.get("experiment") == "decay_v2" and feats.get("arm") == "A"
+    if not legacy_arm and feats.get("initial_tp") and feats.get("initial_stop"):
         _apply_designed_time_decay(sym, pos, feats)
         return
 

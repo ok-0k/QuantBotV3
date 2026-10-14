@@ -26,13 +26,14 @@ offline research toolkit with a cost-aware backtester.
     the services are up.
   - The **dashboard** gained health tiles (heartbeats, ledger, breaker headroom,
     model ages) and shows times in Pacific time.
-- **Some exit fixes are switched off until the experiment ends.** They change
-  trading behaviour, so they sit behind `V3_FIXES` (see
-  [Deferred exit fixes](#deferred-exit-fixes-v3_fixes)) and turn on with the
-  experiment's end, around 2026-10-14.
-- **An experiment is running.** `decay_v2` splits the symbols into two groups to
-  compare the legacy time decay with the decay as designed. The early read
-  favours the designed decay (group B). The decision is made when it ends.
+- **The deferred exit fixes are on.** They sit behind `V3_FIXES` (see
+  [Deferred exit fixes](#deferred-exit-fixes-v3_fixes)), which turned on when
+  the experiment ended on 2026-10-14.
+- **The designed time decay won its experiment and is now the default.**
+  `decay_v2` compared the legacy time decay with the decay as designed. Group B
+  lost about $1.63 less per symbol per day (95% CI $1.30 to $1.97), and the gap
+  held before and after the audit deploy. It loses less mostly by trading less;
+  it is still a net loss, not an edge.
 - **The ML models don't add an edge.** The audit found the XGBoost gate is
   anti-predictive for shorts (AUC ≈ 0.36), and the SAC actor vetoes about 96% of
   trend-down shorts. Both models are static: incremental retraining never
@@ -87,7 +88,7 @@ Nightly cron 04:00 (Pi time): stop bot → prune_db.sh (verified backup, then pr
 | `scripts/restore_db.sh` | Restore a nightly backup (refuses while either service runs; dry run by default) |
 | `scripts/set_ledger_anchor.py` | Record a reviewed out-of-band cash change so the ledger check reads ~0 (dry run by default) |
 | `scripts/reset_circuit_breaker.py` | Re-base the breaker's peak equity after a reviewed drawdown (dry run by default) |
-| `scripts/experiment_report.py` | Read-only A/B report for the running experiment |
+| `scripts/experiment_report.py` | Read-only A/B report for an experiment (pass its name, e.g. `decay_v2`) |
 | `scripts/entry_edge.py` | Read-only: the bot's entries against random entry, using Binance history |
 | `set_cash_balance.py`, `heal_equity.py` | Manual cash tools. The first records the change in `capital_adjustments`; the second refuses while positions are open |
 | `research/` | Offline backtester, data cache, pre-registered study, carry analysis ([results](research/RESULTS.md)) |
@@ -112,7 +113,8 @@ Nightly cron 04:00 (Pi time): stop bot → prune_db.sh (verified backup, then pr
 - **Initial levels:** an ATR stop above entry and an ATR target below it.
 - **Trailing stop:** once price passes the target.
 - **Break-even stop:** after a confirmed favourable move.
-- **Time decay:** depends on the experiment group (see below).
+- **Time decay:** pulls the target toward entry and tightens the stop as the
+  trade ages, computed from the initial levels (see `decay_v2` below).
 - **Survival stop:** closes a position at −$15.
 - **4-hour exit:** closes losing positions after 4 hours.
 
@@ -129,11 +131,11 @@ restart.
 
 ### Deferred exit fixes (`V3_FIXES`)
 
-These change trading decisions, so they stay off while `decay_v2` runs and turn
-on when it ends. With `V3_FIXES` off, decisions and fills are identical to the
-pre-audit code.
+These change trading decisions, so they stayed off while `decay_v2` ran. They
+are on by default since it ended. With env `V3_FIXES=false`, decisions and
+fills are identical to the pre-audit code.
 
-- **Stops and targets only tighten.** Today the time decay can overwrite a
+- **Stops and targets only tighten.** Without it, the time decay can overwrite a
   break-even or trailing stop with a looser level.
 - **Tick checks run in a fixed order:** survival stop, then stop, then target.
 - **Slots are reserved while an order is in flight**, so two entries can't
@@ -166,7 +168,7 @@ Trade data is **kept forever**. The nightly prune never deletes `trades` or
 `rl_experience`. Equity history keeps 30 s detail for 2 days, then one point
 every 5 minutes.
 
-## Running experiment: `decay_v2`
+## Experiment `decay_v2` (2026-10-06 to 2026-10-14, B adopted)
 
 The legacy time decay ran on every websocket update (~2 s) and shrank the
 *current* stop and target each time, so the effect compounded. It collapsed both
@@ -185,10 +187,13 @@ That is the cause of the old ~20-minute trade lifecycle.
   significantly worse.
 - **Caveat:** group B ran without persistent break-even and trailing stops,
   which `V3_FIXES` fixes.
-- **Turning it off:** set `EXPERIMENT_NAME=""`.
+- **Result:** B adopted. Every short with recorded initial levels now uses the
+  designed decay. The legacy path remains for group A, so the experiment can be
+  re-run with env `EXPERIMENT_NAME=decay_v2`, and for longs, which record no
+  initial levels and kept the legacy decay in both groups.
 
 ```bash
-.venv/bin/python scripts/experiment_report.py     # per-group stats, per-symbol-day CI, decision rule
+.venv/bin/python scripts/experiment_report.py decay_v2   # per-group stats, per-symbol-day CI, decision rule
 ```
 
 ## Research
@@ -241,7 +246,7 @@ vcgencmd measure_temp; free -h
 | Constant | Value | Notes |
 |----------|-------|-------|
 | `STARTING_CASH` | 10,000 | Paper balance |
-| `SYMBOLS` | 50 pairs | 4 are delisted on Binance spot (MATIC, MKR, OCEAN, AGIX). Remove them only after the experiment ends, because groups are assigned by list position |
+| `SYMBOLS` | 50 pairs | 4 are delisted on Binance spot (MATIC, MKR, OCEAN, AGIX). Removing them shifts the list positions the `decay_v2` report uses to rebuild its groups |
 | `EXECUTION_MODE` | paper | `paper` or `testnet` (env). **No live mode** |
 | `SHORT_MAX_OPEN` | 5 | 3 per group while an experiment runs |
 | `MAX_ORDER_EQUITY_FRAC` | 15% | Hard per-order clamp |
@@ -255,8 +260,8 @@ vcgencmd measure_temp; free -h
 | `MAX_HOLD_OPEN_SECONDS` | 14,400 | Closes losing positions after 4h |
 | `MAX_DRAWDOWN_PCT` / `CB_RECOVERY_PCT` | 20% / 10% | Circuit breaker trips at 20% drawdown, clears at 10% |
 | `STALE_ENTRY_MAX_SECS` / `WS_BACKFILL_AFTER_SECS` | 180 / 90 | Stale-data entry gate, REST backfill after a websocket outage |
-| `EXPERIMENT_NAME` | `decay_v2` | Empty string disables experiments |
-| `V3_FIXES` | off | Deferred exit fixes. Env `V3_FIXES=true` turns them on |
+| `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
+| `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
 
 ## Execution modes and order protections
 
@@ -290,8 +295,8 @@ and blank the webhook.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q                   # 335 tests; throwaway temp DB, never the live one
-V3_FIXES=true .venv/bin/python -m pytest tests/ -q     # same suite with the deferred exit fixes on
+.venv/bin/python -m pytest tests/ -q                   # 337 tests; throwaway temp DB, never the live one
+V3_FIXES=false .venv/bin/python -m pytest tests/ -q    # same suite with the deferred exit fixes off
 ```
 
 ## Pi setup (first time)

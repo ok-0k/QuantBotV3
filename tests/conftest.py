@@ -68,6 +68,17 @@ def _no_discord(monkeypatch):
     yield
 
 
+@pytest.fixture()
+def decay_v2_on(monkeypatch):
+    """Run the decay_v2 symbol split, whatever the default or env says (it
+    ended on 2026-10-14 and is off by default since)."""
+    import bot
+    import insights
+    monkeypatch.setattr(bot, "EXPERIMENT_NAME", "decay_v2")
+    monkeypatch.setattr(insights, "EXPERIMENT_NAME", "decay_v2")
+    yield
+
+
 def make_candles(
     n: int = 120,
     start_price: float = 100.0,

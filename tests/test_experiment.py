@@ -17,6 +17,7 @@ from config import (DECAY_HALFLIFE_CANDLES, DECAY_SL_TIGHTEN_STRENGTH,
 from conftest import make_candles
 
 ZERO_STATE = np.zeros(13, dtype=np.float32)
+pytestmark = pytest.mark.usefixtures("decay_v2_on")
 A_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 0]
 B_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 1]
 
@@ -111,6 +112,37 @@ def test_designed_decay_never_loosens_a_tighter_stop(fresh):
     fresh.update_stop_price(sym, 100.10)          # trail / BE already tighter
     bot._apply_ml_time_decay(sym, fresh.get_short_position(sym), [])
     assert fresh.get_short_position(sym)["stop_price"] == 100.10
+
+
+# ── Decay: with no experiment running, new positions decay as designed ───────
+
+def test_positions_opened_without_an_experiment_decay_as_designed(fresh, monkeypatch):
+    monkeypatch.setattr(bot, "EXPERIMENT_NAME", "")
+    sym = A_SYMS[0]                               # arm A while the split ran
+    fresh.open_short(sym, 1.0, 100.0, "QF", 100.55, 97.4, 20.0,
+                     entry_features={"initial_stop": 100.55, "initial_tp": 97.4})
+    with fresh.get_db() as conn:
+        conn.execute("UPDATE positions SET opened_ts=?, candle_count=? WHERE symbol=?",
+                     (_ago(60), 60, sym))
+    for _ in range(200):          # ~7 minutes of websocket updates
+        bot._apply_ml_time_decay(sym, fresh.get_short_position(sym), [])
+    p = fresh.get_short_position(sym)
+    tp, sl = _expected(60)
+    assert p["tp_price"] == pytest.approx(tp, rel=1e-6)
+    assert p["stop_price"] == pytest.approx(sl, rel=1e-6)
+
+
+def test_entries_without_an_experiment_record_initial_levels_and_no_arm(fresh, monkeypatch):
+    monkeypatch.setattr(bot, "EXPERIMENT_NAME", "")
+    sym = A_SYMS[0]
+    candles = make_candles(n=120, start_price=100.0, drift=-0.05, amplitude=0.4)
+    ens = {"signal": "short", "symbol": sym, "price": candles[-1]["close"], "regime": "ranging",
+           "on_fire": False, "position_size_mult": 1.0, "buy_weight": 0.0, "sell_weight": 0.6,
+           "ml_prob": 0.05, "breakdown": [], "time": "2026-10-14T00:00:00Z", "meta": {}}
+    bot._execute_trade(ens, "QF", candles, 0.5, ZERO_STATE, STARTING_CASH)
+    f = json.loads(fresh.get_short_position(sym)["entry_features"])
+    assert "arm" not in f and "experiment" not in f
+    assert f["initial_stop"] > 0 and f["initial_tp"] > 0
 
 
 # ── Decay: arm A and pre-experiment positions keep legacy behaviour ──────────

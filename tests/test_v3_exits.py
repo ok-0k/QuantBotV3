@@ -1,7 +1,7 @@
 """
 Exit paths: what the trade journal records on every exit (on by default),
-and the V3_FIXES exit behaviour (off by default, deferred until decay_v2
-ends): stops/targets only ever tighten, break-even and trailing stops survive
+and the V3_FIXES exit behaviour (on by default since decay_v2 ended; these
+tests pin it explicitly either way): stops/targets only ever tighten, break-even and trailing stops survive
 time decay, tick-path order survival -> stop -> take-profit, a stop moved
 within the minute triggers on the mark only, and exit rewards credit the
 regime the position was entered in.
@@ -30,7 +30,7 @@ ENTRY, SL0, TP0 = 100.0, 100.55, 97.4
 
 @pytest.fixture()
 def fresh(clean_db, monkeypatch):
-    monkeypatch.setattr(bot, "V3_FIXES", False)              # default, whatever the env says
+    monkeypatch.setattr(bot, "V3_FIXES", False)              # legacy path, whatever the default or env says
     bot.brain._edge_profiles.clear()
     bot.brain.ml_probs.clear()
     bot.brain.circuit_open = False

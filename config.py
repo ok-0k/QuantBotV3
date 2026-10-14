@@ -340,26 +340,26 @@ DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 # Symbols alternate between arm A and arm B in SYMBOLS order (balanced, majors
 # split). The arm is recorded in every entry's entry_features, and each arm
 # gets its own share of SHORT_MAX_OPEN slots so a slow-exiting arm cannot
-# starve the other. Set EXPERIMENT_NAME="" (env) to switch off.
+# starve the other. EXPERIMENT_NAME="" (the default) means no experiment.
 #
-# decay_v2 (started 2026-10-06):
+# decay_v2 (2026-10-06 .. 2026-10-14, ended. Re-run it with env
+# EXPERIMENT_NAME=decay_v2):
 #   A = legacy time decay: re-applied to the CURRENT stop/target on every
 #       websocket update (~every 2 s), with a "candle" clock that ticks every
 #       30 s — compounding collapses TP and SL onto entry ~15-20 min in.
 #   B = decay as designed: lambda = 1 - exp(-age_min / DECAY_HALFLIFE_CANDLES)
 #       from wall-clock age, applied to the INITIAL levels (idempotent).
-EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "decay_v2").strip()
+EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "").strip()
 
-# ── V3 FIXES (deferred behaviour fixes, default OFF) ─────────────────────────
-# Verified bugs whose fixes change live exits/entries, held back so the
-# decay_v2 experiment stays clean. With this OFF every code path behaves
-# exactly as before. Turn ON (env V3_FIXES=true) after decay_v2 ends:
+# ── V3 FIXES (deferred behaviour fixes, default ON since decay_v2 ended) ─────
+# Verified bugs whose fixes change live exits/entries, held back while the
+# decay_v2 experiment ran. Env V3_FIXES=false restores the old behaviour:
 #   - stops/targets only ever tighten; trail/BE levels are not undone by decay
 #   - tick path checks survival -> stop -> take-profit (a fee-gated TP no
 #     longer skips the stop check); a stop armed mid-candle uses the mark
 #   - in-flight entry slot reservation (no same-minute cap overshoot)
 #   - exit rewards credit the position's own entry regime
-V3_FIXES: bool = os.getenv("V3_FIXES", "false").strip().lower() in ("1", "true", "yes")
+V3_FIXES: bool = os.getenv("V3_FIXES", "true").strip().lower() in ("1", "true", "yes")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
