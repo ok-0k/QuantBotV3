@@ -82,7 +82,7 @@ from config import (
     MIN_EXPECTED_TP_NET_USD,
     MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
     STARTING_CASH,
-    V3_FIXES,
+    V3_FIXES, ENTRY_EVIDENCE_GATE, VALIDATED_STRATEGIES,
 )
 from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
@@ -601,6 +601,17 @@ def _top_strategy(ensemble: dict, direction: str) -> str:
     )
     # No strategy voted -> pure ML Gate A override -> label XGBOOST
     return top["strategy"] if top else None
+
+
+def _has_validated_edge(ensemble: dict, direction: str) -> bool:
+    """True if the entry's strategy family passed a pre-registered
+    out-of-sample test (config.VALIDATED_STRATEGIES). A family matches the
+    whole name or the part before its first "_" ("QF" clears "QF_RA_S7_M87",
+    not "QFX_1")."""
+    name = _top_strategy(ensemble, direction)
+    if not name:
+        return False
+    return name in VALIDATED_STRATEGIES or name.split("_", 1)[0] in VALIDATED_STRATEGIES
 
 
 def _handle_signal(signame: str) -> None:
@@ -1524,6 +1535,15 @@ async def _evaluate_and_trade(
     if direction in ("buy", "short") and brain.circuit_open:
         log.info("%s %s blocked - circuit breaker open", symbol, direction.upper())
         _journal_entry_block(ensemble, direction, "circuit_breaker", _ts)
+        return
+
+    # Evidence gate (off by default): no new entry unless its strategy passed a
+    # pre-registered out-of-sample test. Refused signals are journaled, sampled
+    # by the per-symbol throttle, so the data keeps coming. Exits never stop.
+    if direction in ("buy", "short") and ENTRY_EVIDENCE_GATE and not _has_validated_edge(ensemble, direction):
+        log.debug("%s %s blocked - no validated edge (%s)", symbol, direction.upper(),
+                  _top_strategy(ensemble, direction))
+        _journal_entry_block(ensemble, direction, "no_validated_edge", _ts)
         return
 
     if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:

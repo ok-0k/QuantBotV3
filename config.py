@@ -361,6 +361,20 @@ EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "").strip()
 #   - exit rewards credit the position's own entry regime
 V3_FIXES: bool = os.getenv("V3_FIXES", "true").strip().lower() in ("1", "true", "yes")
 
+# ── EVIDENCE GATE (default OFF) ──────────────────────────────────────────────
+# With the gate ON, a new entry is allowed only if its strategy family is in
+# VALIDATED_STRATEGIES: signals that passed a pre-registered out-of-sample test
+# (see research/RESULTS.md). Every other entry signal is journaled as a skipped
+# row with reason "no_validated_edge" (one per symbol per 5 min), so its
+# features and forward returns can still be studied at no cost. Exits are
+# never gated. The list is empty because no signal has passed yet: turning the
+# gate on means the bot opens no new positions until one does.
+# Env ENTRY_EVIDENCE_GATE=true turns it on.
+ENTRY_EVIDENCE_GATE: bool = os.getenv("ENTRY_EVIDENCE_GATE", "false").strip().lower() in ("1", "true", "yes")
+# Strategy families (the part of a strategy name before the first "_", e.g.
+# "QF" for "QF_RA_S7_M87") cleared to trade while the gate is on.
+VALIDATED_STRATEGIES: frozenset[str] = frozenset()
+
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
 # ═════════════════════════════════════════════════════════════════════════════
