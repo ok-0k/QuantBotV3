@@ -1,5 +1,7 @@
 # Signal research — results (2026-10-07, corrected 2026-10-11)
 
+> **Follow-up (2026-10-14):** crowding signals (funding and premium as directional, cross-sectional signals) were tested in a separate pre-registered study. All 48 configs were rejected. See [RESULTS_FUNDING.md](RESULTS_FUNDING.md).
+
 **Question:** does any simple, well-known signal beat realistic trading costs on
 the live bot's 50-coin universe, on data it was not designed on?
 
