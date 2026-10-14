@@ -59,7 +59,7 @@ def test_journal_window_and_exit_mix(fresh):
     assert w["cost_pct"] == pytest.approx(0.36)
 
 
-def test_experiment_arms_and_verdict(fresh):
+def test_experiment_arms_and_verdict(fresh, decay_v2_on):
     for _ in range(2):
         _round_trip(A_SYM, +0.01, "STOP_LOSS")
         _round_trip(B_SYM, -0.01, "TAKE_PROFIT")

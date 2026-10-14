@@ -17,6 +17,7 @@ from config import (DECAY_HALFLIFE_CANDLES, DECAY_SL_TIGHTEN_STRENGTH,
 from conftest import make_candles
 
 ZERO_STATE = np.zeros(13, dtype=np.float32)
+pytestmark = pytest.mark.usefixtures("decay_v2_on")
 A_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 0]
 B_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 1]
 

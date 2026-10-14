@@ -73,7 +73,7 @@ def _experiment():
         conn.close()
 
 
-def test_arm_symbols_match_bot_assignment_and_exclude_delisted():
+def test_arm_symbols_match_bot_assignment_and_exclude_delisted(decay_v2_on):
     arms = insights.arm_symbols()
     for arm, syms in arms.items():
         assert all(bot._experiment_arm(s) == arm for s in syms)

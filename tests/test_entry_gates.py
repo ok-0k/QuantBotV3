@@ -108,7 +108,7 @@ def test_breaker_trip_warns_once(fresh, caplog, monkeypatch):
 
 # ── journaling blocked entries ───────────────────────────────────────────────
 
-def test_slots_full_block_journaled_once_per_window(harness, fresh, monkeypatch):
+def test_slots_full_block_journaled_once_per_window(harness, fresh, monkeypatch, decay_v2_on):
     for s in A_SYMS[1:4]:                                   # fill arm A's 3 slots
         fresh.open_short(s, 1.0, 100.0, "QF", 101.0, 97.0, 20.0)
     harness(A_SYMS[0])
@@ -141,7 +141,7 @@ def test_reset_script_dry_run_then_confirm(fresh, monkeypatch):
 
 # ── V3 in-flight slot reservation ────────────────────────────────────────────
 
-def test_v3_in_flight_entries_count_against_the_arm_cap(fresh, monkeypatch):
+def test_v3_in_flight_entries_count_against_the_arm_cap(fresh, monkeypatch, decay_v2_on):
     for s in A_SYMS[1:3]:
         fresh.open_short(s, 1.0, 100.0, "QF", 101.0, 97.0, 20.0)
     bot._entry_in_flight[A_SYMS[3]] = {"action": "short", "arm": "A", "qty": 1.0, "price": 100.0}
