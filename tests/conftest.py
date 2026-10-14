@@ -68,6 +68,18 @@ def _no_discord(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _evidence_gate_off(monkeypatch):
+    """Entry tests expect entries: the evidence gate is off unless a test turns
+    it on, whatever the env says."""
+    try:
+        import bot
+        monkeypatch.setattr(bot, "ENTRY_EVIDENCE_GATE", False, raising=False)
+    except ImportError:
+        pass
+    yield
+
+
 @pytest.fixture()
 def decay_v2_on(monkeypatch):
     """Run the decay_v2 symbol split, whatever the default or env says (it

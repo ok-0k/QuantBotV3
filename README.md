@@ -143,6 +143,19 @@ fills are identical to the pre-audit code.
 - **Exit learning uses the position's own regime**, not the regime of whichever
   symbol was evaluated last.
 
+### Evidence gate (`ENTRY_EVIDENCE_GATE`, on by default)
+
+The entry signal has shown no edge (see Research), so every trade it opens is
+a guess that pays fees. With the gate on, a new entry is allowed only if its
+exact strategy name is in `VALIDATED_STRATEGIES`: signals that passed a
+pre-registered out-of-sample test. Every other signal is journaled as a skipped
+row with reason `no_validated_edge`, at most one per symbol every 5 minutes, so
+its features and forward returns can still be studied at no cost. Exits are
+never gated. The list is empty today, so turning the gate on means the bot
+opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=false`
+turns it off. The dashboard's System section shows an Evidence Gate tile, and
+the bot logs one warning at startup while the gate is on with nothing validated.
+
 ## Trade journal
 
 Every `trades` row carries:
@@ -152,9 +165,9 @@ Every `trades` row carries:
   experiment group.
 - **Skipped entries are journalled too**, with the reason in `reason`:
   `sac_veto`, `size_below_min_notional`, `insufficient_margin`,
-  `circuit_breaker`, `slots_full`, `corr_block`, `exposure_block` and
-  `margin_halt`. Gate blocks are rate-limited to one row per symbol and reason
-  every 5 minutes.
+  `circuit_breaker`, `slots_full`, `corr_block`, `exposure_block`,
+  `margin_halt` and `no_validated_edge`. Gate blocks are rate-limited to one
+  row per symbol and reason every 5 minutes.
 - `exit_reason`: one of `TAKE_PROFIT`, `STOP_LOSS`, `TIGHTENED_STOP`,
   `BREAKEVEN_STOP`, `TRAILING_STOP`, `HARD_STOP`, `TIME_HOLD_EXIT`, `MAX_HOLD`,
   `CIRCUIT_BREAKER` or `OTHER`. `exit_detail` holds the raw trigger text plus
@@ -262,6 +275,7 @@ vcgencmd measure_temp; free -h
 | `STALE_ENTRY_MAX_SECS` / `WS_BACKFILL_AFTER_SECS` | 180 / 90 | Stale-data entry gate, REST backfill after a websocket outage |
 | `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
 | `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
+| `ENTRY_EVIDENCE_GATE` | on | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=false` turns it off |
 
 ## Execution modes and order protections
 
@@ -295,7 +309,7 @@ and blank the webhook.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q                   # 337 tests; throwaway temp DB, never the live one
+.venv/bin/python -m pytest tests/ -q                   # 349 tests; throwaway temp DB, never the live one
 V3_FIXES=false .venv/bin/python -m pytest tests/ -q    # same suite with the deferred exit fixes off
 ```
 
