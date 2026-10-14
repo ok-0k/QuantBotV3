@@ -143,7 +143,7 @@ fills are identical to the pre-audit code.
 - **Exit learning uses the position's own regime**, not the regime of whichever
   symbol was evaluated last.
 
-### Evidence gate (`ENTRY_EVIDENCE_GATE`, off by default)
+### Evidence gate (`ENTRY_EVIDENCE_GATE`, on by default)
 
 The entry signal has shown no edge (see Research), so every trade it opens is
 a guess that pays fees. With the gate on, a new entry is allowed only if its
@@ -152,8 +152,8 @@ pre-registered out-of-sample test. Every other signal is journaled as a skipped
 row with reason `no_validated_edge`, at most one per symbol every 5 minutes, so
 its features and forward returns can still be studied at no cost. Exits are
 never gated. The list is empty today, so turning the gate on means the bot
-opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=true`
-turns it on. The dashboard's System section shows an Evidence Gate tile, and
+opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=false`
+turns it off. The dashboard's System section shows an Evidence Gate tile, and
 the bot logs one warning at startup while the gate is on with nothing validated.
 
 ## Trade journal
@@ -275,7 +275,7 @@ vcgencmd measure_temp; free -h
 | `STALE_ENTRY_MAX_SECS` / `WS_BACKFILL_AFTER_SECS` | 180 / 90 | Stale-data entry gate, REST backfill after a websocket outage |
 | `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
 | `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
-| `ENTRY_EVIDENCE_GATE` | off | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=true` turns it on |
+| `ENTRY_EVIDENCE_GATE` | on | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=false` turns it off |
 
 ## Execution modes and order protections
 

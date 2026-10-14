@@ -63,9 +63,9 @@ def _rows(db):
 
 
 @pytest.mark.skipif(bool(os.getenv("ENTRY_EVIDENCE_GATE")), reason="env overrides the default")
-def test_gate_off_by_default():
+def test_gate_on_by_default():
     import config
-    assert config.ENTRY_EVIDENCE_GATE is False
+    assert config.ENTRY_EVIDENCE_GATE is True
     assert config.VALIDATED_STRATEGIES == frozenset()
 
 
