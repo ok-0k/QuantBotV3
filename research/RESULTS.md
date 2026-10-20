@@ -1,6 +1,9 @@
 # Signal research — results (2026-10-07, corrected 2026-10-11)
 
 > **Follow-up (2026-10-20):** the owner's "smart money" intraday playbook (liquidity sweep, market structure shift, fair value gap entry) was tested in a separate pre-registered study. All 8 short decision units were rejected. See [RESULTS_SMC.md](RESULTS_SMC.md).
+> Any version that loosens the rules to get more trades (other killzones, looser displacement,
+> other target or bias rules) is a new study: it needs its own pre-registration and PM review,
+> and is never a re-run of this one on the same data.
 
 **Question:** does any simple, well-known signal beat realistic trading costs on
 the live bot's 50-coin universe, on data it was not designed on?
