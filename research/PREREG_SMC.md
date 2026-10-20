@@ -9,12 +9,33 @@ timestamps, bar counts, gaps and outages (Appendix A). That is the same kind
 of data-only pass as `research/data_check.py`. A Project Manager (PM) reviews
 this document before anything runs.
 
+**Revision 1 (2026-10-20), after PM review of `8e0af86` (verdict: CHANGES,
+small; no lookahead found).**
+- Decisions are made on the 8 configurations × **short** only; `both` is now
+  report-only, like `long`.
+- The OOS t-stat bar is **2.50**, binding.
+- Three binding OOS checks are added: portfolio-scope expectancy > 0,
+  risk-weighted expectancy > 0, and no NY day > 25% of OOS net R.
+- §5.5 wording is fixed.
+- Three sanity counters are added, each of which must be 0.
+- The PM's rulings on the §13 judgement calls are recorded there.
+
+Still design only: no real-data strategy statistic has been computed.
+
 Code: `research/smc.py` implements sections 3 to 11 (data handling,
 detection, bias, order model, costs, limits, statistics, decision rules).
 `tests/test_research_smc.py` tests it on synthetic data only: swing timing,
 structure, displacement, FVG, sweeps, ticks, the fill model, costs, limits,
-verdicts, an exact long/short mirror test, and a no-lookahead test (future
-bars replaced by different data cannot change any earlier setup).
+verdicts, and an exact long/short mirror test. No-lookahead is tested
+several ways:
+- future bars replaced by different data cannot change any earlier setup;
+- at several cut times (09:30, 15m boundaries, 10:55), with the SMT
+  reference symbol's future replaced too, neither the setups nor the orders
+  `walk` places before the cut change, for every config, side, scope and
+  cost case;
+- SMT uses reference information only up to the reclaim;
+- the walk is causal: perturbing any outcome not yet known at time T cannot
+  change an order placed before T.
 `research/smc_data_check.py` downloads the 5m klines and reports coverage.
 The runner (`research/smc_study.py`) is written only after approval, and it
 must use the functions and constants in `research/smc.py` unchanged.
@@ -138,11 +159,11 @@ that is not trading: the MATIC lesson) is met natively. Delisted pairs simply
 stop producing bars, and no symbol-day is eligible without 33.5 hours of
 complete bars before it (§3.6).
 
-`spot_tradable` itself (8h windows on 1h closes) is **reported as a
-cross-check only**, applied to 1h closes resampled from the 5m cache. The
-report counts the traded symbol-days whose window containing 09:30 NY is
-False; the expected count is 0. It is not used to decide, because its 8h
-window can extend up to 8 hours past the decision time.
+`spot_tradable` itself (8h windows on 1h closes) is a **sanity counter**
+(§10, `smc.spot_mismatch_days`), applied to 1h closes resampled from the 5m
+cache. It counts the symbol-days with a placed order whose window containing
+09:30 NY is False. **It must be 0.** It is not a selection rule, because its
+8h window can extend up to 8 hours past the decision time.
 
 Missing bars during a trade: a pending order cannot fill on a missing bar. An
 open position is exited by the first rule that fires on the next bar that
@@ -410,9 +431,10 @@ Conflicting timeframes always give Neutral.
   - This means a bearish break that flips an up state, ends a bearish
     displacement leg, and leaves an FVG.
   - The 15m bars, N = 2 and §4.2–4.4 apply, whatever the entry timeframe.
-- **The effect:** the day is **Neutral from that MSS's confirmation onward**,
-  where confirmation is the close of its FVG's third candle (`smc.neutral_time`).
-  Bearish mirrors.
+- **The effect:** the day is **Neutral from the close of candle m+1**, the
+  candle after the 15m MSS candle m, onward (`smc.neutral_time`). Bearish
+  mirrors.
+  - m+1 is the latest candle that can be the FVG's third candle.
 - It applies to orders placed at or after that time. Pending orders and open
   positions are not touched.
 
@@ -440,7 +462,8 @@ Checks within each bar, in this order:
    the FVG bottom → cancel.
    - With the limit at the CE, price must trade through the CE before it can
      close below the bottom, so check 2 always fires first. This cancel
-     therefore cannot bind. It is kept because the playbook lists it.
+     therefore cannot bind. It is kept because the playbook lists it, and its
+     count is a **sanity counter (§10) that must be 0**.
 4. If the live window ends unfilled → cancel ("expired" after 60 minutes, or
    "killzone_end").
 
@@ -534,8 +557,9 @@ costs is a loss.
   independent. **Inference clusters by NY day** (§10), so 30 correlated alt
   trades on one morning count as one cluster, not 30 observations.
 
-**Reported alongside, not decisional:** the **portfolio variant** (scope
-`portfolio`).
+**The portfolio variant** (scope `portfolio`) is **binding** through one
+check (§11 `port_exp_pos`: its OOS expectancy at base cost must be > 0). PM
+ruling on §13 #17: the bot is one account.
 - The same limits apply once across all symbols: 2 filled-or-pending orders
   a day, −2U a day, −5U a week, one order per symbol.
 - Orders are processed in placement order; ties go by `config.SYMBOLS` order,
@@ -543,11 +567,14 @@ costs is a loss.
 - This variant shows what a single account following the playbook literally
   would have done. The report also shows the worst day in U and the most
   trades in a day for the per-symbol run, so its portfolio risk is visible.
+- In addition, §11 `day_share` (no NY day > 25% of OOS net R) catches a
+  result carried by one big correlated morning.
 
 **Note:** with the 2-trade cap, "2 consecutive losses" can never bind (the
 cap binds first). The −2U daily stop binds only after a single loss worse
 than −2R, such as a gap or 2× costs. Both rules are implemented as written
-anyway.
+anyway. **The number of times the two-loss rule binds is a sanity counter
+(§10) that must be 0.**
 
 ### 8.3 News
 
@@ -565,8 +592,8 @@ reasons:
    inconsistently.
 3. A fixed daily no-entry window around 10:00 (for example 09:55–10:05) would
    be an executable stand-in, but it would cut every day for a release that
-   occurs on only some days. **The PM may switch it on before the run** (an
-   option, not in the grid).
+   occurs on only some days. **PM ruling (2026-10-20): the window stays
+   OFF.**
 
 The forward test (§14) records whether each trade overlapped a 10:00 release,
 so the effect can be checked going forward.
@@ -595,8 +622,9 @@ simulations**, because the limits interact:
 
 **Fixed, not grid dimensions:** the time stop (on), the risk unit (0.5%), the
 news handling (none), TP1 = 1R, the limit scope (per symbol), and every
-constant in §4. **Decision units:** 8 configurations × {short, both} = 16
-(§11). The `long` results are reported but cannot produce a candidate (§11).
+constant in §4. **Decision units:** 8 configurations × `short` = **8**
+(§11). The `long` and `both` results are reported but cannot produce a
+candidate (§11).
 
 ## 10. What is reported
 
@@ -618,7 +646,7 @@ winners. Output goes to `results/<timestamp>-smc/`: `report.txt`,
   cumulative sums in exit-time order;
 - gross (zero-cost) expectancy of the same trades, and cost per trade in R;
 - the worst day in U and the most trades in one day;
-- the top symbol and its share of net R;
+- the top symbol and its share of net R; the top NY day and its share of net R;
 - the number of A+ trades and the exit reasons.
 
 **OOS at 2× costs:** n, expectancy and t. This is a separate simulation,
@@ -635,27 +663,35 @@ because the limits react to the higher losses.
 - eligible symbol-days, and the reasons for ineligibility;
 - the bias distribution (Bullish, Bearish and Neutral days), and the days
   neutralised under §5.5;
-- the `spot_tradable` cross-check count (§3.5);
 - the inferred tick per symbol (median tick ÷ price).
 
-**The portfolio variant (§8.2):** OOS n, expectancy, t and max drawdown in U.
-Reported only.
+**The portfolio variant (§8.2), for every config × side:** IS and OOS n,
+expectancy, t and max drawdown in U. The OOS expectancy feeds §11
+`port_exp_pos`.
 
-**Multiple testing:** for each decision unit, whether the OOS t clears the
-Bonferroni level of 2.73 (§12). This flag is informational.
+**Sanity counters (each must be 0).** Over every config, side, scope and cost
+case of the run:
+
+| counter | source | why it must be 0 |
+|---|---|---|
+| `fvg_invalid` cancels | outcome reason of placed orders (`walk` stats `outcome_fvg_invalid`) | a CE limit always fills first (§6.1) |
+| two-loss rule binds | `walk` stats `two_loss_binds` | the 2-trade cap binds first (§8.2) |
+| `spot_tradable` mismatches | `smc.spot_mismatch_days` over symbol-days with a placed order | eligibility needs complete bars before 09:30 (§3.5) |
+
+**If any counter is not 0, every verdict is frozen.** It is then handled as
+a §15 bug: a demonstrating test, a fix, before-and-after numbers for all
+configurations, and a post-hoc label. No verdict stands until that is done.
 
 **For the whole run:** the data fingerprint (`smc.fingerprint`), the commit
 hash, END and the runtime.
 
 ## 11. Decision rules (fixed now)
 
-**Scope.** The rules are applied to each of the **16 decision units**: the
-8 configurations × side ∈ {**short**, **both**}.
-- `short` is decidable on its own, as the bot needs.
-- `both` tests the full playbook.
-- `long` is reported with the same checks for information. It cannot become a
-  candidate, because the bot cannot trade it, and a long-capable executor
-  would need its own pre-registration.
+**Scope.** The rules are applied to each of the **8 decision units**: the
+8 configurations × side **short**.
+- `long` and `both` are reported with the same checks for information. They
+  cannot become candidates: the bot is short-only and cannot trade them, and
+  a long-capable executor would need its own pre-registration.
 
 All statistics are in **R per trade net of base costs**, unweighted, unless a
 rule says otherwise (`smc.verdict`, thresholds in `smc.PASS`).
@@ -666,11 +702,14 @@ A decision unit is a **CANDIDATE** only if **every** check holds:
 |---|---|
 | `is_exp_pos` | IS expectancy > 0 |
 | `oos_exp_min` | OOS expectancy ≥ **+0.10R** |
-| `oos_t` | OOS day-clustered t-stat ≥ **2.0** |
+| `oos_t` | OOS day-clustered t-stat ≥ **2.50** |
 | `oos_n` | at least **100** OOS trades |
 | `oos_h1_pos`, `oos_h2_pos` | expectancy > 0 in **both** OOS halves |
 | `oos_2x_nonneg` | OOS expectancy ≥ 0 at **2× costs** (its own simulation) |
 | `sym_share` | no single symbol contributes more than **25%** of OOS net R (total OOS net R must be > 0) |
+| `day_share` | no single NY trading day contributes more than **25%** of OOS net R (total OOS net R must be > 0) |
+| `oos_exp_w_pos` | OOS **risk-weighted** expectancy Σ wR / Σ w > 0, where A+ is sized at 2× B |
+| `port_exp_pos` | OOS expectancy > 0 with **portfolio-scope** limits (§8.2), at base cost |
 
 **Max drawdown in R** (and in U) is reported for every unit. It is not a
 threshold.
@@ -683,30 +722,52 @@ threshold.
 - **0.10R** is a minimum economic edge after costs. It leaves room for
   frictions the backtest does not model (worse fills on small caps, borrow
   that is unavailable, queue position).
-- **t ≥ 2 clustered by day** is needed because same-morning trades across 50
-  coins are correlated.
+- **t ≥ 2.50 clustered by day.** Same-morning trades across 50 coins are
+  correlated, and 2.50 is the Bonferroni bar for 8 units at one-sided 5%
+  (§12). This universe has already had 65+ failed tests.
+- **The 2× cost check is the real bar.** At 2× costs the expectancy is
+  roughly the base expectancy minus one more cost per trade, so it needs
+  base expectancy ≥ cost per trade. That is about 0.25R on 15m and about
+  0.45R on 5m (PM estimate from the ATR figures in §1), well above the 0.10R
+  floor. The 0.10R floor is confirmed as written.
 - **Both halves** guard against a result carried by one regime.
-- **2× costs** and the **25% concentration cap** guard against a result
-  carried by optimistic costs or by one coin (the MATIC lesson).
+- **2× costs** and the **25% concentration caps** guard against a result
+  carried by optimistic costs, by one coin (the MATIC lesson) or by one
+  morning.
+- **Risk-weighted** and **portfolio** expectancy guard against an edge that
+  disappears when trades are sized and limited the way one account actually
+  would.
 
 ## 12. Multiple testing
 
-There are 16 decision units, strongly correlated: the same setups appear
-across management and bias settings, and short sits inside both.
+There are 8 decision units (configurations × short), strongly correlated:
+the same setups appear across management and bias settings.
 
-- A one-sided t ≥ 2.0 is about p = 0.023 per unit. Across 16 independent
-  units, about 0.37 would clear the t-rule alone by chance.
-- A Bonferroni correction for 16 would need t ≥ 2.73. The report flags each
-  unit against 2.73, but **the pre-registered rule stays at 2.0**.
-- **The defences:** the stacked rules (minimum 0.10R, a positive IS, both OOS
-  halves positive, 2× costs, at least 100 trades, the concentration cap), then
-  the independent re-run and the forward test (§14).
+- **The bar is t ≥ 2.50**, the Bonferroni correction for 8 units at one-sided
+  5% (0.05 / 8 = 0.00625, which is z ≈ 2.50). It is binding.
+- Under no edge, the chance that any one of 8 independent units clears it by
+  luck is at most about 5%. The correlation between units makes it smaller.
+- **The defences on top:** the stacked rules (minimum 0.10R, a positive IS,
+  both OOS halves positive, 2× costs, at least 100 trades, symbol and day
+  concentration caps, risk-weighted and portfolio expectancy), then the
+  independent re-run and the forward test (§14).
 - Even a CANDIDATE is weak evidence until it survives a forward paper test.
 
 ## 13. Judgement calls and unverified assumptions
 
-**Judgement calls**, made here before any result. The PM may change any of
-them before the run; after the run none may change.
+**Judgement calls**, made here before any result. After the run none may
+change.
+
+**PM rulings (2026-10-20):**
+- #1–3, #8, #9, #13, #15, #16, #20 and #21 are confirmed.
+- #10: TP1 = entry + 1R is confirmed.
+- #17: the portfolio variant becomes binding through `port_exp_pos`.
+- #18: the time stop is always on.
+- #19: the 09:55–10:05 window stays OFF.
+- #24: the decision covers short only.
+- The two rules that can never fire stay in, with their counts reported
+  (§10).
+- All other items stand as written.
 
 1. **Day and week boundaries.** The NY day runs midnight to midnight (not a
    17:00 or 18:00 roll). The week runs Monday to Sunday with the weekend
@@ -732,7 +793,7 @@ them before the run; after the run none may change.
    Ties in "closest to the broken swing" go to the later FVG.
 10. **TP1 = entry + 1.0R** exactly, not an "internal high". The alternative,
     TP1 = the displacement leg's high, makes TP1 and the TP1-cancel rule
-    depend on leg shape. **The PM may pick it.**
+    depend on leg shape. *(PM: 1R confirmed.)*
 11. **TP2 = the nearest untaken Tier 1/2 pool.** If it is < 2R away the setup
     is skipped, with no looking further out.
 12. **The sweep extreme** is the lowest low from the earliest merged sweep
@@ -743,13 +804,13 @@ them before the run; after the run none may change.
 15. **SMT** is measured against BTC (ETH for BTC) on the same level type,
     Tier 1/2 only.
 16. **Risk:** 0.5% fixed for A+, 0.25% for B and for A+ on a Neutral day.
-17. **The limits are per symbol** for the decision. The portfolio variant is
-    reported (§8.2). **The PM may make "portfolio OOS expectancy > 0" an
-    additional binding check.**
+17. **The limits are per symbol** for the main statistics. *(PM: the
+    portfolio variant is binding through `port_exp_pos` (§8.2, §11).)*
 18. **The time stop is on** in every configuration. The playbook says
-    "consider". It is not a grid dimension, to keep the grid at 8.
-19. **No news blackout** (§8.3). **The PM may switch on a fixed 09:55–10:05
-    no-entry window.**
+    "consider". It is not a grid dimension, to keep the grid at 8. *(PM:
+    confirmed.)*
+19. **No news blackout** (§8.3). *(PM: the 09:55–10:05 window stays OFF.
+    The forward test logs 10:00 releases.)*
 20. **Execution on 5m bars** for both entry timeframes.
 21. **Same-bar ambiguities** are resolved against the strategy:
     - a TP1 touch before a fill means a cancel;
@@ -760,8 +821,8 @@ them before the run; after the run none may change.
     loss.
 23. **Expectancy is unweighted per trade.** The risk-weighted figure is
     reported.
-24. **Sides are separate simulations.** The decision covers short and both;
-    long is informational.
+24. **Sides are separate simulations.** *(PM: the decision covers short
+    only; long and both are informational.)*
 25. **Eligibility** (§3.6): a complete 33.5h of 5m bars before the session,
     a listing age of at least 30 days, and at least $2M a day of quote volume
     over the last 7 days.
@@ -815,7 +876,7 @@ pre-registered, and there is no re-tuning.
 ## 15. What may not change after results are seen
 
 None of the following may change after results are seen:
-- the grid, the sides, and which sides decide;
+- the grid, the sides, and which side decides (short);
 - every constant in `research/smc.py`, §4: swing N, the ATR length,
   displacement, the FVG minimum, the equal-level tolerance, the reclaim and
   MSS windows, the stop buffer, TP1, the TP2 minimum, the order TTL, the time
@@ -846,11 +907,25 @@ CANDIDATE.
    - simulate and price them with `smc.attach_outcomes`;
    - apply gates and limits with `smc.walk`;
    - summarise with `smc.split` and `smc.summarize`;
-   - decide with `smc.verdict`.
+   - decide with `smc.verdict(base, stress_2x_oos, portfolio_oos)`;
+   - count the §10 sanity counters with `walk(stats=)` and
+     `smc.spot_mismatch_days`.
 
    It should keep only setups and day contexts per symbol, not the bars
    (memory on the Pi).
-2. **The first real-data run is the run of record.** Its output is committed
+
+   It must also:
+   - refuse to run on a dirty tree or without `RESEARCH_OFFLINE=1`;
+   - record the commit, the data fingerprint and END;
+   - compute everything in one invocation;
+   - print no statistic until all output is written.
+
+   The synthetic end-to-end test monkeypatches `smc.load_symbol`. It uses at
+   least 3 symbols, including BTC and ETH, and covers the full grid × all
+   sides, the 2× run, the portfolio variant, the verdicts and the output
+   files.
+2. **No smoke or partial real-data runs.**
+3. **The first real-data run is the run of record.** Its output is committed
    unchanged, and the write-up (`research/RESULTS_SMC.md`) follows.
 
 ```

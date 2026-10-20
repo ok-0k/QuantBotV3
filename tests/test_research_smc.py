@@ -80,7 +80,8 @@ def test_grid_is_the_8_preregistered_configs():
     assert len(g) == 8 and len({c.name for c in g}) == 8
     assert {c.tf for c in g} == {5, 15} and {c.mgmt for c in g} == {"pbe", "tp2"}
     assert {c.bias for c in g} == {True, False}
-    assert M.DECISION_SIDES == ("short", "both")
+    assert M.DECISION_SIDES == ("short",)                    # "long" and "both" are report-only
+    assert M.PASS["oos_t"] == 2.50 and M.PASS["day_share"] == 0.25
 
 
 def test_trading_days_are_nyse_weekdays():
@@ -406,20 +407,45 @@ def test_cluster_t():
     assert M.cluster_t(r, np.arange(50)) == pytest.approx(plain)
 
 
-def _summ(exp, n=200, t=3.0, share=0.1):
-    return {"exp": exp, "n": n, "t": t, "max_sym_share": share}
+def _summ(exp, n=200, t=3.0, share=0.1, exp_w=None, day_share=0.1):
+    return {"exp": exp, "n": n, "t": t, "max_sym_share": share,
+            "exp_w": exp if exp_w is None else exp_w, "max_day_share": day_share}
 
 
 def test_verdict_needs_every_rule():
     good = {"IS": _summ(0.05), "OOS": _summ(0.15), "OOS_H1": _summ(0.1), "OOS_H2": _summ(0.2)}
-    v, failed = M.verdict(good, {"exp": 0.01})
+    port = {"exp": 0.05}
+    v, failed = M.verdict(good, {"exp": 0.01}, port)
     assert v.startswith("CANDIDATE") and failed == []
     for k, bad, fail in (("IS", _summ(-0.01), "is_exp_pos"), ("OOS", _summ(0.09), "oos_exp_min"),
-                         ("OOS", _summ(0.2, t=1.9), "oos_t"), ("OOS", _summ(0.2, n=99), "oos_n"),
-                         ("OOS_H2", _summ(-0.1), "oos_h2_pos"), ("OOS", _summ(0.2, share=0.3), "sym_share")):
-        v, failed = M.verdict({**good, k: bad}, {"exp": 0.01})
+                         ("OOS", _summ(0.2, t=2.49), "oos_t"), ("OOS", _summ(0.2, n=99), "oos_n"),
+                         ("OOS_H2", _summ(-0.1), "oos_h2_pos"), ("OOS", _summ(0.2, share=0.3), "sym_share"),
+                         ("OOS", _summ(0.2, exp_w=-0.01), "oos_exp_w_pos"),
+                         ("OOS", _summ(0.2, day_share=0.26), "day_share"),
+                         ("OOS", _summ(0.2, share=np.nan, day_share=np.nan), "day_share")):
+        v, failed = M.verdict({**good, k: bad}, {"exp": 0.01}, port)
         assert v == "rejected" and fail in failed
-    assert "oos_2x_nonneg" in M.verdict(good, {"exp": -0.001})[1]
+    assert M.verdict({**good, "OOS": _summ(0.2, t=2.50)}, {"exp": 0.01}, port)[1] == []
+    assert "oos_2x_nonneg" in M.verdict(good, {"exp": -0.001}, port)[1]
+    assert "port_exp_pos" in M.verdict(good, {"exp": 0.01}, {"exp": 0.0})[1]
+    assert "port_exp_pos" in M.verdict(good, {"exp": 0.01}, M.summarize([]))[1]   # no portfolio trades
+
+
+def _trade(sym, day, r, w=1.0, grade="A+"):
+    return M.Trade(sym, day, -1, grade, w, r, r + 0.3, "tp2", day, day, day)
+
+
+def test_summarize_day_share_and_risk_weighted_expectancy():
+    tr = [_trade("A", 1, 3.0), _trade("B", 1, 1.0), _trade("A", 2, -1.0, w=0.5, grade="B"),
+          _trade("C", 3, 1.0, w=0.5, grade="B")]
+    s = M.summarize(tr)
+    assert s["total_r"] == pytest.approx(4.0)
+    assert s["max_day_share"] == pytest.approx(4.0 / 4.0) and s["top_day"] == 1     # day 1 = all of the net R
+    assert s["max_sym_share"] == pytest.approx(2.0 / 4.0)
+    assert s["exp_w"] == pytest.approx((3 + 1 - 0.5 + 0.5) / 3.0)
+    assert s["exp"] == pytest.approx(1.0)
+    neg = M.summarize([_trade("A", 1, 1.0, w=0.5, grade="B"), _trade("B", 2, -0.8)])
+    assert neg["exp"] > 0 and neg["exp_w"] < 0                                     # A+ losers outweigh
 
 
 def test_periods():
@@ -474,6 +500,34 @@ def test_walk_one_at_a_time_two_per_day_and_daily_stop():
     port = [_fake("A", D0, 575, 1.0, 640), _fake("B", D0, 580, 1.0, 640), _fake("A", D0, 650, 1.0, 660)]
     assert len(M.walk(port, ctxs, cfg, (1,), "base", scope="symbol")) == 3
     assert len(M.walk(port, ctxs, cfg, (1,), "base", scope="portfolio")) == 2
+
+
+def test_walk_counts_refusals_and_logs_placed_orders(monkeypatch):
+    cfg = M.Config(5, "tp2", False)
+    ctxs = {"A": {D0: _ctx()}}
+    cands = [_fake("A", D0, 575, -0.5, 590), _fake("A", D0, 580, 1.0, 600),
+             _fake("A", D0, 595, -0.5, 600), _fake("A", D0, 605, 1.0, 610)]
+    st, log = {}, []
+    M.walk(cands, ctxs, cfg, (1,), "base", stats=st, placed_log=log)
+    assert [x[3] for x in log] == [M.ny_ms(D0, 575), M.ny_ms(D0, 595)]
+    assert st["symbol_busy"] == 1 and st["day_cap"] == 1 and st.get("two_loss_binds", 0) == 0
+    assert st["placed"] == 2 and st["outcome_stop"] == 2
+    monkeypatch.setattr(M, "MAX_TRADES_DAY", 3)                  # only then can the two-loss rule bind
+    st2 = {}
+    assert len(M.walk(cands, ctxs, cfg, (1,), "base", stats=st2)) == 2 and st2["two_loss_binds"] == 1
+
+
+def test_spot_tradable_cross_check_counts_days_without_spot_bars():
+    b = random_walk("2024-01-01", 20, seed=4)
+    d_ok, d_gap = M.day_num(date(2024, 1, 10)), M.day_num(date(2024, 1, 12))
+    c = b.c.copy()
+    t930 = M.ny_ms(d_gap, M.KZ_START)
+    lab = pd.Timestamp(t930, unit="ms", tz="UTC").ceil("8h")
+    gone = (b.t + M.BASE_MS > int(lab.timestamp() * 1000) - 8 * M.HOUR_MS) & (b.t + M.BASE_MS <= int(lab.timestamp() * 1000))
+    c[gone] = np.nan                                             # no spot bar in that whole 8h window
+    bb = M.Bars(b.t, b.o, b.h, b.l, c, 5, b.qv)
+    assert M.spot_mismatch_days(b, [d_ok, d_gap]) == []
+    assert M.spot_mismatch_days(bb, [d_ok, d_gap]) == [d_gap]
 
 
 def test_walk_weekly_stop_and_sides():
@@ -553,6 +607,130 @@ def test_no_lookahead_future_bars_cannot_change_past_setups(synth):
             c1, c2 = p1.ctx[d], p2.ctx[d]
             assert (c1.bias, c1.daily_dir, c1.p0, c1.liquidity) == (c2.bias, c2.daily_dir, c2.p0, c2.liquidity)
             assert min(c1.neutral_from, cut + 1) == min(c2.neutral_from, cut + 1)
+
+
+def _splice(b, other, i):
+    """b up to bar i-1, then `other`'s bars shifted to continue from b's last close."""
+    shift = b.c[i - 1] - other.o[i]
+    f = lambda a, x: np.r_[a[:i], np.round(x[i:] + shift, 2)]
+    return M.Bars(b.t, f(b.o, other.o), f(b.h, other.h), f(b.l, other.l), f(b.c, other.c), 5, b.qv)
+
+
+def _pipeline(bx, bref, days):
+    """Two symbols, each the other's SMT reference; setups with SMT, outcomes."""
+    px, pr = M.prepare("XUSDT", bx, days), M.prepare("BTCUSDT", bref, days)
+    rx, rr = M.ref_taken_times(pr), M.ref_taken_times(px)
+    cands = []
+    for prep, ref in ((px, rx), (pr, rr)):
+        cs = [c for tf in (5, 15) for sd in (1, -1) for c in M.find_candidates(prep, tf, sd, ref=ref)]
+        M.attach_outcomes(cs, prep.b5, {k: v["b"] for k, v in prep.tf.items()})
+        cands += cs
+    return cands, {"XUSDT": px.ctx, "BTCUSDT": pr.ctx}
+
+
+def _placed(cands, ctxs):
+    out = {}
+    for cfg in M.grid():
+        for side_name, sides in M.SIDES.items():
+            for scope in ("symbol", "portfolio"):
+                for ck in ("base", "2x"):
+                    log = []
+                    M.walk(cands, ctxs, cfg, sides, ck, scope=scope, placed_log=log,
+                           sym_order={"BTCUSDT": 0, "XUSDT": 1})
+                    out[(cfg.name, side_name, scope, ck)] = log
+    return out
+
+
+def test_no_lookahead_at_several_cuts_including_smt_reference_and_walk(synth):
+    b, days = synth
+    bref = random_walk("2024-01-01", 200, seed=21, base=60.0)
+    cands, ctxs = _pipeline(b, bref, days)
+    assert any(c.smt for c in cands) and any(not c.smt for c in cands)
+    base_placed = _placed(cands, ctxs)
+    # Cuts: 09:30 on the reference symbol's first setup day, then cuts landing EXACTLY on
+    # placement times (15m boundaries, 10:55), so that any peek past placement changes a setup.
+    tp = sorted({c.t_place for c in cands})
+    minute = lambda t: int(M.ny_day_minute(np.array([t]))[1][0])
+    on15 = [t for t in tp if minute(t) % 15 == 0]
+    at1055 = [t for t in tp if minute(t) == 10 * 60 + 55]
+    cuts = ([M.ny_ms(min(c.day for c in cands if c.sym == "BTCUSDT"), 9 * 60 + 30)]
+            + on15[:: max(1, len(on15) // 4)][:4] + (at1055[:1] or [M.ny_ms(cands[-1].day, 10 * 60 + 55)]))
+    assert sum(c.t_place in cuts for c in cands) >= 3
+    ox, orf = random_walk("2024-01-01", 200, seed=98), random_walk("2024-01-01", 200, seed=97, base=60.0)
+    checked_cands = checked_orders = 0
+    for cut in cuts:
+        i = (cut - int(b.t[0])) // M.BASE_MS
+        alt_c, alt_ctx = _pipeline(_splice(b, ox, i), _splice(bref, orf, i), days)
+        k1 = sorted((c.sym, c.smt) + _key(c) for c in cands if c.t_place <= cut)
+        k2 = sorted((c.sym, c.smt) + _key(c) for c in alt_c if c.t_place <= cut)
+        assert k1 == k2
+        checked_cands += len(k1)
+        alt_placed = _placed(alt_c, alt_ctx)
+        for key, log in base_placed.items():
+            before = [x for x in log if x[3] < cut]
+            assert before == [x for x in alt_placed[key] if x[3] < cut], key
+            checked_orders += len(before)
+    assert checked_cands > 0 and checked_orders > 0
+
+
+def test_smt_uses_reference_information_only_up_to_the_reclaim(synth):
+    b, days = synth
+    prep = M.prepare("XUSDT", b, days)
+    base = [c for tf in (5, 15) for sd in (1, -1) for c in M.find_candidates(prep, tf, sd)]
+    tier12 = lambda c: any(k in M.TIER1 + M.TIER2 for k in c.sweep_kinds)
+    assert any(tier12(c) for c in base)
+    kinds = M.TIER1 + M.TIER2
+    late = {d: {(sd, k): max(c.t_place for c in base if c.day == d) + M.BASE_MS for sd in (1, -1) for k in kinds}
+            for d in {c.day for c in base}}
+    early = {d: {(sd, k): min(c.t_sweep for c in base if c.day == d) for sd in (1, -1) for k in kinds}
+             for d in {c.day for c in base}}
+    for tf in (5, 15):
+        for sd in (1, -1):
+            for c in M.find_candidates(prep, tf, sd, ref=late):       # reference takes its level only later
+                assert c.smt == tier12(c)
+            assert not any(c.smt for c in M.find_candidates(prep, tf, sd, ref=early))
+
+
+def test_walk_is_causal_future_outcomes_cannot_change_earlier_orders():
+    rng = np.random.default_rng(5)
+    syms = ["S0", "S1", "S2"]
+    days = [D0 + k for k in range(5)]                           # Mon..Fri
+    ctxs = {sy: {d: _ctx(bias=int(rng.integers(-1, 2))) for d in days} for sy in syms}
+
+    def make(seed):
+        g = np.random.default_rng(seed)
+        out = []
+        for d in days:
+            for sy in syms:
+                for place in sorted(g.choice(np.arange(575, 655, 5), 6, replace=False)):
+                    c = _fake(sy, d, int(place), float(g.normal(-0.2, 1.5)), int(place) + int(g.integers(5, 60)),
+                              filled=bool(g.random() < 0.7), grade=["A+", "B"][int(g.integers(0, 2))],
+                              side=[1, -1][int(g.integers(0, 2))])
+                    out.append(c)
+        return out
+
+    cands = make(1)
+    cuts = [(k, mn) for k in range(len(days)) for mn in range(575, 665, 5)]   # every 5 min, 09:35-11:00
+    for n_cut, (cut_day, cut_min) in enumerate(cuts):
+        T = M.ny_ms(days[cut_day], cut_min)
+        alt = make(1)
+        g = np.random.default_rng(n_cut)
+        for c in alt:
+            oc = c.out["tp2"]
+            if c.t_place >= T or oc.t_end > T:                  # anything not yet known at T
+                filled = bool(g.random() < 0.5) if c.t_place >= T or oc.t_fill > T else oc.filled
+                t_end = max(T + M.BASE_MS, c.t_place + M.BASE_MS) + int(g.integers(0, 12)) * M.BASE_MS
+                new = M.Outcome(filled, "x", t_end, oc.t_fill)
+                c.out = {"tp2": new, "pbe": new}
+                r = float(g.choice([-5.0, 5.0]))                # extreme, so any peek moves a limit
+                c.r = {(mg, k): r for mg in ("tp2", "pbe") for k in M.COSTS}
+        for cfg in (M.Config(5, "tp2", True), M.Config(5, "pbe", False)):
+            for sides in M.SIDES.values():
+                for scope in ("symbol", "portfolio"):
+                    l1, l2 = [], []
+                    M.walk(cands, ctxs, cfg, sides, "base", scope=scope, placed_log=l1)
+                    M.walk(alt, ctxs, cfg, sides, "base", scope=scope, placed_log=l2)
+                    assert [x for x in l1 if x[3] < T] == [x for x in l2 if x[3] < T]
 
 
 def test_long_and_short_detection_are_exact_mirrors(synth):

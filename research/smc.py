@@ -119,8 +119,8 @@ def grid() -> list[Config]:
 
 
 SIDES = {"long": (1,), "short": (-1,), "both": (1, -1)}
-DECISION_SIDES = ("short", "both")
-PASS = {"oos_exp": 0.10, "oos_t": 2.0, "oos_n": 100, "sym_share": 0.25}
+DECISION_SIDES = ("short",)     # §11: the bot is short-only; "long" and "both" are report-only
+PASS = {"oos_exp": 0.10, "oos_t": 2.50, "oos_n": 100, "sym_share": 0.25, "day_share": 0.25}
 
 
 # ── bars and time ────────────────────────────────────────────────────────────
@@ -631,9 +631,10 @@ def _taken_window(b5: Bars, a: int, z: int, level: float, hi: bool, tick: float)
 
 
 def neutral_time(b15: Bars, atr15_prev: np.ndarray, st15: Structure, D: int) -> int:
-    """§5.5 earliest confirmation time (close of the FVG's third candle) of a
-    15m displacement MSS whose MSS candle opens in [09:30, 11:00) on day D,
-    in LONG space (pass mirrored bars and structure for a bullish bias)."""
+    """§5.5 earliest time the day turns Neutral: the close of candle m+1 after
+    a 15m displacement MSS (candle m, opening in [09:30, 11:00) on day D)
+    whose leg leaves an FVG, in LONG space (pass mirrored bars and structure
+    for a bullish bias)."""
     a, z = b15.at(ny_ms(D, KZ_START)), b15.at(ny_ms(D, KZ_END))
     for m in range(a, min(z, len(b15.c) - 1)):
         if st15.brk[m] == 1 and st15.prev[m] == -1:
@@ -1042,43 +1043,61 @@ def gate(cand: Candidate, cfg: Config, ctx: DayCtx) -> float | None:
 
 
 def walk(cands: list[Candidate], ctxs: dict, cfg: Config, sides: tuple, cost_key: str,
-         scope: str = "symbol", sym_order: dict | None = None) -> list[Trade]:
+         scope: str = "symbol", sym_order: dict | None = None, stats: dict | None = None,
+         placed_log: list | None = None) -> list[Trade]:
     """§8 apply the bias gate and the risk limits to the candidate stream in
     placement order (ties: SYMBOLS order, then long before short).
-    scope="symbol": every symbol is its own playbook account (the decision
-    run); scope="portfolio": one shared account (reported only).
+    scope="symbol": every symbol is its own playbook account (the main
+    decision run); scope="portfolio": one shared account (§11 check
+    port_exp_pos: its OOS expectancy must be > 0).
     Limits per account: at most MAX_TRADES_DAY filled-or-pending orders per NY
     day; no new order once the day's realized U <= -2 or its last two closed
     trades both lost; none once the week's realized U <= -5; one order or
-    position per symbol at a time."""
+    position per symbol at a time. `stats` (optional) counts why candidates
+    were refused (incl. the §10 sanity counter "two_loss_binds"); `placed_log`
+    (optional) receives (sym, tf, side, t_place) of every order placed."""
     so = sym_order or {}
     order = sorted((c for c in cands if c.side in sides and c.tf == cfg.tf),
                    key=lambda c: (c.t_place, so.get(c.sym, 0), -c.side))
     busy: dict[str, int] = {}
     placed: dict[tuple, list] = {}    # (account, day) -> [(filled, t_end, trade or None)]
     trades: list[Trade] = []
+    st = stats if stats is not None else {}
+    bump = lambda k: st.__setitem__(k, st.get(k, 0) + 1)
     for c in order:
         ctx = ctxs[c.sym][c.day]
         w = gate(c, cfg, ctx)
-        if w is None or busy.get(c.sym, -1) > c.t_place:
+        if w is None:
+            bump("gate_refused")
+            continue
+        if busy.get(c.sym, -1) > c.t_place:
+            bump("symbol_busy")
             continue
         acct = c.sym if scope == "symbol" else "ALL"
         today = placed.setdefault((acct, c.day), [])
         if sum(1 for filled, t_end, tr in today if filled or t_end > c.t_place) >= MAX_TRADES_DAY:
+            bump("day_cap")
             continue
         closed = sorted((tr for _, _, tr in today if tr is not None and tr.t_exit <= c.t_place),
                         key=lambda x: x.t_exit)
         if sum(x.w * x.r for x in closed) <= DAY_STOP_U:
+            bump("day_stop_binds")
             continue
         if len(closed) >= DAY_MAX_LOSSES and all(x.r < 0 for x in closed[-DAY_MAX_LOSSES:]):
+            bump("two_loss_binds")
             continue
         mon = c.day - int(weekday(c.day))
         week_u = sum(tr.w * tr.r for d in range(mon, c.day + 1) for _, _, tr in placed.get((acct, d), ())
                      if tr is not None and tr.t_exit <= c.t_place)
         if week_u <= WEEK_STOP_U:
+            bump("week_stop_binds")
             continue
         oc = c.out[cfg.mgmt]
         busy[c.sym] = oc.t_end
+        bump("placed")
+        bump(f"outcome_{oc.reason}")
+        if placed_log is not None:
+            placed_log.append((c.sym, c.tf, c.side, c.t_place))
         tr = None
         if oc.filled:
             tr = Trade(c.sym, c.day, c.side, c.grade, w, c.r[(cfg.mgmt, cost_key)], c.r[(cfg.mgmt, "zero")],
@@ -1141,7 +1160,8 @@ def period_of(day: int) -> str:
 
 def summarize(trades: list[Trade]) -> dict:
     if not trades:
-        return {"n": 0, "exp": np.nan, "t": np.nan, "total_r": 0.0, "max_sym_share": np.nan}
+        return {"n": 0, "exp": np.nan, "exp_w": np.nan, "t": np.nan, "total_r": 0.0,
+                "max_sym_share": np.nan, "max_day_share": np.nan}
     tr = sorted(trades, key=lambda x: (x.t_exit, x.sym))
     r = np.array([x.r for x in tr])
     w = np.array([x.w for x in tr])
@@ -1150,6 +1170,7 @@ def summarize(trades: list[Trade]) -> dict:
     by_sym = pd.Series(r).groupby([x.sym for x in tr]).sum()
     tot = float(r.sum())
     per_day_u = pd.Series(w * r).groupby(day).sum()
+    per_day_r = pd.Series(r).groupby(day).sum()
     return {
         "n": int(r.size), "exp": float(r.mean()), "median": float(np.median(r)), "t": cluster_t(r, day),
         "win_rate": float((r > 0).mean()), "avg_win": float(wins.mean()) if wins.size else np.nan,
@@ -1163,6 +1184,8 @@ def summarize(trades: list[Trade]) -> dict:
         "max_trades_day": int(pd.Series(day).value_counts().max()),
         "max_sym_share": float(by_sym.max() / tot) if tot > 0 else np.nan,
         "top_sym": str(by_sym.idxmax()),
+        "max_day_share": float(per_day_r.max() / tot) if tot > 0 else np.nan,
+        "top_day": int(per_day_r.idxmax()),
         "n_a_plus": int(sum(x.grade == "A+" for x in tr)),
         "reasons": pd.Series([x.reason for x in tr]).value_counts().to_dict(),
     }
@@ -1180,8 +1203,9 @@ def split(trades: list[Trade]) -> dict[str, list[Trade]]:
     return out
 
 
-def verdict(base: dict[str, dict], stress: dict) -> tuple[str, list[str]]:
-    """§11 base: summarize() per period at base cost; stress: OOS at 2x cost."""
+def verdict(base: dict[str, dict], stress: dict, port: dict) -> tuple[str, list[str]]:
+    """§11 base: summarize() per period at base cost (per-symbol limits);
+    stress: OOS at 2x cost; port: OOS at base cost with portfolio-scope limits."""
     o = base["OOS"]
     checks = {
         "is_exp_pos": base["IS"].get("exp", np.nan) > 0,
@@ -1192,9 +1216,31 @@ def verdict(base: dict[str, dict], stress: dict) -> tuple[str, list[str]]:
         "oos_h2_pos": base["OOS_H2"].get("exp", np.nan) > 0,
         "oos_2x_nonneg": stress.get("exp", np.nan) >= 0,
         "sym_share": o.get("max_sym_share", np.nan) <= PASS["sym_share"],
+        "day_share": o.get("max_day_share", np.nan) <= PASS["day_share"],
+        "oos_exp_w_pos": o.get("exp_w", np.nan) > 0,
+        "port_exp_pos": port.get("exp", np.nan) > 0,
     }
     failed = [k for k, v in checks.items() if not v]
     return ("CANDIDATE (needs independent re-run + forward test)" if not failed else "rejected"), failed
+
+
+def spot_mismatch_days(b5: Bars, days) -> list[int]:
+    """§3.5 sanity counter: the days (of those given, e.g. days with a placed
+    order) on which research.study.spot_tradable, applied to 1h closes
+    resampled from these 5m bars, is False for the 8h window containing
+    09:30 NY. Expected: none."""
+    from research.study import spot_tradable            # imports config: runner only
+    ok = ~np.isnan(b5.c)
+    close = pd.Series(b5.c[ok], index=pd.to_datetime(b5.t[ok] + BASE_MS, unit="ms", utc=True))
+    c1h = close.resample("1h", closed="right", label="right").last()
+    st = spot_tradable(c1h.to_frame("x"))["x"]
+    out = []
+    for D in days:
+        t = pd.Timestamp(ny_ms(D, KZ_START), unit="ms", tz="UTC")
+        label = t.ceil("8h") if t != t.floor("8h") else t
+        if not bool(st.get(label, False)):
+            out.append(int(D))
+    return out
 
 
 # ── real-data loading (runner only) ─────────────────────────────────────────
