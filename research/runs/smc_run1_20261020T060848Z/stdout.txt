@@ -1,0 +1,464 @@
+SMC playbook study (research/PREREG_SMC.md, revision 1)
+commit 215157796213c95aeaf32bf71d3bdbb743d0e291  fingerprint eafd756afa4c3c6dbe2d47b78a3e74a1c435edfede1f7180d10242a4c7d4fc15
+END 2026-10-07 00:00:00+00:00  IS 2023-01-01..2025-04-01  OOS 2025-04-01..END (split 2026-01-01)
+50 symbols, 943 trading days, runtime 246.8s
+
+SANITY COUNTERS (must all be 0): fvg_invalid=0, two_loss_binds=0, spot_mismatch=0   ->  ok
+
+DECISION UNITS (config x short)
+config / side               IS exp  OOS n OOS exp  OOS t  H1 exp  H2 exp  2x exp   exp_w    port   sym%   day%   mdd R  verdict / failed checks
+smc_5m_pbe_bias short      -0.194     20 +0.174  +0.48 +0.333 -0.302 -0.182 +0.174 +0.047  +0.74  +1.59    -3.8  rejected  [is_exp_pos, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share]
+smc_5m_pbe_nobias short    -0.075     61 -0.038  -0.19 +0.116 -0.219 -0.418 +0.032 -0.260      —      —   -10.9  rejected  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, port_exp_pos]
+smc_5m_tp2_bias short      -0.145     20 +0.412  +0.81 +0.717 -0.504 +0.034 +0.412 +0.196  +0.55  +1.10    -3.2  rejected  [is_exp_pos, oos_t, oos_n, oos_h2_pos, sym_share, day_share]
+smc_5m_tp2_nobias short    -0.003     61 +0.153  +0.55 +0.390 -0.127 -0.244 +0.236 -0.134  +0.69  +1.18    -9.9  rejected  [is_exp_pos, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, port_exp_pos]
+smc_15m_pbe_bias short     -0.599      6 -0.128  -0.25 -0.234 -0.076 -0.414 -0.128 -0.128      —      —    -1.7  rejected  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_pbe_nobias short   -0.365     22 -0.168  -0.69 -0.017 -0.294 -0.382 -0.159 -0.120      —      —    -6.0  rejected  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_bias short     -0.641      6 -0.030  -0.05 -0.284 +0.096 -0.319 -0.030 -0.030      —      —    -1.7  rejected  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_nobias short   -0.408     22 -0.114  -0.42 +0.042 -0.243 -0.335 -0.096 -0.058      —      —    -5.8  rejected  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+
+INFORMATIONAL (cannot produce a candidate)
+config / side               IS exp  OOS n OOS exp  OOS t  H1 exp  H2 exp  2x exp   exp_w    port   sym%   day%   mdd R  verdict / failed checks
+smc_5m_pbe_bias long       -0.339     26 -0.208  -0.76 +0.158 -0.900 -0.485 -0.224 -0.357      —      —    -8.5  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_pbe_nobias long     -0.288     95 -0.437  -3.19 -0.390 -0.540 -0.727 -0.388 -0.455      —      —   -41.8  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_tp2_bias long       -0.460     26 -0.204  -0.59 +0.255 -1.070 -0.491 -0.219 -0.381      —      —   -10.6  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_tp2_nobias long     -0.308     95 -0.445  -2.66 -0.317 -0.722 -0.743 -0.393 -0.501      —      —   -42.7  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_pbe_bias long      +0.042      7 -0.196  -0.46 -0.142 -0.269 -0.402 -0.196 -0.196      —      —    -3.3  informational (rejected)  [oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_pbe_nobias long    -0.056     24 -0.282  -1.34 -0.206 -0.388 -0.490 -0.263 -0.358      —      —    -8.7  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_bias long      +0.060      7 -0.183  -0.32 +0.126 -0.594 -0.395 -0.183 -0.183      —      —    -4.2  informational (rejected)  [oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_nobias long    -0.112     24 -0.254  -1.00 -0.139 -0.413 -0.468 -0.238 -0.324      —      —    -9.1  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_pbe_bias both       -0.271     46 -0.042  -0.19 +0.240 -0.686 -0.354 -0.062 -0.160      —      —   -10.0  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_pbe_nobias both     -0.188    156 -0.281  -2.46 -0.219 -0.385 -0.606 -0.221 -0.368      —      —   -45.3  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_5m_tp2_bias both       -0.311     46 +0.064  +0.22 +0.471 -0.867 -0.263 +0.039 -0.100  +1.53  +3.07   -13.1  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, port_exp_pos]
+smc_5m_tp2_nobias both     -0.165    156 -0.211  -1.41 -0.079 -0.435 -0.548 -0.142 -0.337      —      —   -43.5  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_pbe_bias both      -0.324     13 -0.165  -0.52 -0.173 -0.158 -0.408 -0.165 -0.165      —      —    -4.0  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_pbe_nobias both    -0.183     46 -0.227  -1.45 -0.127 -0.336 -0.439 -0.214 -0.245      —      —   -13.7  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_bias both      -0.340     13 -0.112  -0.29 -0.011 -0.199 -0.360 -0.112 -0.112      —      —    -4.9  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+smc_15m_tp2_nobias both    -0.234     46 -0.187  -1.03 -0.064 -0.321 -0.404 -0.170 -0.197      —      —   -13.2  informational (rejected)  [is_exp_pos, oos_exp_min, oos_t, oos_n, oos_h1_pos, oos_h2_pos, oos_2x_nonneg, sym_share, day_share, oos_exp_w_pos, port_exp_pos]
+
+ALL SIMULATIONS (per period)
+config               sides     scope cost  period      n     exp      t    win     PF    tot R   mdd R   mdd U   gross cost/tr    A+
+smc_5m_pbe_bias       long    symbol base      IS     27 -0.339  -2.27  +0.48  +0.33     -9.1   -10.2    -6.2 -0.062 +0.276    27
+smc_5m_pbe_bias       long    symbol base     OOS     26 -0.208  -0.76  +0.35  +0.59     -5.4    -8.5    -5.2 +0.069 +0.277    26
+smc_5m_pbe_bias       long    symbol base  OOS_H1     17 +0.158  +0.50  +0.47  +1.56     +2.7    -3.0    -1.5 +0.428 +0.270    17
+smc_5m_pbe_bias       long    symbol base  OOS_H2      9 -0.900  -5.88  +0.11  +0.03     -8.1    -8.1    -4.3 -0.610 +0.290     9
+smc_5m_pbe_bias       long    symbol   2x      IS     27 -0.615  -3.89  +0.33  +0.11    -16.6   -16.7   -10.2 -0.062 +0.552    27
+smc_5m_pbe_bias       long    symbol   2x     OOS     26 -0.485  -1.78  +0.23  +0.30    -12.6   -13.8    -7.9 +0.069 +0.554    26
+smc_5m_pbe_bias       long    symbol   2x  OOS_H1     17 -0.112  -0.37  +0.35  +0.74     -1.9    -4.8    -2.4 +0.428 +0.540    17
+smc_5m_pbe_bias       long    symbol   2x  OOS_H2      9 -1.190  -7.70  +0.00  +0.00    -10.7   -10.7    -5.8 -0.610 +0.579     9
+smc_5m_pbe_bias       long portfolio base      IS     27 -0.339  -2.27  +0.48  +0.33     -9.1   -10.2    -6.2 -0.062 +0.276    27
+smc_5m_pbe_bias       long portfolio base     OOS     20 -0.357  -1.78  +0.25  +0.38     -7.1    -8.8    -5.4 -0.083 +0.274    20
+smc_5m_pbe_bias       long portfolio base  OOS_H1     12 -0.023  -0.08  +0.33  +0.94     -0.3    -2.6    -2.0 +0.236 +0.258    12
+smc_5m_pbe_bias       long portfolio base  OOS_H2      8 -0.860  -4.62  +0.12  +0.03     -6.9    -7.1    -3.8 -0.561 +0.298     8
+smc_5m_pbe_bias       long portfolio   2x      IS     27 -0.615  -3.89  +0.33  +0.11    -16.6   -16.7   -10.2 -0.062 +0.552    27
+smc_5m_pbe_bias       long portfolio   2x     OOS     20 -0.632  -3.03  +0.15  +0.21    -12.6   -13.8    -8.2 -0.083 +0.549    20
+smc_5m_pbe_bias       long portfolio   2x  OOS_H1     12 -0.281  -0.96  +0.25  +0.50     -3.4    -4.7    -3.2 +0.236 +0.517    12
+smc_5m_pbe_bias       long portfolio   2x  OOS_H2      8 -1.158  -6.25  +0.00  +0.00     -9.3    -9.3    -5.1 -0.561 +0.597     8
+smc_5m_pbe_bias      short    symbol base      IS     24 -0.194  -1.02  +0.33  +0.61     -4.7    -5.7    -2.9 +0.043 +0.237    24
+smc_5m_pbe_bias      short    symbol base     OOS     20 +0.174  +0.48  +0.60  +1.47     +3.5    -3.8    -1.9 +0.531 +0.357    19
+smc_5m_pbe_bias      short    symbol base  OOS_H1     15 +0.333  +0.78  +0.67  +2.16     +5.0    -3.8    -1.9 +0.710 +0.377    14
+smc_5m_pbe_bias      short    symbol base  OOS_H2      5 -0.302  -0.53  +0.40  +0.52     -1.5    -2.1    -1.1 -0.008 +0.294     5
+smc_5m_pbe_bias      short    symbol   2x      IS     24 -0.432  -2.20  +0.33  +0.34    -10.4   -10.4    -5.4 +0.043 +0.475    24
+smc_5m_pbe_bias      short    symbol   2x     OOS     20 -0.182  -0.48  +0.40  +0.67     -3.6    -6.1    -3.1 +0.531 +0.713    19
+smc_5m_pbe_bias      short    symbol   2x  OOS_H1     15 -0.045  -0.10  +0.40  +0.90     -0.7    -6.1    -3.1 +0.710 +0.755    14
+smc_5m_pbe_bias      short    symbol   2x  OOS_H2      5 -0.595  -0.95  +0.40  +0.31     -3.0    -3.0    -1.5 -0.008 +0.588     5
+smc_5m_pbe_bias      short portfolio base      IS     24 -0.194  -1.02  +0.33  +0.61     -4.7    -5.7    -2.9 +0.043 +0.237    24
+smc_5m_pbe_bias      short portfolio base     OOS     19 +0.047  +0.16  +0.58  +1.12     +0.9    -3.8    -1.9 +0.405 +0.358    18
+smc_5m_pbe_bias      short portfolio base  OOS_H1     14 +0.171  +0.49  +0.64  +1.56     +2.4    -3.8    -1.9 +0.553 +0.381    13
+smc_5m_pbe_bias      short portfolio base  OOS_H2      5 -0.302  -0.53  +0.40  +0.52     -1.5    -2.1    -1.1 -0.008 +0.294     5
+smc_5m_pbe_bias      short portfolio   2x      IS     24 -0.432  -2.20  +0.33  +0.34    -10.4   -10.4    -5.4 +0.043 +0.475    24
+smc_5m_pbe_bias      short portfolio   2x     OOS     19 -0.311  -0.98  +0.37  +0.47     -5.9    -7.2    -3.6 +0.405 +0.717    18
+smc_5m_pbe_bias      short portfolio   2x  OOS_H1     14 -0.210  -0.56  +0.36  +0.57     -2.9    -6.1    -3.1 +0.553 +0.763    13
+smc_5m_pbe_bias      short portfolio   2x  OOS_H2      5 -0.595  -0.95  +0.40  +0.31     -3.0    -3.0    -1.5 -0.008 +0.588     5
+smc_5m_pbe_bias       both    symbol base      IS     51 -0.271  -2.29  +0.41  +0.46    -13.8   -14.3    -8.4 -0.013 +0.258    51
+smc_5m_pbe_bias       both    symbol base     OOS     46 -0.042  -0.19  +0.46  +0.91     -1.9   -10.0    -5.3 +0.270 +0.312    45
+smc_5m_pbe_bias       both    symbol base  OOS_H1     32 +0.240  +0.95  +0.56  +1.84     +7.7    -3.1    -2.2 +0.560 +0.320    31
+smc_5m_pbe_bias       both    symbol base  OOS_H2     14 -0.686  -3.27  +0.21  +0.16     -9.6    -9.6    -5.1 -0.395 +0.291    14
+smc_5m_pbe_bias       both    symbol   2x      IS     51 -0.529  -4.30  +0.33  +0.21    -27.0   -27.1   -15.5 -0.013 +0.516    51
+smc_5m_pbe_bias       both    symbol   2x     OOS     46 -0.354  -1.60  +0.30  +0.44    -16.3   -17.3    -9.7 +0.270 +0.623    45
+smc_5m_pbe_bias       both    symbol   2x  OOS_H1     32 -0.081  -0.31  +0.38  +0.82     -2.6    -8.0    -4.5 +0.560 +0.641    31
+smc_5m_pbe_bias       both    symbol   2x  OOS_H2     14 -0.977  -4.33  +0.14  +0.09    -13.7   -13.7    -7.3 -0.395 +0.582    14
+smc_5m_pbe_bias       both portfolio base      IS     51 -0.271  -2.29  +0.41  +0.46    -13.8   -14.3    -8.4 -0.013 +0.258    51
+smc_5m_pbe_bias       both portfolio base     OOS     39 -0.160  -0.90  +0.41  +0.67     -6.3    -9.0    -5.0 +0.155 +0.315    38
+smc_5m_pbe_bias       both portfolio base  OOS_H1     26 +0.082  +0.37  +0.50  +1.24     +2.1    -3.2    -2.3 +0.406 +0.325    25
+smc_5m_pbe_bias       both portfolio base  OOS_H2     13 -0.645  -2.85  +0.23  +0.18     -8.4    -8.6    -4.6 -0.348 +0.297    13
+smc_5m_pbe_bias       both portfolio   2x      IS     51 -0.529  -4.30  +0.33  +0.21    -27.0   -27.1   -15.5 -0.013 +0.516    51
+smc_5m_pbe_bias       both portfolio   2x     OOS     39 -0.476  -2.55  +0.26  +0.32    -18.6   -19.6   -11.1 +0.155 +0.631    38
+smc_5m_pbe_bias       both portfolio   2x  OOS_H1     26 -0.243  -1.03  +0.31  +0.54     -6.3    -9.4    -5.6 +0.406 +0.649    25
+smc_5m_pbe_bias       both portfolio   2x  OOS_H2     13 -0.942  -3.87  +0.15  +0.10    -12.2   -12.2    -6.6 -0.348 +0.593    13
+smc_5m_pbe_nobias     long    symbol base      IS     98 -0.288  -1.53  +0.39  +0.52    -28.3   -28.9   -19.1 -0.001 +0.287    27
+smc_5m_pbe_nobias     long    symbol base     OOS     95 -0.437  -3.19  +0.28  +0.29    -41.5   -41.8   -24.1 -0.147 +0.290    26
+smc_5m_pbe_nobias     long    symbol base  OOS_H1     65 -0.390  -2.07  +0.29  +0.33    -25.3   -25.5   -12.0 -0.117 +0.272    17
+smc_5m_pbe_nobias     long    symbol base  OOS_H2     30 -0.540  -3.68  +0.27  +0.22    -16.2   -16.2   -12.2 -0.212 +0.328     9
+smc_5m_pbe_nobias     long    symbol   2x      IS     98 -0.575  -2.91  +0.27  +0.30    -56.4   -56.7   -36.7 -0.001 +0.574    27
+smc_5m_pbe_nobias     long    symbol   2x     OOS     95 -0.727  -5.29  +0.16  +0.14    -69.1   -69.1   -40.8 -0.147 +0.580    26
+smc_5m_pbe_nobias     long    symbol   2x  OOS_H1     65 -0.662  -3.58  +0.15  +0.16    -43.0   -43.0   -22.5 -0.117 +0.544    17
+smc_5m_pbe_nobias     long    symbol   2x  OOS_H2     30 -0.868  -5.24  +0.17  +0.10    -26.1   -26.1   -18.4 -0.212 +0.656     9
+smc_5m_pbe_nobias     long portfolio base      IS     81 -0.448  -3.69  +0.33  +0.32    -36.3   -36.9   -23.3 -0.148 +0.301    26
+smc_5m_pbe_nobias     long portfolio base     OOS     62 -0.455  -4.17  +0.27  +0.28    -28.2   -29.3   -18.1 -0.155 +0.300    16
+smc_5m_pbe_nobias     long portfolio base  OOS_H1     38 -0.455  -3.17  +0.26  +0.28    -17.3   -18.2    -9.6 -0.180 +0.276     9
+smc_5m_pbe_nobias     long portfolio base  OOS_H2     24 -0.455  -2.65  +0.29  +0.28    -10.9   -11.1    -8.5 -0.117 +0.337     7
+smc_5m_pbe_nobias     long portfolio   2x      IS     81 -0.749  -5.85  +0.22  +0.17    -60.6   -61.0   -38.9 -0.148 +0.601    26
+smc_5m_pbe_nobias     long portfolio   2x     OOS     62 -0.755  -6.38  +0.15  +0.14    -46.8   -47.4   -28.6 -0.155 +0.599    16
+smc_5m_pbe_nobias     long portfolio   2x  OOS_H1     38 -0.731  -4.80  +0.13  +0.15    -27.8   -28.4   -15.3 -0.180 +0.551     9
+smc_5m_pbe_nobias     long portfolio   2x  OOS_H2     24 -0.792  -4.11  +0.17  +0.12    -19.0   -19.0   -13.3 -0.117 +0.675     7
+smc_5m_pbe_nobias    short    symbol base      IS     87 -0.075  -0.56  +0.44  +0.83     -6.5   -12.0    -8.8 +0.179 +0.254    24
+smc_5m_pbe_nobias    short    symbol base     OOS     61 -0.038  -0.19  +0.51  +0.93     -2.3   -10.9    -6.3 +0.343 +0.381    19
+smc_5m_pbe_nobias    short    symbol base  OOS_H1     33 +0.116  +0.37  +0.55  +1.24     +3.8    -5.4    -3.2 +0.555 +0.439    14
+smc_5m_pbe_nobias    short    symbol base  OOS_H2     28 -0.219  -0.97  +0.46  +0.63     -6.1    -9.7    -5.6 +0.092 +0.311     5
+smc_5m_pbe_nobias    short    symbol   2x      IS     87 -0.330  -2.36  +0.38  +0.46    -28.7   -28.9   -19.6 +0.179 +0.509    24
+smc_5m_pbe_nobias    short    symbol   2x     OOS     61 -0.418  -1.84  +0.43  +0.47    -25.5   -28.6   -15.3 +0.343 +0.761    19
+smc_5m_pbe_nobias    short    symbol   2x  OOS_H1     33 -0.323  -0.89  +0.42  +0.57    -10.7   -16.2    -9.7 +0.555 +0.879    14
+smc_5m_pbe_nobias    short    symbol   2x  OOS_H2     28 -0.531  -2.09  +0.43  +0.35    -14.9   -17.3   -10.2 +0.092 +0.623     5
+smc_5m_pbe_nobias    short portfolio base      IS     70 -0.130  -1.00  +0.44  +0.73     -9.1   -11.1    -8.4 +0.142 +0.272    23
+smc_5m_pbe_nobias    short portfolio base     OOS     50 -0.260  -1.37  +0.42  +0.58    -13.0   -15.5    -7.5 +0.141 +0.401    17
+smc_5m_pbe_nobias    short portfolio base  OOS_H1     26 -0.154  -0.54  +0.46  +0.72     -4.0    -8.5    -5.1 +0.307 +0.461    12
+smc_5m_pbe_nobias    short portfolio base  OOS_H2     24 -0.376  -1.48  +0.38  +0.46     -9.0   -10.5    -6.0 -0.038 +0.338     5
+smc_5m_pbe_nobias    short portfolio   2x      IS     70 -0.403  -2.93  +0.37  +0.39    -28.2   -28.7   -19.5 +0.142 +0.545    23
+smc_5m_pbe_nobias    short portfolio   2x     OOS     50 -0.662  -2.96  +0.32  +0.27    -33.1   -34.6   -20.0 +0.141 +0.803    17
+smc_5m_pbe_nobias    short portfolio   2x  OOS_H1     26 -0.614  -1.77  +0.31  +0.30    -16.0   -18.3   -11.3 +0.307 +0.921    12
+smc_5m_pbe_nobias    short portfolio   2x  OOS_H2     24 -0.713  -2.52  +0.33  +0.25    -17.1   -18.0   -10.5 -0.038 +0.675     5
+smc_5m_pbe_nobias     both    symbol base      IS    185 -0.188  -1.65  +0.41  +0.64    -34.8   -36.8   -25.3 +0.084 +0.272    51
+smc_5m_pbe_nobias     both    symbol base     OOS    156 -0.281  -2.46  +0.37  +0.52    -43.8   -45.3   -26.8 +0.044 +0.325    45
+smc_5m_pbe_nobias     both    symbol base  OOS_H1     98 -0.219  -1.33  +0.38  +0.60    -21.5   -21.7   -10.3 +0.109 +0.328    31
+smc_5m_pbe_nobias     both    symbol base  OOS_H2     58 -0.385  -3.00  +0.36  +0.40    -22.3   -23.6   -16.5 -0.065 +0.320    14
+smc_5m_pbe_nobias     both    symbol   2x      IS    185 -0.460  -3.85  +0.32  +0.36    -85.1   -85.6   -56.3 +0.084 +0.544    51
+smc_5m_pbe_nobias     both    symbol   2x     OOS    156 -0.606  -5.02  +0.26  +0.26    -94.6   -95.2   -54.9 +0.044 +0.651    45
+smc_5m_pbe_nobias     both    symbol   2x  OOS_H1     98 -0.548  -3.17  +0.24  +0.30    -53.7   -53.7   -27.3 +0.109 +0.657    31
+smc_5m_pbe_nobias     both    symbol   2x  OOS_H2     58 -0.705  -4.87  +0.29  +0.21    -40.9   -41.6   -27.6 -0.065 +0.640    14
+smc_5m_pbe_nobias     both portfolio base      IS    149 -0.291  -3.32  +0.39  +0.49    -43.4   -45.6   -29.9 -0.005 +0.287    49
+smc_5m_pbe_nobias     both portfolio base     OOS    112 -0.368  -3.55  +0.34  +0.41    -41.2   -43.3   -24.9 -0.023 +0.345    33
+smc_5m_pbe_nobias     both portfolio base  OOS_H1     64 -0.333  -2.32  +0.34  +0.45    -21.3   -23.1   -11.1 +0.018 +0.351    21
+smc_5m_pbe_nobias     both portfolio base  OOS_H2     48 -0.415  -2.75  +0.33  +0.37    -19.9   -20.3   -13.7 -0.078 +0.337    12
+smc_5m_pbe_nobias     both portfolio   2x      IS    149 -0.578  -6.23  +0.30  +0.26    -86.2   -87.0   -57.0 -0.005 +0.574    49
+smc_5m_pbe_nobias     both portfolio   2x     OOS    112 -0.713  -6.02  +0.22  +0.20    -79.9   -80.5   -48.1 -0.023 +0.690    33
+smc_5m_pbe_nobias     both portfolio   2x  OOS_H1     64 -0.684  -4.13  +0.20  +0.21    -43.7   -44.4   -24.7 +0.018 +0.702    21
+smc_5m_pbe_nobias     both portfolio   2x  OOS_H2     48 -0.753  -4.46  +0.25  +0.19    -36.1   -36.1   -23.4 -0.078 +0.675    12
+smc_5m_tp2_bias       long    symbol base      IS     27 -0.460  -2.34  +0.26  +0.33    -12.4   -13.0    -8.3 -0.173 +0.287    27
+smc_5m_tp2_bias       long    symbol base     OOS     26 -0.204  -0.59  +0.23  +0.65     -5.3   -10.6    -6.1 +0.084 +0.288    26
+smc_5m_tp2_bias       long    symbol base  OOS_H1     17 +0.255  +0.68  +0.35  +1.79     +4.3    -3.0    -1.5 +0.539 +0.284    17
+smc_5m_tp2_bias       long    symbol base  OOS_H2      9 -1.070  -6.37  +0.00  +0.00     -9.6    -9.6    -5.1 -0.775 +0.294     9
+smc_5m_tp2_bias       long    symbol   2x      IS     27 -0.747  -3.64  +0.22  +0.18    -20.2   -20.2   -12.7 -0.173 +0.574    27
+smc_5m_tp2_bias       long    symbol   2x     OOS     26 -0.491  -1.46  +0.23  +0.39    -12.8   -14.6    -8.3 +0.084 +0.575    26
+smc_5m_tp2_bias       long    symbol   2x  OOS_H1     17 -0.029  -0.08  +0.35  +0.94     -0.5    -4.7    -2.3 +0.539 +0.568    17
+smc_5m_tp2_bias       long    symbol   2x  OOS_H2      9 -1.364  -8.23  +0.00  +0.00    -12.3   -12.3    -6.6 -0.775 +0.589     9
+smc_5m_tp2_bias       long portfolio base      IS     27 -0.460  -2.34  +0.26  +0.33    -12.4   -13.0    -8.3 -0.173 +0.287    27
+smc_5m_tp2_bias       long portfolio base     OOS     20 -0.381  -1.48  +0.15  +0.43     -7.6    -9.7    -5.8 -0.101 +0.281    20
+smc_5m_tp2_bias       long portfolio base  OOS_H1     12 +0.065  +0.18  +0.25  +1.16     +0.8    -2.6    -1.7 +0.330 +0.265    12
+smc_5m_tp2_bias       long portfolio base  OOS_H2      8 -1.051  -5.80  +0.00  +0.00     -8.4    -8.4    -4.5 -0.747 +0.304     8
+smc_5m_tp2_bias       long portfolio   2x      IS     27 -0.747  -3.64  +0.22  +0.18    -20.2   -20.2   -12.7 -0.173 +0.574    27
+smc_5m_tp2_bias       long portfolio   2x     OOS     20 -0.662  -2.49  +0.15  +0.27    -13.2   -15.1    -8.8 -0.101 +0.561    20
+smc_5m_tp2_bias       long portfolio   2x  OOS_H1     12 -0.200  -0.55  +0.25  +0.68     -2.4    -4.2    -3.0 +0.330 +0.530    12
+smc_5m_tp2_bias       long portfolio   2x  OOS_H2      8 -1.354  -7.42  +0.00  +0.00    -10.8   -10.8    -5.9 -0.747 +0.607     8
+smc_5m_tp2_bias      short    symbol base      IS     24 -0.145  -0.62  +0.29  +0.71     -3.5    -6.3    -3.2 +0.100 +0.244    24
+smc_5m_tp2_bias      short    symbol base     OOS     20 +0.412  +0.81  +0.55  +1.95     +8.2    -3.2    -1.6 +0.789 +0.377    19
+smc_5m_tp2_bias      short    symbol base  OOS_H1     15 +0.717  +1.19  +0.67  +3.49    +10.8    -3.2    -1.6 +1.119 +0.403    14
+smc_5m_tp2_bias      short    symbol base  OOS_H2      5 -0.504  -0.78  +0.20  +0.43     -2.5    -2.5    -1.3 -0.203 +0.301     5
+smc_5m_tp2_bias      short    symbol   2x      IS     24 -0.389  -1.66  +0.29  +0.43     -9.3    -9.3    -5.0 +0.100 +0.488    24
+smc_5m_tp2_bias      short    symbol   2x     OOS     20 +0.034  +0.07  +0.45  +1.05     +0.7    -5.8    -2.9 +0.789 +0.754    19
+smc_5m_tp2_bias      short    symbol   2x  OOS_H1     15 +0.314  +0.50  +0.53  +1.68     +4.7    -5.8    -2.9 +1.119 +0.805    14
+smc_5m_tp2_bias      short    symbol   2x  OOS_H2      5 -0.804  -1.16  +0.20  +0.30     -4.0    -4.0    -2.0 -0.203 +0.601     5
+smc_5m_tp2_bias      short portfolio base      IS     24 -0.145  -0.62  +0.29  +0.71     -3.5    -6.3    -3.2 +0.100 +0.244    24
+smc_5m_tp2_bias      short portfolio base     OOS     19 +0.196  +0.52  +0.53  +1.43     +3.7    -3.2    -1.6 +0.576 +0.380    18
+smc_5m_tp2_bias      short portfolio base  OOS_H1     14 +0.446  +1.02  +0.64  +2.45     +6.2    -3.2    -1.6 +0.854 +0.408    13
+smc_5m_tp2_bias      short portfolio base  OOS_H2      5 -0.504  -0.78  +0.20  +0.43     -2.5    -2.5    -1.3 -0.203 +0.301     5
+smc_5m_tp2_bias      short portfolio   2x      IS     24 -0.389  -1.66  +0.29  +0.43     -9.3    -9.3    -5.0 +0.100 +0.488    24
+smc_5m_tp2_bias      short portfolio   2x     OOS     19 -0.184  -0.46  +0.42  +0.72     -3.5    -6.4    -3.2 +0.576 +0.760    18
+smc_5m_tp2_bias      short portfolio   2x  OOS_H1     14 +0.037  +0.08  +0.50  +1.08     +0.5    -5.8    -2.9 +0.854 +0.817    13
+smc_5m_tp2_bias      short portfolio   2x  OOS_H2      5 -0.804  -1.16  +0.20  +0.30     -4.0    -4.0    -2.0 -0.203 +0.601     5
+smc_5m_tp2_bias       both    symbol base      IS     51 -0.311  -2.08  +0.27  +0.48    -15.9   -16.4   -10.1 -0.045 +0.267    51
+smc_5m_tp2_bias       both    symbol base     OOS     46 +0.064  +0.22  +0.37  +1.12     +2.9   -13.1    -6.9 +0.391 +0.327    45
+smc_5m_tp2_bias       both    symbol base  OOS_H1     32 +0.471  +1.39  +0.50  +2.54    +15.1    -3.2    -2.3 +0.811 +0.340    31
+smc_5m_tp2_bias       both    symbol base  OOS_H2     14 -0.867  -3.49  +0.07  +0.13    -12.1   -12.1    -6.4 -0.571 +0.297    14
+smc_5m_tp2_bias       both    symbol   2x      IS     51 -0.578  -3.76  +0.25  +0.28    -29.5   -29.5   -17.6 -0.045 +0.534    51
+smc_5m_tp2_bias       both    symbol   2x     OOS     46 -0.263  -0.89  +0.33  +0.64    -12.1   -17.9    -9.4 +0.391 +0.653    45
+smc_5m_tp2_bias       both    symbol   2x  OOS_H1     32 +0.132  +0.38  +0.44  +1.27     +4.2    -6.0    -3.9 +0.811 +0.679    31
+smc_5m_tp2_bias       both    symbol   2x  OOS_H2     14 -1.164  -4.51  +0.07  +0.10    -16.3   -16.3    -8.6 -0.571 +0.593    14
+smc_5m_tp2_bias       both portfolio base      IS     51 -0.311  -2.08  +0.27  +0.48    -15.9   -16.4   -10.1 -0.045 +0.267    51
+smc_5m_tp2_bias       both portfolio base     OOS     39 -0.100  -0.44  +0.33  +0.82     -3.9   -11.9    -6.2 +0.229 +0.329    38
+smc_5m_tp2_bias       both portfolio base  OOS_H1     26 +0.270  +0.95  +0.46  +1.76     +7.0    -3.2    -2.3 +0.612 +0.342    25
+smc_5m_tp2_bias       both portfolio base  OOS_H2     13 -0.840  -3.25  +0.08  +0.15    -10.9   -10.9    -5.8 -0.538 +0.303    13
+smc_5m_tp2_bias       both portfolio   2x      IS     51 -0.578  -3.76  +0.25  +0.28    -29.5   -29.5   -17.6 -0.045 +0.534    51
+smc_5m_tp2_bias       both portfolio   2x     OOS     39 -0.429  -1.81  +0.28  +0.46    -16.7   -19.1   -10.9 +0.229 +0.658    38
+smc_5m_tp2_bias       both portfolio   2x  OOS_H1     26 -0.072  -0.24  +0.38  +0.87     -1.9    -7.6    -4.6 +0.612 +0.685    25
+smc_5m_tp2_bias       both portfolio   2x  OOS_H2     13 -1.143  -4.21  +0.08  +0.10    -14.9   -14.9    -7.9 -0.538 +0.605    13
+smc_5m_tp2_nobias     long    symbol base      IS     98 -0.308  -1.08  +0.27  +0.59    -30.2   -35.0   -21.4 -0.007 +0.301    27
+smc_5m_tp2_nobias     long    symbol base     OOS     95 -0.445  -2.66  +0.20  +0.36    -42.3   -42.7   -26.1 -0.147 +0.298    26
+smc_5m_tp2_nobias     long    symbol base  OOS_H1     65 -0.317  -1.40  +0.25  +0.48    -20.6   -24.5   -12.2 -0.037 +0.280    17
+smc_5m_tp2_nobias     long    symbol base  OOS_H2     30 -0.722  -4.28  +0.10  +0.16    -21.7   -21.7   -15.6 -0.384 +0.337     9
+smc_5m_tp2_nobias     long    symbol   2x      IS     98 -0.609  -2.07  +0.21  +0.39    -59.7   -59.7   -39.9 -0.007 +0.602    27
+smc_5m_tp2_nobias     long    symbol   2x     OOS     95 -0.743  -4.50  +0.16  +0.20    -70.5   -70.5   -41.7 -0.147 +0.596    26
+smc_5m_tp2_nobias     long    symbol   2x  OOS_H1     65 -0.597  -2.71  +0.18  +0.28    -38.8   -41.1   -20.8 -0.037 +0.559    17
+smc_5m_tp2_nobias     long    symbol   2x  OOS_H2     30 -1.059  -5.87  +0.10  +0.10    -31.8   -31.8   -22.0 -0.384 +0.675     9
+smc_5m_tp2_nobias     long portfolio base      IS     81 -0.508  -3.34  +0.22  +0.37    -41.2   -41.3   -27.1 -0.194 +0.314    26
+smc_5m_tp2_nobias     long portfolio base     OOS     62 -0.501  -3.90  +0.19  +0.30    -31.0   -32.5   -19.9 -0.193 +0.308    16
+smc_5m_tp2_nobias     long portfolio base  OOS_H1     38 -0.418  -2.47  +0.24  +0.37    -15.9   -18.1    -9.2 -0.135 +0.283     9
+smc_5m_tp2_nobias     long portfolio base  OOS_H2     24 -0.632  -3.16  +0.12  +0.21    -15.2   -15.2   -11.1 -0.284 +0.348     7
+smc_5m_tp2_nobias     long portfolio   2x      IS     81 -0.822  -5.16  +0.17  +0.23    -66.6   -66.6   -43.5 -0.194 +0.628    26
+smc_5m_tp2_nobias     long portfolio   2x     OOS     62 -0.809  -5.95  +0.15  +0.18    -50.1   -51.0   -31.1 -0.193 +0.616    16
+smc_5m_tp2_nobias     long portfolio   2x  OOS_H1     38 -0.701  -3.97  +0.16  +0.21    -26.6   -27.5   -14.7 -0.135 +0.566     9
+smc_5m_tp2_nobias     long portfolio   2x  OOS_H2     24 -0.979  -4.53  +0.12  +0.13    -23.5   -23.5   -16.4 -0.284 +0.695     7
+smc_5m_tp2_nobias    short    symbol base      IS     87 -0.003  -0.02  +0.36  +0.99     -0.3   -12.2    -8.8 +0.261 +0.264    24
+smc_5m_tp2_nobias    short    symbol base     OOS     61 +0.153  +0.55  +0.49  +1.26     +9.3    -9.9    -6.1 +0.549 +0.397    19
+smc_5m_tp2_nobias    short    symbol base  OOS_H1     33 +0.390  +0.88  +0.55  +1.73    +12.9    -6.7    -3.3 +0.851 +0.461    14
+smc_5m_tp2_nobias    short    symbol base  OOS_H2     28 -0.127  -0.45  +0.43  +0.80     -3.6    -9.9    -5.7 +0.193 +0.321     5
+smc_5m_tp2_nobias    short    symbol   2x      IS     87 -0.267  -1.49  +0.30  +0.60    -23.3   -25.6   -17.1 +0.261 +0.528    24
+smc_5m_tp2_nobias    short    symbol   2x     OOS     61 -0.244  -0.81  +0.44  +0.71    -14.9   -19.8   -11.3 +0.549 +0.793    19
+smc_5m_tp2_nobias    short    symbol   2x  OOS_H1     33 -0.071  -0.14  +0.48  +0.91     -2.3   -13.5    -7.7 +0.851 +0.922    14
+smc_5m_tp2_nobias    short    symbol   2x  OOS_H2     28 -0.448  -1.46  +0.39  +0.48    -12.5   -16.9   -10.1 +0.193 +0.641     5
+smc_5m_tp2_nobias    short portfolio base      IS     70 -0.083  -0.50  +0.34  +0.84     -5.8   -12.0    -9.1 +0.200 +0.283    23
+smc_5m_tp2_nobias    short portfolio base     OOS     50 -0.134  -0.54  +0.40  +0.80     -6.7   -11.0    -6.4 +0.283 +0.417    17
+smc_5m_tp2_nobias    short portfolio base  OOS_H1     26 -0.007  -0.02  +0.46  +0.99     -0.2    -8.6    -4.3 +0.476 +0.483    12
+smc_5m_tp2_nobias    short portfolio base  OOS_H2     24 -0.271  -0.83  +0.33  +0.64     -6.5   -10.6    -6.0 +0.074 +0.345     5
+smc_5m_tp2_nobias    short portfolio   2x      IS     70 -0.365  -2.15  +0.29  +0.50    -25.6   -27.5   -18.3 +0.200 +0.565    23
+smc_5m_tp2_nobias    short portfolio   2x     OOS     50 -0.551  -1.95  +0.34  +0.44    -27.5   -30.7   -17.5 +0.283 +0.834    17
+smc_5m_tp2_nobias    short portfolio   2x  OOS_H1     26 -0.491  -1.10  +0.38  +0.48    -12.8   -18.1   -10.9 +0.476 +0.967    12
+smc_5m_tp2_nobias    short portfolio   2x  OOS_H2     24 -0.616  -1.75  +0.29  +0.39    -14.8   -17.4   -10.4 +0.074 +0.690     5
+smc_5m_tp2_nobias     both    symbol base      IS    185 -0.165  -1.00  +0.31  +0.74    -30.5   -33.6   -24.8 +0.119 +0.284    51
+smc_5m_tp2_nobias     both    symbol base     OOS    156 -0.211  -1.41  +0.31  +0.67    -33.0   -43.5   -28.3 +0.125 +0.336    45
+smc_5m_tp2_nobias     both    symbol base  OOS_H1     98 -0.079  -0.36  +0.35  +0.87     -7.7   -20.8   -10.9 +0.262 +0.341    31
+smc_5m_tp2_nobias     both    symbol base  OOS_H2     58 -0.435  -2.70  +0.26  +0.42    -25.2   -26.1   -19.1 -0.105 +0.329    14
+smc_5m_tp2_nobias     both    symbol   2x      IS    185 -0.448  -2.64  +0.25  +0.47    -82.9   -84.5   -57.0 +0.119 +0.567    51
+smc_5m_tp2_nobias     both    symbol   2x     OOS    156 -0.548  -3.53  +0.27  +0.39    -85.4   -86.0   -48.6 +0.125 +0.673    45
+smc_5m_tp2_nobias     both    symbol   2x  OOS_H1     98 -0.420  -1.88  +0.29  +0.49    -41.1   -43.4   -19.2 +0.262 +0.681    31
+smc_5m_tp2_nobias     both    symbol   2x  OOS_H2     58 -0.764  -4.43  +0.24  +0.25    -44.3   -44.8   -30.6 -0.105 +0.659    14
+smc_5m_tp2_nobias     both portfolio base      IS    149 -0.302  -2.73  +0.28  +0.55    -45.0   -48.2   -32.2 -0.003 +0.299    49
+smc_5m_tp2_nobias     both portfolio base     OOS    112 -0.337  -2.54  +0.29  +0.52    -37.7   -41.0   -23.2 +0.020 +0.357    33
+smc_5m_tp2_nobias     both portfolio base  OOS_H1     64 -0.251  -1.37  +0.33  +0.61    -16.1   -20.1    -8.0 +0.113 +0.364    21
+smc_5m_tp2_nobias     both portfolio base  OOS_H2     48 -0.451  -2.36  +0.23  +0.42    -21.7   -21.7   -15.6 -0.105 +0.346    12
+smc_5m_tp2_nobias     both portfolio   2x      IS    149 -0.601  -5.27  +0.23  +0.34    -89.5   -91.4   -60.4 -0.003 +0.598    49
+smc_5m_tp2_nobias     both portfolio   2x     OOS    111 -0.705  -4.79  +0.23  +0.29    -78.3   -80.0   -47.9 +0.006 +0.712    33
+smc_5m_tp2_nobias     both portfolio   2x  OOS_H1     63 -0.635  -3.04  +0.24  +0.32    -40.0   -41.7   -22.1 +0.091 +0.726    21
+smc_5m_tp2_nobias     both portfolio   2x  OOS_H2     48 -0.798  -3.89  +0.21  +0.25    -38.3   -38.3   -25.8 -0.105 +0.693    12
+smc_15m_pbe_bias      long    symbol base      IS      9 +0.042  +0.28  +0.44  +1.28     +0.4    -1.0    -0.5 +0.208 +0.166     9
+smc_15m_pbe_bias      long    symbol base     OOS      7 -0.196  -0.46  +0.43  +0.63     -1.4    -3.3    -1.6 +0.009 +0.206     7
+smc_15m_pbe_bias      long    symbol base  OOS_H1      4 -0.142  -0.20  +0.25  +0.77     -0.6    -2.4    -1.2 +0.047 +0.189     4
+smc_15m_pbe_bias      long    symbol base  OOS_H2      3 -0.269  -0.54  +0.67  +0.36     -0.8    -1.3    -0.6 -0.041 +0.228     3
+smc_15m_pbe_bias      long    symbol   2x      IS      9 -0.124  -0.79  +0.33  +0.50     -1.1    -1.7    -0.8 +0.208 +0.331     9
+smc_15m_pbe_bias      long    symbol   2x     OOS      7 -0.402  -0.92  +0.29  +0.39     -2.8    -4.5    -2.3 +0.009 +0.411     7
+smc_15m_pbe_bias      long    symbol   2x  OOS_H1      4 -0.331  -0.46  +0.25  +0.56     -1.3    -3.0    -1.5 +0.047 +0.377     4
+smc_15m_pbe_bias      long    symbol   2x  OOS_H2      3 -0.497  -0.96  +0.33  +0.07     -1.5    -1.5    -0.8 -0.041 +0.456     3
+smc_15m_pbe_bias      long portfolio base      IS      8 +0.049  +0.29  +0.50  +1.30     +0.4    -1.0    -0.5 +0.228 +0.179     8
+smc_15m_pbe_bias      long portfolio base     OOS      7 -0.196  -0.46  +0.43  +0.63     -1.4    -3.3    -1.6 +0.009 +0.206     7
+smc_15m_pbe_bias      long portfolio base  OOS_H1      4 -0.142  -0.20  +0.25  +0.77     -0.6    -2.4    -1.2 +0.047 +0.189     4
+smc_15m_pbe_bias      long portfolio base  OOS_H2      3 -0.269  -0.54  +0.67  +0.36     -0.8    -1.3    -0.6 -0.041 +0.228     3
+smc_15m_pbe_bias      long portfolio   2x      IS      8 -0.129  -0.74  +0.38  +0.52     -1.0    -1.7    -0.8 +0.228 +0.357     8
+smc_15m_pbe_bias      long portfolio   2x     OOS      7 -0.402  -0.92  +0.29  +0.39     -2.8    -4.5    -2.3 +0.009 +0.411     7
+smc_15m_pbe_bias      long portfolio   2x  OOS_H1      4 -0.331  -0.46  +0.25  +0.56     -1.3    -3.0    -1.5 +0.047 +0.377     4
+smc_15m_pbe_bias      long portfolio   2x  OOS_H2      3 -0.497  -0.96  +0.33  +0.07     -1.5    -1.5    -0.8 -0.041 +0.456     3
+smc_15m_pbe_bias     short    symbol base      IS     12 -0.599  -4.25  +0.17  +0.04     -7.2    -7.2    -3.6 -0.391 +0.208    12
+smc_15m_pbe_bias     short    symbol base     OOS      6 -0.128  -0.25  +0.50  +0.79     -0.8    -1.7    -0.8 +0.157 +0.286     6
+smc_15m_pbe_bias     short    symbol base  OOS_H1      2 -0.234  -0.23  +0.50  +0.63     -0.5    -1.3    -0.6 -0.041 +0.193     2
+smc_15m_pbe_bias     short    symbol base  OOS_H2      4 -0.076  -0.11  +0.50  +0.87     -0.3    -1.7    -0.8 +0.256 +0.332     4
+smc_15m_pbe_bias     short    symbol   2x      IS     12 -0.807  -4.51  +0.08  +0.01     -9.7    -9.7    -4.8 -0.391 +0.416    12
+smc_15m_pbe_bias     short    symbol   2x     OOS      6 -0.414  -0.72  +0.50  +0.47     -2.5    -3.0    -1.5 +0.157 +0.571     6
+smc_15m_pbe_bias     short    symbol   2x  OOS_H1      2 -0.428  -0.38  +0.50  +0.45     -0.9    -1.5    -0.8 -0.041 +0.387     2
+smc_15m_pbe_bias     short    symbol   2x  OOS_H2      4 -0.407  -0.52  +0.50  +0.49     -1.6    -2.3    -1.2 +0.256 +0.663     4
+smc_15m_pbe_bias     short portfolio base      IS      7 -0.684  -2.81  +0.29  +0.06     -4.8    -4.8    -2.4 -0.399 +0.285     7
+smc_15m_pbe_bias     short portfolio base     OOS      6 -0.128  -0.25  +0.50  +0.79     -0.8    -1.7    -0.8 +0.157 +0.286     6
+smc_15m_pbe_bias     short portfolio base  OOS_H1      2 -0.234  -0.23  +0.50  +0.63     -0.5    -1.3    -0.6 -0.041 +0.193     2
+smc_15m_pbe_bias     short portfolio base  OOS_H2      4 -0.076  -0.11  +0.50  +0.87     -0.3    -1.7    -0.8 +0.256 +0.332     4
+smc_15m_pbe_bias     short portfolio   2x      IS      7 -0.969  -3.67  +0.14  +0.01     -6.8    -6.8    -3.4 -0.399 +0.570     7
+smc_15m_pbe_bias     short portfolio   2x     OOS      6 -0.414  -0.72  +0.50  +0.47     -2.5    -3.0    -1.5 +0.157 +0.571     6
+smc_15m_pbe_bias     short portfolio   2x  OOS_H1      2 -0.428  -0.38  +0.50  +0.45     -0.9    -1.5    -0.8 -0.041 +0.387     2
+smc_15m_pbe_bias     short portfolio   2x  OOS_H2      4 -0.407  -0.52  +0.50  +0.49     -1.6    -2.3    -1.2 +0.256 +0.663     4
+smc_15m_pbe_bias      both    symbol base      IS     21 -0.324  -2.20  +0.29  +0.23     -6.8    -8.1    -4.1 -0.134 +0.190    21
+smc_15m_pbe_bias      both    symbol base     OOS     13 -0.165  -0.52  +0.46  +0.71     -2.1    -4.0    -2.0 +0.078 +0.243    13
+smc_15m_pbe_bias      both    symbol base  OOS_H1      6 -0.173  -0.32  +0.33  +0.72     -1.0    -3.7    -1.9 +0.017 +0.190     6
+smc_15m_pbe_bias      both    symbol base  OOS_H2      7 -0.158  -0.38  +0.57  +0.69     -1.1    -1.9    -1.0 +0.129 +0.287     7
+smc_15m_pbe_bias      both    symbol   2x      IS     21 -0.514  -3.51  +0.19  +0.10    -10.8   -11.3    -5.7 -0.134 +0.380    21
+smc_15m_pbe_bias      both    symbol   2x     OOS     13 -0.408  -1.21  +0.38  +0.43     -5.3    -7.0    -3.5 +0.078 +0.485    13
+smc_15m_pbe_bias      both    symbol   2x  OOS_H1      6 -0.363  -0.67  +0.33  +0.52     -2.2    -4.6    -2.3 +0.017 +0.381     6
+smc_15m_pbe_bias      both    symbol   2x  OOS_H2      7 -0.446  -0.96  +0.43  +0.35     -3.1    -3.2    -1.6 +0.129 +0.575     7
+smc_15m_pbe_bias      both portfolio base      IS     15 -0.293  -1.66  +0.40  +0.32     -4.4    -5.7    -2.9 -0.065 +0.228    15
+smc_15m_pbe_bias      both portfolio base     OOS     13 -0.165  -0.52  +0.46  +0.71     -2.1    -4.0    -2.0 +0.078 +0.243    13
+smc_15m_pbe_bias      both portfolio base  OOS_H1      6 -0.173  -0.32  +0.33  +0.72     -1.0    -3.7    -1.9 +0.017 +0.190     6
+smc_15m_pbe_bias      both portfolio base  OOS_H2      7 -0.158  -0.38  +0.57  +0.69     -1.1    -1.9    -1.0 +0.129 +0.287     7
+smc_15m_pbe_bias      both portfolio   2x      IS     15 -0.521  -2.75  +0.27  +0.13     -7.8    -8.5    -4.2 -0.065 +0.456    15
+smc_15m_pbe_bias      both portfolio   2x     OOS     13 -0.408  -1.21  +0.38  +0.43     -5.3    -7.0    -3.5 +0.078 +0.485    13
+smc_15m_pbe_bias      both portfolio   2x  OOS_H1      6 -0.363  -0.67  +0.33  +0.52     -2.2    -4.6    -2.3 +0.017 +0.381     6
+smc_15m_pbe_bias      both portfolio   2x  OOS_H2      7 -0.446  -0.96  +0.43  +0.35     -3.1    -3.2    -1.6 +0.129 +0.575     7
+smc_15m_pbe_nobias    long    symbol base      IS     40 -0.056  -0.43  +0.47  +0.77     -2.2    -7.5    -4.2 +0.135 +0.191     9
+smc_15m_pbe_nobias    long    symbol base     OOS     24 -0.282  -1.34  +0.42  +0.48     -6.8    -8.7    -6.0 -0.073 +0.209     7
+smc_15m_pbe_nobias    long    symbol base  OOS_H1     14 -0.206  -0.81  +0.43  +0.56     -2.9    -4.8    -3.6 -0.025 +0.181     4
+smc_15m_pbe_nobias    long    symbol base  OOS_H2     10 -0.388  -1.07  +0.40  +0.41     -3.9    -5.9    -3.4 -0.141 +0.247     3
+smc_15m_pbe_nobias    long    symbol   2x      IS     40 -0.247  -1.74  +0.40  +0.33     -9.9   -11.8    -6.7 +0.135 +0.381     9
+smc_15m_pbe_nobias    long    symbol   2x     OOS     24 -0.490  -2.25  +0.29  +0.28    -11.8   -13.5    -9.0 -0.073 +0.417     7
+smc_15m_pbe_nobias    long    symbol   2x  OOS_H1     14 -0.387  -1.47  +0.29  +0.34     -5.4    -7.1    -5.1 -0.025 +0.362     4
+smc_15m_pbe_nobias    long    symbol   2x  OOS_H2     10 -0.635  -1.72  +0.30  +0.22     -6.3    -7.7    -4.6 -0.141 +0.494     3
+smc_15m_pbe_nobias    long portfolio base      IS     23 -0.226  -1.45  +0.39  +0.40     -5.2    -7.0    -3.8 -0.017 +0.209     5
+smc_15m_pbe_nobias    long portfolio base     OOS     21 -0.358  -1.55  +0.33  +0.42     -7.5    -9.4    -6.3 -0.143 +0.216     7
+smc_15m_pbe_nobias    long portfolio base  OOS_H1     11 -0.331  -1.08  +0.27  +0.44     -3.6    -5.5    -4.0 -0.144 +0.187     4
+smc_15m_pbe_nobias    long portfolio base  OOS_H2     10 -0.388  -1.07  +0.40  +0.41     -3.9    -5.9    -3.4 -0.141 +0.247     3
+smc_15m_pbe_nobias    long portfolio   2x      IS     23 -0.436  -2.43  +0.35  +0.19    -10.0   -11.1    -6.2 -0.017 +0.419     5
+smc_15m_pbe_nobias    long portfolio   2x     OOS     21 -0.574  -2.40  +0.24  +0.26    -12.0   -13.7    -9.1 -0.143 +0.431     7
+smc_15m_pbe_nobias    long portfolio   2x  OOS_H1     11 -0.518  -1.61  +0.18  +0.30     -5.7    -7.4    -5.2 -0.144 +0.374     4
+smc_15m_pbe_nobias    long portfolio   2x  OOS_H2     10 -0.635  -1.72  +0.30  +0.22     -6.3    -7.7    -4.6 -0.141 +0.494     3
+smc_15m_pbe_nobias   short    symbol base      IS     28 -0.365  -2.45  +0.29  +0.28    -10.2   -10.2    -8.7 -0.171 +0.195    12
+smc_15m_pbe_nobias   short    symbol base     OOS     22 -0.168  -0.69  +0.41  +0.69     -3.7    -6.0    -3.8 +0.047 +0.215     6
+smc_15m_pbe_nobias   short    symbol base  OOS_H1     10 -0.017  -0.04  +0.50  +0.97     -0.2    -4.0    -2.6 +0.167 +0.184     2
+smc_15m_pbe_nobias   short    symbol base  OOS_H2     12 -0.294  -0.92  +0.33  +0.49     -3.5    -5.1    -3.4 -0.053 +0.240     4
+smc_15m_pbe_nobias   short    symbol   2x      IS     28 -0.560  -3.90  +0.21  +0.15    -15.7   -15.7   -12.7 -0.171 +0.390    12
+smc_15m_pbe_nobias   short    symbol   2x     OOS     22 -0.382  -1.50  +0.41  +0.44     -8.4    -9.9    -6.4 +0.047 +0.429     6
+smc_15m_pbe_nobias   short    symbol   2x  OOS_H1     10 -0.200  -0.49  +0.50  +0.67     -2.0    -5.2    -3.4 +0.167 +0.367     2
+smc_15m_pbe_nobias   short    symbol   2x  OOS_H2     12 -0.534  -1.54  +0.33  +0.30     -6.4    -6.8    -4.6 -0.053 +0.481     4
+smc_15m_pbe_nobias   short portfolio base      IS     20 -0.306  -1.64  +0.40  +0.40     -6.1    -6.1    -5.2 -0.074 +0.233     6
+smc_15m_pbe_nobias   short portfolio base     OOS     19 -0.120  -0.51  +0.42  +0.77     -2.3    -4.4    -3.0 +0.096 +0.217     5
+smc_15m_pbe_nobias   short portfolio base  OOS_H1      9 +0.123  +0.34  +0.56  +1.29     +1.1    -2.7    -1.3 +0.297 +0.174     1
+smc_15m_pbe_nobias   short portfolio base  OOS_H2     10 -0.339  -1.09  +0.30  +0.46     -3.4    -4.4    -3.0 -0.084 +0.256     4
+smc_15m_pbe_nobias   short portfolio   2x      IS     20 -0.539  -2.74  +0.30  +0.20    -10.8   -10.8    -8.5 -0.074 +0.465     6
+smc_15m_pbe_nobias   short portfolio   2x     OOS     19 -0.337  -1.33  +0.42  +0.50     -6.4    -7.6    -4.4 +0.096 +0.434     5
+smc_15m_pbe_nobias   short portfolio   2x  OOS_H1      9 -0.051  -0.14  +0.56  +0.90     -0.5    -3.6    -1.8 +0.297 +0.348     1
+smc_15m_pbe_nobias   short portfolio   2x  OOS_H2     10 -0.595  -1.74  +0.30  +0.28     -6.0    -6.1    -4.1 -0.084 +0.511     4
+smc_15m_pbe_nobias    both    symbol base      IS     68 -0.183  -1.53  +0.40  +0.48    -12.5   -16.8   -12.3 +0.009 +0.192    21
+smc_15m_pbe_nobias    both    symbol base     OOS     46 -0.227  -1.45  +0.41  +0.58    -10.5   -13.7    -8.9 -0.016 +0.211    13
+smc_15m_pbe_nobias    both    symbol base  OOS_H1     24 -0.127  -0.59  +0.46  +0.74     -3.1    -6.9    -5.3 +0.055 +0.182     6
+smc_15m_pbe_nobias    both    symbol base  OOS_H2     22 -0.336  -1.43  +0.36  +0.45     -7.4    -9.9    -5.8 -0.093 +0.244     7
+smc_15m_pbe_nobias    both    symbol   2x      IS     68 -0.376  -3.09  +0.32  +0.23    -25.6   -26.6   -18.8 +0.009 +0.385    21
+smc_15m_pbe_nobias    both    symbol   2x     OOS     46 -0.439  -2.66  +0.35  +0.36    -20.2   -23.0   -15.0 -0.016 +0.423    13
+smc_15m_pbe_nobias    both    symbol   2x  OOS_H1     24 -0.309  -1.40  +0.38  +0.48     -7.4   -10.2    -7.2 +0.055 +0.364     6
+smc_15m_pbe_nobias    both    symbol   2x  OOS_H2     22 -0.580  -2.34  +0.32  +0.26    -12.8   -14.3    -8.8 -0.093 +0.487     7
+smc_15m_pbe_nobias    both portfolio base      IS     43 -0.264  -2.11  +0.40  +0.40    -11.3   -13.1    -9.0 -0.043 +0.220    11
+smc_15m_pbe_nobias    both portfolio base     OOS     40 -0.245  -1.49  +0.38  +0.58     -9.8   -13.0    -7.9 -0.029 +0.216    12
+smc_15m_pbe_nobias    both portfolio base  OOS_H1     20 -0.127  -0.55  +0.40  +0.75     -2.5    -6.3    -4.4 +0.054 +0.181     5
+smc_15m_pbe_nobias    both portfolio base  OOS_H2     20 -0.364  -1.56  +0.35  +0.43     -7.3    -9.8    -5.8 -0.112 +0.251     7
+smc_15m_pbe_nobias    both portfolio   2x      IS     43 -0.484  -3.53  +0.33  +0.20    -20.8   -21.8   -14.7 -0.043 +0.440    11
+smc_15m_pbe_nobias    both portfolio   2x     OOS     40 -0.461  -2.67  +0.33  +0.36    -18.5   -21.3   -13.4 -0.029 +0.432    12
+smc_15m_pbe_nobias    both portfolio   2x  OOS_H1     20 -0.308  -1.28  +0.35  +0.51     -6.2    -9.0    -5.8 +0.054 +0.362     5
+smc_15m_pbe_nobias    both portfolio   2x  OOS_H2     20 -0.615  -2.51  +0.30  +0.25    -12.3   -13.9    -8.5 -0.112 +0.503     7
+smc_15m_tp2_bias      long    symbol base      IS      9 +0.060  +0.38  +0.44  +1.40     +0.5    -0.6    -0.3 +0.235 +0.175     9
+smc_15m_tp2_bias      long    symbol base     OOS      7 -0.183  -0.32  +0.29  +0.71     -1.3    -4.2    -2.1 +0.030 +0.212     7
+smc_15m_tp2_bias      long    symbol base  OOS_H1      4 +0.126  +0.13  +0.25  +1.21     +0.5    -2.4    -1.2 +0.315 +0.189     4
+smc_15m_tp2_bias      long    symbol base  OOS_H2      3 -0.594  -1.34  +0.33  +0.12     -1.8    -1.8    -0.9 -0.350 +0.244     3
+smc_15m_tp2_bias      long    symbol   2x      IS      9 -0.115  -0.75  +0.33  +0.54     -1.0    -1.3    -0.7 +0.235 +0.351     9
+smc_15m_tp2_bias      long    symbol   2x     OOS      7 -0.395  -0.68  +0.29  +0.51     -2.8    -5.5    -2.8 +0.030 +0.425     7
+smc_15m_tp2_bias      long    symbol   2x  OOS_H1      4 -0.063  -0.06  +0.25  +0.92     -0.3    -3.0    -1.5 +0.315 +0.378     4
+smc_15m_tp2_bias      long    symbol   2x  OOS_H2      3 -0.837  -1.72  +0.33  +0.04     -2.5    -2.5    -1.3 -0.350 +0.487     3
+smc_15m_tp2_bias      long portfolio base      IS      8 +0.070  +0.40  +0.50  +1.42     +0.6    -0.6    -0.3 +0.259 +0.189     8
+smc_15m_tp2_bias      long portfolio base     OOS      7 -0.183  -0.32  +0.29  +0.71     -1.3    -4.2    -2.1 +0.030 +0.212     7
+smc_15m_tp2_bias      long portfolio base  OOS_H1      4 +0.126  +0.13  +0.25  +1.21     +0.5    -2.4    -1.2 +0.315 +0.189     4
+smc_15m_tp2_bias      long portfolio base  OOS_H2      3 -0.594  -1.34  +0.33  +0.12     -1.8    -1.8    -0.9 -0.350 +0.244     3
+smc_15m_tp2_bias      long portfolio   2x      IS      8 -0.120  -0.69  +0.38  +0.56     -1.0    -1.3    -0.7 +0.259 +0.379     8
+smc_15m_tp2_bias      long portfolio   2x     OOS      7 -0.395  -0.68  +0.29  +0.51     -2.8    -5.5    -2.8 +0.030 +0.425     7
+smc_15m_tp2_bias      long portfolio   2x  OOS_H1      4 -0.063  -0.06  +0.25  +0.92     -0.3    -3.0    -1.5 +0.315 +0.378     4
+smc_15m_tp2_bias      long portfolio   2x  OOS_H2      3 -0.837  -1.72  +0.33  +0.04     -2.5    -2.5    -1.3 -0.350 +0.487     3
+smc_15m_tp2_bias     short    symbol base      IS     12 -0.641  -5.12  +0.08  +0.00     -7.7    -7.7    -3.9 -0.430 +0.211    12
+smc_15m_tp2_bias     short    symbol base     OOS      6 -0.030  -0.05  +0.50  +0.95     -0.2    -1.7    -0.9 +0.258 +0.289     6
+smc_15m_tp2_bias     short    symbol base  OOS_H1      2 -0.284  -0.29  +0.50  +0.55     -0.6    -1.3    -0.6 -0.081 +0.203     2
+smc_15m_tp2_bias     short    symbol base  OOS_H2      4 +0.096  +0.12  +0.50  +1.17     +0.4    -1.7    -0.8 +0.428 +0.331     4
+smc_15m_tp2_bias     short    symbol   2x      IS     12 -0.852  -4.83  +0.00  +0.00    -10.2   -10.2    -5.1 -0.430 +0.422    12
+smc_15m_tp2_bias     short    symbol   2x     OOS      6 -0.319  -0.49  +0.50  +0.59     -1.9    -3.1    -1.6 +0.258 +0.577     6
+smc_15m_tp2_bias     short    symbol   2x  OOS_H1      2 -0.487  -0.46  +0.50  +0.37     -1.0    -1.5    -0.8 -0.081 +0.406     2
+smc_15m_tp2_bias     short    symbol   2x  OOS_H2      4 -0.235  -0.26  +0.50  +0.70     -0.9    -2.3    -1.2 +0.428 +0.663     4
+smc_15m_tp2_bias     short portfolio base      IS      7 -0.756  -3.79  +0.14  +0.00     -5.3    -5.3    -2.7 -0.465 +0.290     7
+smc_15m_tp2_bias     short portfolio base     OOS      6 -0.030  -0.05  +0.50  +0.95     -0.2    -1.7    -0.9 +0.258 +0.289     6
+smc_15m_tp2_bias     short portfolio base  OOS_H1      2 -0.284  -0.29  +0.50  +0.55     -0.6    -1.3    -0.6 -0.081 +0.203     2
+smc_15m_tp2_bias     short portfolio base  OOS_H2      4 +0.096  +0.12  +0.50  +1.17     +0.4    -1.7    -0.8 +0.428 +0.331     4
+smc_15m_tp2_bias     short portfolio   2x      IS      7 -1.046  -4.71  +0.00  +0.00     -7.3    -7.3    -3.7 -0.465 +0.581     7
+smc_15m_tp2_bias     short portfolio   2x     OOS      6 -0.319  -0.49  +0.50  +0.59     -1.9    -3.1    -1.6 +0.258 +0.577     6
+smc_15m_tp2_bias     short portfolio   2x  OOS_H1      2 -0.487  -0.46  +0.50  +0.37     -1.0    -1.5    -0.8 -0.081 +0.406     2
+smc_15m_tp2_bias     short portfolio   2x  OOS_H2      4 -0.235  -0.26  +0.50  +0.70     -0.9    -2.3    -1.2 +0.428 +0.663     4
+smc_15m_tp2_bias      both    symbol base      IS     21 -0.340  -2.37  +0.24  +0.21     -7.2    -8.1    -4.1 -0.145 +0.196    21
+smc_15m_tp2_bias      both    symbol base     OOS     13 -0.112  -0.29  +0.38  +0.82     -1.5    -4.9    -2.5 +0.135 +0.248    13
+smc_15m_tp2_bias      both    symbol base  OOS_H1      6 -0.011  -0.02  +0.33  +0.98     -0.1    -3.7    -1.9 +0.183 +0.194     6
+smc_15m_tp2_bias      both    symbol base  OOS_H2      7 -0.199  -0.40  +0.43  +0.68     -1.4    -1.9    -1.0 +0.095 +0.294     7
+smc_15m_tp2_bias      both    symbol   2x      IS     21 -0.536  -3.78  +0.14  +0.10    -11.3   -11.6    -5.8 -0.145 +0.392    21
+smc_15m_tp2_bias      both    symbol   2x     OOS     13 -0.360  -0.87  +0.38  +0.55     -4.7    -7.4    -3.7 +0.135 +0.495    13
+smc_15m_tp2_bias      both    symbol   2x  OOS_H1      6 -0.205  -0.30  +0.33  +0.73     -1.2    -4.6    -2.3 +0.183 +0.387     6
+smc_15m_tp2_bias      both    symbol   2x  OOS_H2      7 -0.493  -0.91  +0.43  +0.40     -3.5    -3.5    -1.7 +0.095 +0.588     7
+smc_15m_tp2_bias      both portfolio base      IS     15 -0.316  -1.81  +0.33  +0.29     -4.7    -5.7    -2.9 -0.079 +0.237    15
+smc_15m_tp2_bias      both portfolio base     OOS     13 -0.112  -0.29  +0.38  +0.82     -1.5    -4.9    -2.5 +0.135 +0.248    13
+smc_15m_tp2_bias      both portfolio base  OOS_H1      6 -0.011  -0.02  +0.33  +0.98     -0.1    -3.7    -1.9 +0.183 +0.194     6
+smc_15m_tp2_bias      both portfolio base  OOS_H2      7 -0.199  -0.40  +0.43  +0.68     -1.4    -1.9    -1.0 +0.095 +0.294     7
+smc_15m_tp2_bias      both portfolio   2x      IS     15 -0.552  -2.99  +0.20  +0.13     -8.3    -8.7    -4.3 -0.079 +0.473    15
+smc_15m_tp2_bias      both portfolio   2x     OOS     13 -0.360  -0.87  +0.38  +0.55     -4.7    -7.4    -3.7 +0.135 +0.495    13
+smc_15m_tp2_bias      both portfolio   2x  OOS_H1      6 -0.205  -0.30  +0.33  +0.73     -1.2    -4.6    -2.3 +0.183 +0.387     6
+smc_15m_tp2_bias      both portfolio   2x  OOS_H2      7 -0.493  -0.91  +0.43  +0.40     -3.5    -3.5    -1.7 +0.095 +0.588     7
+smc_15m_tp2_nobias    long    symbol base      IS     40 -0.112  -0.89  +0.45  +0.59     -4.5    -8.5    -4.4 +0.086 +0.198     9
+smc_15m_tp2_nobias    long    symbol base     OOS     24 -0.254  -1.00  +0.38  +0.56     -6.1    -9.1    -6.7 -0.039 +0.214     7
+smc_15m_tp2_nobias    long    symbol base  OOS_H1     14 -0.139  -0.46  +0.43  +0.70     -2.0    -5.0    -3.7 +0.045 +0.185     4
+smc_15m_tp2_nobias    long    symbol base  OOS_H2     10 -0.413  -0.94  +0.30  +0.43     -4.1    -6.3    -3.6 -0.158 +0.255     3
+smc_15m_tp2_nobias    long    symbol   2x      IS     40 -0.310  -2.25  +0.38  +0.23    -12.4   -13.1    -7.0 +0.086 +0.396     9
+smc_15m_tp2_nobias    long    symbol   2x     OOS     24 -0.468  -1.81  +0.25  +0.36    -11.2   -14.0    -9.8 -0.039 +0.428     7
+smc_15m_tp2_nobias    long    symbol   2x  OOS_H1     14 -0.324  -1.04  +0.29  +0.45     -4.5    -7.3    -5.2 +0.045 +0.369     4
+smc_15m_tp2_nobias    long    symbol   2x  OOS_H2     10 -0.669  -1.52  +0.20  +0.29     -6.7    -8.2    -4.8 -0.158 +0.511     3
+smc_15m_tp2_nobias    long portfolio base      IS     23 -0.284  -1.79  +0.35  +0.34     -6.5    -8.0    -4.0 -0.070 +0.214     5
+smc_15m_tp2_nobias    long portfolio base     OOS     21 -0.324  -1.15  +0.29  +0.51     -6.8    -9.8    -7.0 -0.104 +0.220     7
+smc_15m_tp2_nobias    long portfolio base  OOS_H1     11 -0.242  -0.64  +0.27  +0.59     -2.7    -5.6    -4.0 -0.054 +0.188     4
+smc_15m_tp2_nobias    long portfolio base  OOS_H2     10 -0.413  -0.94  +0.30  +0.43     -4.1    -6.3    -3.6 -0.158 +0.255     3
+smc_15m_tp2_nobias    long portfolio   2x      IS     23 -0.498  -2.79  +0.30  +0.17    -11.4   -12.1    -6.5 -0.070 +0.428     5
+smc_15m_tp2_nobias    long portfolio   2x     OOS     21 -0.544  -1.88  +0.19  +0.35    -11.4   -14.2    -9.9 -0.104 +0.440     7
+smc_15m_tp2_nobias    long portfolio   2x  OOS_H1     11 -0.431  -1.10  +0.18  +0.42     -4.7    -7.5    -5.3 -0.054 +0.376     4
+smc_15m_tp2_nobias    long portfolio   2x  OOS_H2     10 -0.669  -1.52  +0.20  +0.29     -6.7    -8.2    -4.8 -0.158 +0.511     3
+smc_15m_tp2_nobias   short    symbol base      IS     28 -0.408  -2.96  +0.21  +0.23    -11.4   -11.4    -9.5 -0.206 +0.201    12
+smc_15m_tp2_nobias   short    symbol base     OOS     22 -0.114  -0.42  +0.41  +0.79     -2.5    -5.8    -3.8 +0.108 +0.222     6
+smc_15m_tp2_nobias   short    symbol base  OOS_H1     10 +0.042  +0.10  +0.50  +1.08     +0.4    -3.7    -2.5 +0.239 +0.197     2
+smc_15m_tp2_nobias   short    symbol base  OOS_H2     12 -0.243  -0.67  +0.33  +0.58     -2.9    -5.1    -3.4 -0.001 +0.242     4
+smc_15m_tp2_nobias   short    symbol   2x      IS     28 -0.609  -4.52  +0.18  +0.12    -17.1   -17.1   -13.6 -0.206 +0.403    12
+smc_15m_tp2_nobias   short    symbol   2x     OOS     22 -0.335  -1.20  +0.36  +0.52     -7.4    -9.8    -6.4 +0.108 +0.443     6
+smc_15m_tp2_nobias   short    symbol   2x  OOS_H1     10 -0.155  -0.35  +0.40  +0.75     -1.6    -5.1    -3.3 +0.239 +0.394     2
+smc_15m_tp2_nobias   short    symbol   2x  OOS_H2     12 -0.485  -1.25  +0.33  +0.36     -5.8    -6.8    -4.6 -0.001 +0.484     4
+smc_15m_tp2_nobias   short portfolio base      IS     20 -0.365  -2.04  +0.30  +0.31     -7.3    -7.3    -6.1 -0.124 +0.242     6
+smc_15m_tp2_nobias   short portfolio base     OOS     19 -0.058  -0.22  +0.42  +0.89     -1.1    -4.4    -3.0 +0.167 +0.225     5
+smc_15m_tp2_nobias   short portfolio base  OOS_H1      9 +0.188  +0.47  +0.56  +1.45     +1.7    -2.4    -1.2 +0.377 +0.189     1
+smc_15m_tp2_nobias   short portfolio base  OOS_H2     10 -0.279  -0.78  +0.30  +0.55     -2.8    -4.4    -3.0 -0.022 +0.257     4
+smc_15m_tp2_nobias   short portfolio   2x      IS     20 -0.607  -3.22  +0.25  +0.17    -12.1   -12.1    -9.4 -0.124 +0.484     6
+smc_15m_tp2_nobias   short portfolio   2x     OOS     19 -0.283  -1.01  +0.37  +0.58     -5.4    -7.3    -4.5 +0.167 +0.450     5
+smc_15m_tp2_nobias   short portfolio   2x  OOS_H1      9 -0.001  -0.00  +0.44  +1.00     -0.0    -3.5    -1.8 +0.377 +0.378     1
+smc_15m_tp2_nobias   short portfolio   2x  OOS_H2     10 -0.536  -1.39  +0.30  +0.35     -5.4    -5.9    -4.1 -0.022 +0.515     4
+smc_15m_tp2_nobias    both    symbol base      IS     68 -0.234  -2.14  +0.35  +0.38    -15.9   -18.7   -13.3 -0.034 +0.199    21
+smc_15m_tp2_nobias    both    symbol base     OOS     46 -0.187  -1.03  +0.39  +0.67     -8.6   -13.2    -8.8 +0.031 +0.218    13
+smc_15m_tp2_nobias    both    symbol base  OOS_H1     24 -0.064  -0.26  +0.46  +0.87     -1.5    -7.0    -5.3 +0.126 +0.190     6
+smc_15m_tp2_nobias    both    symbol base  OOS_H2     22 -0.321  -1.16  +0.32  +0.51     -7.1    -9.7    -5.4 -0.073 +0.248     7
+smc_15m_tp2_nobias    both    symbol   2x      IS     68 -0.433  -3.89  +0.29  +0.17    -29.5   -30.1   -20.7 -0.034 +0.399    21
+smc_15m_tp2_nobias    both    symbol   2x     OOS     46 -0.404  -2.15  +0.30  +0.43    -18.6   -22.8   -15.1 +0.031 +0.435    13
+smc_15m_tp2_nobias    both    symbol   2x  OOS_H1     24 -0.254  -1.01  +0.33  +0.58     -6.1   -10.3    -7.3 +0.126 +0.380     6
+smc_15m_tp2_nobias    both    symbol   2x  OOS_H2     22 -0.569  -1.98  +0.27  +0.32    -12.5   -14.2    -8.3 -0.073 +0.496     7
+smc_15m_tp2_nobias    both portfolio base      IS     43 -0.322  -2.86  +0.33  +0.33    -13.8   -15.3   -10.1 -0.095 +0.227    11
+smc_15m_tp2_nobias    both portfolio base     OOS     40 -0.197  -1.02  +0.35  +0.67     -7.9   -12.5    -7.8 +0.025 +0.222    12
+smc_15m_tp2_nobias    both portfolio base  OOS_H1     20 -0.049  -0.18  +0.40  +0.91     -1.0    -6.4    -4.4 +0.140 +0.189     5
+smc_15m_tp2_nobias    both portfolio base  OOS_H2     20 -0.346  -1.25  +0.30  +0.49     -6.9    -9.6    -5.3 -0.090 +0.256     7
+smc_15m_tp2_nobias    both portfolio   2x      IS     43 -0.549  -4.43  +0.28  +0.17    -23.6   -24.3   -15.9 -0.095 +0.454    11
+smc_15m_tp2_nobias    both portfolio   2x     OOS     40 -0.420  -2.10  +0.28  +0.45    -16.8   -21.1   -13.5 +0.025 +0.445    12
+smc_15m_tp2_nobias    both portfolio   2x  OOS_H1     20 -0.237  -0.86  +0.30  +0.63     -4.7    -9.1    -5.9 +0.140 +0.377     5
+smc_15m_tp2_nobias    both portfolio   2x  OOS_H2     20 -0.603  -2.11  +0.25  +0.31    -12.1   -13.7    -8.1 -0.090 +0.513     7
+
+ORDERS PER SIMULATION (walk stats; base cost, per-symbol scope)
+  smc_5m_pbe_bias      long   gate_refused=407, outcome_breakeven=10, outcome_expired=1, outcome_killzone_end=5, outcome_session_end=9, outcome_stop=17, outcome_time_stop=13, outcome_tp1_first=76, outcome_tp2=4, placed=135
+  smc_5m_pbe_bias      short  gate_refused=353, outcome_breakeven=4, outcome_killzone_end=11, outcome_session_end=13, outcome_stop=9, outcome_time_stop=11, outcome_tp1_first=64, outcome_tp2=7, placed=119
+  smc_5m_pbe_bias      both   gate_refused=760, outcome_breakeven=14, outcome_expired=1, outcome_killzone_end=16, outcome_session_end=22, outcome_stop=26, outcome_time_stop=24, outcome_tp1_first=140, outcome_tp2=11, placed=254
+  smc_5m_pbe_nobias    long   gate_refused=49, outcome_breakeven=28, outcome_expired=2, outcome_killzone_end=20, outcome_session_end=37, outcome_stop=68, outcome_time_stop=46, outcome_tp1_first=278, outcome_tp2=14, placed=493
+  smc_5m_pbe_nobias    short  gate_refused=40, outcome_breakeven=14, outcome_expired=1, outcome_killzone_end=42, outcome_session_end=40, outcome_stop=36, outcome_time_stop=38, outcome_tp1_first=241, outcome_tp2=20, placed=432
+  smc_5m_pbe_nobias    both   gate_refused=89, outcome_breakeven=42, outcome_expired=3, outcome_killzone_end=62, outcome_session_end=77, outcome_stop=104, outcome_time_stop=84, outcome_tp1_first=519, outcome_tp2=34, placed=925
+  smc_5m_tp2_bias      long   gate_refused=407, outcome_expired=1, outcome_killzone_end=5, outcome_session_end=14, outcome_stop=21, outcome_time_stop=13, outcome_tp1_first=76, outcome_tp2=5, placed=135
+  smc_5m_tp2_bias      short  gate_refused=353, outcome_killzone_end=11, outcome_session_end=16, outcome_stop=10, outcome_time_stop=11, outcome_tp1_first=64, outcome_tp2=7, placed=119
+  smc_5m_tp2_bias      both   gate_refused=760, outcome_expired=1, outcome_killzone_end=16, outcome_session_end=30, outcome_stop=31, outcome_time_stop=24, outcome_tp1_first=140, outcome_tp2=12, placed=254
+  smc_5m_tp2_nobias    long   gate_refused=49, outcome_expired=2, outcome_killzone_end=20, outcome_session_end=51, outcome_stop=80, outcome_time_stop=46, outcome_tp1_first=278, outcome_tp2=16, placed=493
+  smc_5m_tp2_nobias    short  gate_refused=40, outcome_expired=1, outcome_killzone_end=42, outcome_session_end=51, outcome_stop=39, outcome_time_stop=38, outcome_tp1_first=241, outcome_tp2=20, placed=432
+  smc_5m_tp2_nobias    both   gate_refused=89, outcome_expired=3, outcome_killzone_end=62, outcome_session_end=102, outcome_stop=119, outcome_time_stop=84, outcome_tp1_first=519, outcome_tp2=36, placed=925
+  smc_15m_pbe_bias     long   gate_refused=162, outcome_breakeven=2, outcome_killzone_end=10, outcome_session_end=4, outcome_stop=3, outcome_time_stop=6, outcome_tp1_first=31, outcome_tp2=1, placed=57
+  smc_15m_pbe_bias     short  gate_refused=144, outcome_killzone_end=15, outcome_session_end=4, outcome_stop=4, outcome_time_stop=9, outcome_tp1_first=44, outcome_tp2=1, placed=77
+  smc_15m_pbe_bias     both   gate_refused=306, outcome_breakeven=2, outcome_killzone_end=25, outcome_session_end=8, outcome_stop=7, outcome_time_stop=15, outcome_tp1_first=75, outcome_tp2=2, placed=134
+  smc_15m_pbe_nobias   long   gate_refused=11, outcome_breakeven=5, outcome_killzone_end=51, outcome_session_end=20, outcome_stop=13, outcome_time_stop=24, outcome_tp1_first=93, outcome_tp2=2, placed=208
+  smc_15m_pbe_nobias   short  gate_refused=13, outcome_breakeven=1, outcome_expired=1, outcome_killzone_end=59, outcome_session_end=16, outcome_stop=10, outcome_time_stop=22, outcome_tp1_first=98, outcome_tp2=1, placed=208
+  smc_15m_pbe_nobias   both   gate_refused=24, outcome_breakeven=6, outcome_expired=1, outcome_killzone_end=110, outcome_session_end=36, outcome_stop=23, outcome_time_stop=46, outcome_tp1_first=191, outcome_tp2=3, placed=416
+  smc_15m_tp2_bias     long   gate_refused=162, outcome_killzone_end=10, outcome_session_end=6, outcome_stop=3, outcome_time_stop=6, outcome_tp1_first=31, outcome_tp2=1, placed=57
+  smc_15m_tp2_bias     short  gate_refused=144, outcome_killzone_end=15, outcome_session_end=4, outcome_stop=4, outcome_time_stop=9, outcome_tp1_first=44, outcome_tp2=1, placed=77
+  smc_15m_tp2_bias     both   gate_refused=306, outcome_killzone_end=25, outcome_session_end=10, outcome_stop=7, outcome_time_stop=15, outcome_tp1_first=75, outcome_tp2=2, placed=134
+  smc_15m_tp2_nobias   long   gate_refused=11, outcome_killzone_end=51, outcome_session_end=24, outcome_stop=14, outcome_time_stop=24, outcome_tp1_first=93, outcome_tp2=2, placed=208
+  smc_15m_tp2_nobias   short  gate_refused=13, outcome_expired=1, outcome_killzone_end=59, outcome_session_end=17, outcome_stop=10, outcome_time_stop=22, outcome_tp1_first=98, outcome_tp2=1, placed=208
+  smc_15m_tp2_nobias   both   gate_refused=24, outcome_expired=1, outcome_killzone_end=110, outcome_session_end=41, outcome_stop=24, outcome_time_stop=46, outcome_tp1_first=191, outcome_tp2=3, placed=416
+
+SANITY COUNTERS PER SIMULATION (non-zero only)
+  none
+
+FUNNEL (all symbols)
+  15m_long: breakouts_or_no_reclaim=30875, dol_lt_2r=507, grade_A+=55, grade_B=153, grade_none=11, levels_taken=97314, mss=3105, mss_in_killzone=731, no_valid_fvg=5, setups=219
+  15m_short: breakouts_or_no_reclaim=31123, dol_lt_2r=460, grade_A+=76, grade_B=132, grade_none=13, levels_taken=92124, mss=2862, mss_in_killzone=683, no_valid_fvg=2, setups=221
+  5m_long: breakouts_or_no_reclaim=50659, dol_lt_2r=597, grade_A+=135, grade_B=358, grade_none=49, levels_taken=139578, mss=4000, mss_in_killzone=1142, no_valid_fvg=3, setups=542
+  5m_short: breakouts_or_no_reclaim=50724, dol_lt_2r=471, grade_A+=117, grade_B=315, grade_none=40, levels_taken=133854, mss=3590, mss_in_killzone=943, setups=472
+
+CONTEXT
+  eligible symbol-days 39309; ineligible: illiquid=4414, listed < 30 days=117, missing 5m bars before the session=3268, missing levels=42
+  bias days: IS:bearish=604, IS:bullish=489, IS:neutral=24170, OOS_H1:bearish=267, OOS_H1:bullish=159, OOS_H1:neutral=7427, OOS_H2:bearish=122, OOS_H2:bullish=161, OOS_H2:neutral=5910
+  days neutralised by a 15m MSS (§5.5): 100
+  median tick/price: BTCUSDT=1.5e-07, ETHUSDT=4.2e-06, BNBUSDT=1.8e-05, SOLUSDT=8.2e-05, XRPUSDT=1.1e-04, DOGEUSDT=9.5e-05, ADAUSDT=2.6e-04, AVAXUSDT=4.4e-04, DOTUSDT=2.3e-04, MATICUSDT=1.3e-04, LINKUSDT=1.5e-04, LTCUSDT=1.3e-04, ATOMUSDT=1.7e-04, UNIUSDT=1.6e-04, APTUSDT=1.3e-04, NEARUSDT=4.2e-04, FILUSDT=2.6e-04, INJUSDT=3.1e-04, OPUSDT=6.0e-04, ARBUSDT=1.9e-04, SEIUSDT=3.2e-04, SUIUSDT=8.4e-05, TIAUSDT=2.6e-04, STXUSDT=2.3e-04, RUNEUSDT=6.2e-04, AAVEUSDT=9.1e-05, MKRUSDT=6.7e-04, SNXUSDT=4.8e-04, CRVUSDT=2.4e-04, COMPUSDT=2.0e-04, FETUSDT=4.7e-04, RENDERUSDT=3.0e-04, WLDUSDT=4.3e-04, OCEANUSDT=2.4e-04, AGIXUSDT=3.4e-05, SANDUSDT=2.7e-04, MANAUSDT=2.7e-04, AXSUSDT=4.5e-04, ENJUSDT=3.4e-04, GALAUSDT=4.9e-04, APEUSDT=5.9e-04, GMTUSDT=5.5e-04, BLURUSDT=4.2e-04, ILVUSDT=1.7e-04, CHZUSDT=2.5e-04, HBARUSDT=1.5e-04, EGLDUSDT=3.0e-04, FLOWUSDT=1.4e-03, ICPUSDT=2.0e-04, QNTUSDT=8.9e-04

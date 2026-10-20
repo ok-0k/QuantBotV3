@@ -1,0 +1,7 @@
+commit 215157796213c95aeaf32bf71d3bdbb743d0e291
+cwd /home/admin/wt-research-smc
+/home/admin/trading_bot/.venv/bin/python -m research.smc_study 
+RESEARCH_OFFLINE=1
+TRADING_ENV_FILE=/nonexistent
+TRADING_DATA_DIR=/tmp/claude-1000/-home-admin/abde66aa-5f84-40ba-9872-902406c887f2/scratchpad/smcrun/td
+TRADING_LOG_DIR=/tmp/claude-1000/-home-admin/abde66aa-5f84-40ba-9872-902406c887f2/scratchpad/smcrun/tl
