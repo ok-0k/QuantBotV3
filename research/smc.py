@@ -1257,11 +1257,16 @@ def load_symbol(sym: str) -> Bars:
     return to_grid(k, s, e)
 
 
+def fingerprint_update(hsh, sym: str, b: Bars) -> None:
+    """Feed one symbol into a running sha256 (symbols must be fed in sorted
+    order to match fingerprint())."""
+    hsh.update(sym.encode())
+    for a in (b.t, b.o, b.h, b.l, b.c):
+        hsh.update(np.ascontiguousarray(np.nan_to_num(a, nan=-1.0)).tobytes())
+
+
 def fingerprint(bars: dict[str, Bars]) -> str:
     hsh = hashlib.sha256()
     for sym in sorted(bars):
-        b = bars[sym]
-        hsh.update(sym.encode())
-        for a in (b.t, b.o, b.h, b.l, b.c):
-            hsh.update(np.ascontiguousarray(np.nan_to_num(a, nan=-1.0)).tobytes())
+        fingerprint_update(hsh, sym, bars[sym])
     return hsh.hexdigest()
