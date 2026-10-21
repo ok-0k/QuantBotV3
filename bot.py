@@ -77,6 +77,7 @@ from config import (
     SHORT_MARGIN_PCT, SHORT_MAX_OPEN, SYMBOL_COOLDOWN_SECS,
     DECAY_HALFLIFE_CANDLES, DECAY_MIN_CANDLES,
     DECAY_SL_TIGHTEN_STRENGTH, DECAY_TP_PULL_STRENGTH, EXPERIMENT_NAME,
+    EXPERIMENT_ARM_SYMBOLS,
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
@@ -377,12 +378,14 @@ async def _refresh_margin_health(
 def _experiment_arm(symbol: str) -> Optional[str]:
     """Arm ("A"/"B") of the active experiment for a symbol, or None if off.
 
-    Alternates in SYMBOLS order: balanced, deterministic, splits the majors.
+    Alternates in EXPERIMENT_ARM_SYMBOLS order (SYMBOLS frozen as decay_v2
+    ran it): balanced, deterministic, splits the majors, and unchanged when
+    a symbol is dropped from SYMBOLS.
     """
     if not EXPERIMENT_NAME:
         return None
     try:
-        idx = SYMBOLS.index(symbol)
+        idx = EXPERIMENT_ARM_SYMBOLS.index(symbol)
     except ValueError:
         idx = sum(symbol.encode())        # stable fallback for unknown symbols
     return "A" if idx % 2 == 0 else "B"

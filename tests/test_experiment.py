@@ -13,13 +13,13 @@ import pytest
 
 import bot
 from config import (DECAY_HALFLIFE_CANDLES, DECAY_SL_TIGHTEN_STRENGTH,
-                    DECAY_TP_PULL_STRENGTH, STARTING_CASH, SYMBOLS)
+                    DECAY_TP_PULL_STRENGTH, EXPERIMENT_ARM_SYMBOLS, STARTING_CASH, SYMBOLS)
 from conftest import make_candles
 
 ZERO_STATE = np.zeros(13, dtype=np.float32)
 pytestmark = pytest.mark.usefixtures("decay_v2_on")
-A_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 0]
-B_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 1]
+A_SYMS = [s for i, s in enumerate(EXPERIMENT_ARM_SYMBOLS) if i % 2 == 0 and s in SYMBOLS]
+B_SYMS = [s for i, s in enumerate(EXPERIMENT_ARM_SYMBOLS) if i % 2 == 1 and s in SYMBOLS]
 
 
 @pytest.fixture()
@@ -50,6 +50,37 @@ def test_arms_alternate_balanced_and_deterministic():
     assert abs(arms.count("A") - arms.count("B")) <= 1
     assert bot._experiment_arm("BTCUSDT") != bot._experiment_arm("ETHUSDT")
     assert [bot._experiment_arm(s) for s in SYMBOLS] == arms
+
+
+# decay_v2's arm map as it ran (config.SYMBOLS at f2a051a, A on even index),
+# delisted pairs left out as insights.arm_symbols() does.
+DECAY_V2_ARMS = {
+    "A": ["BTCUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT", "ATOMUSDT", "APTUSDT",
+          "FILUSDT", "OPUSDT", "SEIUSDT", "TIAUSDT", "RUNEUSDT", "CRVUSDT", "FETUSDT", "WLDUSDT",
+          "MANAUSDT", "ENJUSDT", "APEUSDT", "BLURUSDT", "CHZUSDT", "EGLDUSDT", "ICPUSDT"],
+    "B": ["ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "LTCUSDT", "UNIUSDT", "NEARUSDT", "INJUSDT",
+          "ARBUSDT", "SUIUSDT", "STXUSDT", "AAVEUSDT", "SNXUSDT", "COMPUSDT", "RENDERUSDT", "SANDUSDT",
+          "AXSUSDT", "GALAUSDT", "GMTUSDT", "ILVUSDT", "HBARUSDT", "FLOWUSDT", "QNTUSDT"],
+}
+DECAY_V2_DELISTED = {"MATICUSDT": "B", "MKRUSDT": "A", "OCEANUSDT": "B", "AGIXUSDT": "A"}
+
+
+def test_frozen_arm_order_is_the_decay_v2_symbol_list():
+    import config
+    from research.universe import RESEARCH_SYMBOLS   # pinned to f2a051a by test_research_universe
+    assert config.EXPERIMENT_ARM_SYMBOLS == RESEARCH_SYMBOLS
+
+
+@pytest.mark.parametrize("live", ["as_run", "delisted_dropped"])
+def test_arm_map_is_frozen_whatever_symbols_lists(monkeypatch, live):
+    import insights
+    if live == "delisted_dropped":       # the live list shrinks: no symbol may change arm
+        shrunk = [s for s in SYMBOLS if s not in DECAY_V2_DELISTED]
+        monkeypatch.setattr(bot, "SYMBOLS", shrunk)
+        monkeypatch.setattr(insights, "SYMBOLS", shrunk, raising=False)
+    assert insights.arm_symbols() == DECAY_V2_ARMS
+    expected = {s: arm for arm, syms in DECAY_V2_ARMS.items() for s in syms} | DECAY_V2_DELISTED
+    assert {s: bot._experiment_arm(s) for s in expected} == expected
 
 
 def test_experiment_off_means_no_arm(monkeypatch):
