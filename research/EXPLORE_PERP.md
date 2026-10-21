@@ -11,6 +11,34 @@
 > **new, pre-registered forward test** if it were traded on Binance USDT-M
 > perpetuals instead of spot.
 
+## PM decision (2026-10-21): no forward tests now
+
+This decision is still EXPLORATORY — NOT EVIDENCE. Neither candidate below
+goes to a forward test. The reasons:
+
+1. **Selection bias.** Both picks came out of 108 rows, judged on OOS data
+   that had already been seen. Their OOS t-stats were +2.02 and +1.75,
+   against a multiple-testing bar of about 3.3. The true edge is therefore
+   probably smaller than measured.
+2. **Power.** Take the OOS figures at face value. The information ratio is
+   t / √years, over 1.52 years of OOS. The expected t after T years is then
+   IR × √T.
+
+   | candidate | IR | years to expected t = 2 | expected t after 8 weeks |
+   |---|---|---|---|
+   | `fund_lvl_ls_k3_24h` | 2.02 / √1.52 = 1.64 | (2 / 1.64)² ≈ 1.5 | 1.64 × √(56/365) ≈ 0.64 |
+   | `xsmom_14` (band 0.5) | 1.75 / √1.52 = 1.42 | (2 / 1.42)² ≈ 2.0 | 1.42 × √(56/365) ≈ 0.56 |
+
+   A forward test would need about 1.5 to 2 years. If the true edge is
+   smaller, it would need longer. An 8-week test could not decide anything.
+3. **Product mismatch.** The bot trades spot and is short-only. Both
+   candidates are long/short perp books.
+4. **Overlap.** `fund_lvl_ls` is mostly funding collected, and the running
+   carry forward test (`research/carry_forward.py`) already covers that.
+
+**Revisit only if the owner first decides to add a perp venue that can also
+go long.**
+
 ## Short answer
 
 - **108 rows screened:**
@@ -22,7 +50,7 @@
   (b)** (at least 30 events per 8 weeks). Of those 29, 21 are also
   non-negative OOS at perp cost. Most of the 29 are the same few ideas at
   neighbouring parameters.
-- **Two forward-test candidates are proposed** (details below):
+- **Two forward-test candidates were proposed** (details below; the PM decided against forward tests, see above):
   1. `fund_lvl_ls_k3_24h`: funding level, long/short, rebalanced daily.
   2. `xsmom_14` (band 0.5): 14-day cross-sectional momentum, dollar-neutral.
 - **SMC fails (b)** (at most 6.2 OOS trades per 8 weeks), and so does
