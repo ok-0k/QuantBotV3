@@ -289,8 +289,8 @@ def test_trail_only_matters_when_the_target_is_fee_gated(monkeypatch):
 
 def test_break_even_moves_the_stop_to_entry_then_it_exits_there():
     t = trade(stop0=103.5, tp0=80.0)
-    # ATR ~0.5: wick 4.5 ATR down (to <= 97.75) and close >= 1.5 ATR in profit (<= 99.25)
-    out = run_series(t, bars([(100, 100.1, 97.0, 98.0), (98, 100.3, 97.9, 100.1)]))
+    # ATR incl. this candle ~0.72: wick 4.5 ATR down (to <= ~96.75), close >= 1.5 ATR in profit
+    out = run_series(t, bars([(100, 100.1, 96.5, 98.0), (98, 100.3, 97.9, 100.1)]))
     assert out == ("stop_loss_short", 100.0, T_START + M)
 
 
@@ -496,3 +496,37 @@ def test_summary_before_t0_and_counts(fresh):
     with fresh.get_db() as conn:
         s = shadow.summary(conn)
     assert s["t0"] is None and s["open"] == 0 and s["closed"] == 0 and s["running"] == []
+
+
+# ── visibility: insights payload, dashboard card, CLI report ─────────────────
+
+def test_insights_snapshot_carries_the_shadow_summary(fresh, monkeypatch):
+    import insights
+    s = insights.snapshot()["shadow"]
+    assert s["enabled"] is True and s["closed"] == 0 and s["t0"] is None
+    monkeypatch.setattr(shadow, "summary", lambda conn: (_ for _ in ()).throw(RuntimeError("old db")))
+    assert insights.snapshot()["shadow"] is None
+
+
+def test_dashboard_has_the_learning_card():
+    import dashboard
+    html = dashboard.DASHBOARD_HTML
+    assert 'id="learning-grid"' in html and "function renderLearning" in html
+    assert "renderLearning(d.shadow)" in html
+
+
+def test_shadow_report_script_runs(fresh, capsys):
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "scripts" / "shadow_report.py"
+    spec = importlib.util.spec_from_file_location("shadow_report", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.main()
+    assert "no shadow trade yet" in capsys.readouterr().out
+    start = (datetime.now(timezone.utc) - timedelta(days=10)).replace(hour=0, minute=0, second=0, microsecond=0)
+    fresh.set_portfolio_stat(shadow.T0_KEY, start.isoformat())
+    _closed_rows(fresh, NAME, per_day=5, days=8, start=start)
+    mod.main()
+    out = capsys.readouterr().out
+    assert "40 closed" in out and NAME in out and "NOT evidence" in out

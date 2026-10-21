@@ -239,6 +239,16 @@ def experiment(conn: sqlite3.Connection, name: str | None = None) -> dict | None
     return out
 
 
+def _shadow_summary(conn) -> dict | None:
+    """Shadow learner running numbers (shadow.summary); None if unavailable.
+    Running numbers are NOT evidence before the next evaluation date."""
+    try:
+        import shadow
+        return shadow.summary(conn)
+    except Exception:   # e.g. an old DB without the shadow_trades table
+        return None
+
+
 def snapshot(db_path=None) -> dict:
     """Everything the dashboard's Insights section shows, in one read."""
     conn = connect(db_path)
@@ -249,6 +259,7 @@ def snapshot(db_path=None) -> dict:
             "day": journal_window(conn, 1.0),
             "lifetime": lifetime(conn),
             "experiment": experiment(conn),
+            "shadow": _shadow_summary(conn),
         }
     finally:
         conn.close()

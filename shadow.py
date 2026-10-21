@@ -112,13 +112,15 @@ def step(trade: dict, candle: dict, history: list[dict], rules: Rules) -> Option
     (wick, fee-gated) -> moved stop (close) -> moved target (close, fee-gated)
     -> 4h losing exit -> shadow cap. Mutates trade['stop'] / ['tp'].
     Returns (exit_reason, exit_price) or None. `history` = closed candles
-    before this one (the ATR the tick path would see)."""
+    before this one."""
     entry, stop, tp = trade["entry"], trade["stop"], trade["tp"]
     o, h, l, c = (float(candle[k]) for k in ("open", "high", "low", "close"))
     shares = SHADOW_NOTIONAL_USD / entry
     age_min = (int(candle["time"]) + MINUTE_MS - trade["opened_ms"]) / MINUTE_MS
     stop_open, tp_open = stop, tp
-    atr = rules.atr(history) if len(history) >= 2 else 0.0
+    # The bot's cache (CANDLE_LIMIT = 300) ends with the live minute, so its ATR
+    # includes the current candle: use the 299 closed ones before plus this one.
+    atr = rules.atr(list(history[-299:]) + [candle])
 
     if (entry - c) * shares < HARD_STOP_LOSS_USD:
         return "hard_stop_survival", c
