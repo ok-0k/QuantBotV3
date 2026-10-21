@@ -77,6 +77,7 @@ from config import (
     SHORT_MARGIN_PCT, SHORT_MAX_OPEN, SYMBOL_COOLDOWN_SECS,
     DECAY_HALFLIFE_CANDLES, DECAY_MIN_CANDLES,
     DECAY_SL_TIGHTEN_STRENGTH, DECAY_TP_PULL_STRENGTH, EXPERIMENT_NAME,
+    EXPERIMENT_ARM_SYMBOLS,
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
@@ -379,12 +380,14 @@ async def _refresh_margin_health(
 def _experiment_arm(symbol: str) -> Optional[str]:
     """Arm ("A"/"B") of the active experiment for a symbol, or None if off.
 
-    Alternates in SYMBOLS order: balanced, deterministic, splits the majors.
+    Alternates in EXPERIMENT_ARM_SYMBOLS order (SYMBOLS frozen as decay_v2
+    ran it): balanced, deterministic, splits the majors, and unchanged when
+    a symbol is dropped from SYMBOLS.
     """
     if not EXPERIMENT_NAME:
         return None
     try:
-        idx = SYMBOLS.index(symbol)
+        idx = EXPERIMENT_ARM_SYMBOLS.index(symbol)
     except ValueError:
         idx = sum(symbol.encode())        # stable fallback for unknown symbols
     return "A" if idx % 2 == 0 else "B"
@@ -3228,6 +3231,18 @@ def _report_evidence_gate() -> None:
             log.warning("Evidence gate ON, 0 validated: no new entries (exits still run)")
 
 
+def _report_unfed_positions() -> list[str]:
+    """Open positions on a symbol that is not in SYMBOLS (e.g. dropped after a
+    delisting) get no candles or price feed, so exit_monitor skips them and
+    their stops never fire. Say so at boot; the owner closes them by hand or
+    re-adds the symbol."""
+    unfed = sorted({p["symbol"] for p in get_all_positions()} - set(SYMBOLS))
+    for sym in unfed:
+        log.error("Open position on %s, which is not in SYMBOLS: no price feed, so its "
+                  "exits will not run. Close it by hand or re-add the symbol.", sym)
+    return unfed
+
+
 def _report_model_ages() -> None:
     """Log model file ages at boot and publish them for the dashboard."""
     for key, path in (("model_age_xgb_days", XGB_MODEL), ("model_age_sac_days", SAC_WEIGHTS)):
@@ -3314,6 +3329,7 @@ async def main() -> int:
     init_db()
     _report_model_ages()
     _report_evidence_gate()
+    _report_unfed_positions()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

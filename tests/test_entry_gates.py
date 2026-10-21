@@ -11,11 +11,11 @@ import numpy as np
 import pytest
 
 import bot
-from config import STARTING_CASH, SYMBOLS
+from config import EXPERIMENT_ARM_SYMBOLS, STARTING_CASH, SYMBOLS
 from conftest import make_candles
 
 ZERO_STATE = np.zeros(13, dtype=np.float32)
-A_SYMS = [s for i, s in enumerate(SYMBOLS) if i % 2 == 0]
+A_SYMS = [s for i, s in enumerate(EXPERIMENT_ARM_SYMBOLS) if i % 2 == 0 and s in SYMBOLS]
 
 
 @pytest.fixture()

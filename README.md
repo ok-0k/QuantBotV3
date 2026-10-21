@@ -52,7 +52,7 @@ offline research toolkit with a cost-aware backtester.
 ## Architecture
 
 ```
-Binance WS (1m klines, 50 symbols)
+Binance WS (1m klines, 46 symbols)
    │  every update (~2 s) ──► _tick_exit_check: stops / targets / trailing / decay
    │  closed candle ────────► brain.get_ensemble_signal (short-only)
    │                              ├─ gates: circuit breaker / slots / correlation / exposure (blocks are journalled)
@@ -189,7 +189,8 @@ onto the entry price within about 5 minutes once a trade passed about 15 minutes
 That is the cause of the old ~20-minute trade lifecycle.
 
 - **How the split works:** symbols alternate between group A and group B in
-  `SYMBOLS` order.
+  `EXPERIMENT_ARM_SYMBOLS` order (the 50-symbol list as the experiment ran, so
+  dropping a symbol from `SYMBOLS` does not regroup the others).
 - **Group A** keeps the legacy behaviour.
 - **Group B** uses the decay as designed: λ comes from the trade's wall-clock
   age and is applied to the *initial* levels.
@@ -225,7 +226,9 @@ committed before any result was seen) is in `research/`:
 Data is cached in `/home/admin/trading_data/research/` (outside the repo). The
 backtester charges the same costs as the paper model: 0.10% fee + 0.08% slippage
 per fill, plus 0.03%/day short borrow. Hedge legs are only allowed in hours when
-the spot pair actually trades. Unit tests prove there is no lookahead.
+the spot pair actually trades. Unit tests prove there is no lookahead. The
+research universe is frozen in `research/universe.py` (the live bot's 50 symbols
+as of 2026-10, delisted pairs included up to delisting), not read from `SYMBOLS`.
 
 ---
 
@@ -259,7 +262,7 @@ vcgencmd measure_temp; free -h
 | Constant | Value | Notes |
 |----------|-------|-------|
 | `STARTING_CASH` | 10,000 | Paper balance |
-| `SYMBOLS` | 50 pairs | 4 are delisted on Binance spot (MATIC, MKR, OCEAN, AGIX). Removing them shifts the list positions the `decay_v2` report uses to rebuild its groups |
+| `SYMBOLS` | 46 pairs | The 4 delisted on Binance spot (MATIC, MKR, OCEAN, AGIX) were dropped 2026-10-21. Experiment groups and research keep the frozen 50 (`EXPERIMENT_ARM_SYMBOLS`, `research/universe.py`) |
 | `EXECUTION_MODE` | paper | `paper` or `testnet` (env). **No live mode** |
 | `SHORT_MAX_OPEN` | 5 | 3 per group while an experiment runs |
 | `MAX_ORDER_EQUITY_FRAC` | 15% | Hard per-order clamp |

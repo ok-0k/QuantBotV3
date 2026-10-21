@@ -24,6 +24,8 @@ Universe     config.SYMBOLS (the live bot's 50, incl. 4 since-delisted pairs —
              their history up to delisting is kept, which slightly reduces
              survivorship bias; the list was still chosen in 2026, so some
              survivorship bias remains).
+             Frozen since 2026-10-21 as research.universe.RESEARCH_SYMBOLS
+             (the same 50, same order), independent of the live list.
 Data         Binance spot 1h klines from 2022-10-01 (warmup), resampled to
              4h / 1D; USDT-M perp funding rates for the carry candidates.
 Periods      IS  (design)   2023-01-01 .. 2025-04-01
@@ -65,10 +67,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import SYMBOLS
 from research import backtest as bt
 from research import strategies as S
 from research.data import ROOT, build_panel, load_funding, resample, utc
+from research.universe import RESEARCH_SYMBOLS as SYMBOLS
 
 DATA_START = utc(2022, 10, 1)
 IS_START, OOS_START = utc(2023, 1, 1), utc(2025, 4, 1)

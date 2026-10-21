@@ -31,11 +31,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import SYMBOLS
 from research import backtest as bt
 from research import crowding as C
 from research.data import ROOT
 from research.study import IS_START, OOS_START
+from research.universe import RESEARCH_SYMBOLS as SYMBOLS
 
 BONFERRONI_T = 3.08                     # one-sided 5% / 48 tests (PREREG section 12), informational
 CHECKS = ("is_sharpe", "is_alpha_t", "oos_sharpe", "oos_alpha_pos", "oos_sharpe_2x", "neighbour",
