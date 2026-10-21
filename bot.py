@@ -3209,6 +3209,18 @@ def _report_evidence_gate() -> None:
             log.warning("Evidence gate ON, 0 validated: no new entries (exits still run)")
 
 
+def _report_unfed_positions() -> list[str]:
+    """Open positions on a symbol that is not in SYMBOLS (e.g. dropped after a
+    delisting) get no candles or price feed, so exit_monitor skips them and
+    their stops never fire. Say so at boot; the owner closes them by hand or
+    re-adds the symbol."""
+    unfed = sorted({p["symbol"] for p in get_all_positions()} - set(SYMBOLS))
+    for sym in unfed:
+        log.error("Open position on %s, which is not in SYMBOLS: no price feed, so its "
+                  "exits will not run. Close it by hand or re-add the symbol.", sym)
+    return unfed
+
+
 def _report_model_ages() -> None:
     """Log model file ages at boot and publish them for the dashboard."""
     for key, path in (("model_age_xgb_days", XGB_MODEL), ("model_age_sac_days", SAC_WEIGHTS)):
@@ -3295,6 +3307,7 @@ async def main() -> int:
     init_db()
     _report_model_ages()
     _report_evidence_gate()
+    _report_unfed_positions()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

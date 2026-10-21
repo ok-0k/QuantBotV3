@@ -73,18 +73,23 @@ LOSS_AVERSION_PENALTY: float = 1.5
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
+# MATICUSDT, MKRUSDT, OCEANUSDT and AGIXUSDT were dropped on 2026-10-21: all
+# delisted from Binance spot, so their streams sent nothing and REST returned
+# only pre-delisting candles. The research universe (research.universe) and
+# the experiment arm order (EXPERIMENT_ARM_SYMBOLS) are frozen 50-symbol
+# copies that still list them.
 SYMBOLS = [
     # Large caps — highest liquidity
     "BTCUSDT",   "ETHUSDT",   "BNBUSDT",   "SOLUSDT",   "XRPUSDT",
     # Mid caps — good volatility
-    "DOGEUSDT",  "ADAUSDT",   "AVAXUSDT",  "DOTUSDT",   "MATICUSDT",
+    "DOGEUSDT",  "ADAUSDT",   "AVAXUSDT",  "DOTUSDT",
     "LINKUSDT",  "LTCUSDT",   "ATOMUSDT",  "UNIUSDT",   "APTUSDT",
     "NEARUSDT",  "FILUSDT",   "INJUSDT",   "OPUSDT",    "ARBUSDT",
     "SEIUSDT",   "SUIUSDT",   "TIAUSDT",   "STXUSDT",   "RUNEUSDT",
     # DeFi
-    "AAVEUSDT",  "MKRUSDT",   "SNXUSDT",   "CRVUSDT",   "COMPUSDT",
+    "AAVEUSDT",  "SNXUSDT",   "CRVUSDT",   "COMPUSDT",
     # AI / infra
-    "FETUSDT",   "RENDERUSDT","WLDUSDT",   "OCEANUSDT", "AGIXUSDT",
+    "FETUSDT",   "RENDERUSDT","WLDUSDT",
     # Gaming / NFT
     "SANDUSDT",  "MANAUSDT",  "AXSUSDT",   "ENJUSDT",   "GALAUSDT",
     "APEUSDT",   "GMTUSDT",   "BLURUSDT",  "ILVUSDT",   "CHZUSDT",
