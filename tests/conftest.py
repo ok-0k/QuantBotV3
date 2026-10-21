@@ -50,6 +50,7 @@ def clean_db():
         for table in (
             "positions", "trades", "equity_curve", "rl_experience",
             "ml_cache", "brain_state", "portfolio", "candles", "orders",
+            "shadow_trades",
         ):
             conn.execute(f"DELETE FROM {table}")
     db._seed_portfolio()
@@ -66,6 +67,22 @@ def _no_discord(monkeypatch):
     except ImportError:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def _shadow_queue_empty():
+    """The shadow capture queue is module state: start and end every test empty."""
+    try:
+        import shadow
+        shadow._queue.clear()
+    except ImportError:
+        pass
+    yield
+    try:
+        import shadow
+        shadow._queue.clear()
+    except ImportError:
+        pass
 
 
 @pytest.fixture(autouse=True)

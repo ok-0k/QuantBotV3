@@ -83,12 +83,14 @@ Nightly cron 04:00 (Pi time): stop bot → prune_db.sh (verified backup, then pr
 | `config.py` | All tunables, env overrides, `~/.config/quant-bot/env` loader |
 | `dashboard.py` | FastAPI + SSE dashboard (optional `DASHBOARD_AUTH_TOKEN`) |
 | `ml_engine.py`, `features.py`, `rl_agent.py` | XGBoost gate, features, SAC actor inference |
-| `insights.py` | Read-only journal analytics behind the dashboard's Insights / Experiment / "How Trades End" sections |
+| `insights.py` | Read-only journal analytics behind the dashboard's Insights / Experiment / Learning / "How Trades End" sections |
+| `shadow.py` | Shadow learner: refused shorts tracked as shadow trades, learning statistics, demotion blocklist |
 | `prune_db.sh` | Nightly maintenance: integrity-checked compressed backup first, then trims candles and old equity detail, **never trade data** |
 | `scripts/restore_db.sh` | Restore a nightly backup (refuses while either service runs; dry run by default) |
 | `scripts/set_ledger_anchor.py` | Record a reviewed out-of-band cash change so the ledger check reads ~0 (dry run by default) |
 | `scripts/reset_circuit_breaker.py` | Re-base the breaker's peak equity after a reviewed drawdown (dry run by default) |
 | `scripts/experiment_report.py` | Read-only A/B report for an experiment (pass its name, e.g. `decay_v2`) |
+| `scripts/shadow_report.py` | Read-only shadow learner report (running numbers and the fixed evaluations) |
 | `scripts/entry_edge.py` | Read-only: the bot's entries against random entry, using Binance history |
 | `set_cash_balance.py`, `heal_equity.py` | Manual cash tools. The first records the change in `capital_adjustments`; the second refuses while positions are open |
 | `research/` | Offline backtester, data cache, pre-registered study, carry analysis ([results](research/RESULTS.md)) |
@@ -155,6 +157,31 @@ never gated. The list is empty today, so turning the gate on means the bot
 opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=false`
 turns it off. The dashboard's System section shows an Evidence Gate tile, and
 the bot logs one warning at startup while the gate is on with nothing validated.
+
+### Shadow learner (`SHADOW_LEARNER`, on by default)
+
+The bot keeps learning while the gate holds it flat. Every short the evidence
+gate refuses is also opened as a **shadow trade**: no capital, no orders. Shadow
+trades are resolved on closed 1-minute candles with the bot's own exit rules
+(trailing stop, break-even, designed time decay, the take-profit fee gate, the
+4-hour exit) and its own cost booking, plus 0.03%/day short borrow. Results are
+kept per exact strategy name in the `shadow_trades` table.
+
+- **No peeking:** a setup can only become a candidate at two fixed evaluation
+  dates, 8 and 16 weeks after the first shadow trade, with at least 300 trades,
+  an average of at least +0.10R net and a day-clustered t of at least 3.6.
+  Running numbers before then are shown but decide nothing.
+- **Promotion is manual:** a candidate gets an independent code check and PM
+  review, then the owner adds its exact name to `VALIDATED_STRATEGIES`.
+- **Demotion is automatic:** a validated name whose last 50 real trades average
+  a loss is blocklisted at runtime; only the owner clears it.
+- **Isolation:** the entry path only queues the signal in memory; all database
+  work runs in a worker thread during housekeeping. It can't change or delay a
+  real decision. Env `SHADOW_LEARNER=false` turns it off.
+
+The full rule and every difference from live trading are in
+`research/PREREG_SHADOW.md`. The dashboard's Learning section shows progress;
+`scripts/shadow_report.py` prints it.
 
 ## Trade journal
 
@@ -279,6 +306,7 @@ vcgencmd measure_temp; free -h
 | `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
 | `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
 | `ENTRY_EVIDENCE_GATE` | on | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=false` turns it off |
+| `SHADOW_LEARNER` | on | Refused shorts tracked as shadow trades. Env `SHADOW_LEARNER=false` turns it off |
 
 ## Execution modes and order protections
 
@@ -312,7 +340,7 @@ and blank the webhook.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q                   # 349 tests; throwaway temp DB, never the live one
+.venv/bin/python -m pytest tests/ -q                   # ~480 tests, ~2 min; throwaway temp DB, never the live one
 V3_FIXES=false .venv/bin/python -m pytest tests/ -q    # same suite with the deferred exit fixes off
 ```
 
