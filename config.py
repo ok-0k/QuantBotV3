@@ -375,6 +375,17 @@ ENTRY_EVIDENCE_GATE: bool = os.getenv("ENTRY_EVIDENCE_GATE", "true").strip().low
 # family matching: a pass covers one pre-registered config, not its variants.
 VALIDATED_STRATEGIES: frozenset[str] = frozenset()
 
+# ── SHADOW LEARNER (default ON) ──────────────────────────────────────────────
+# Every short entry the evidence gate refuses is also opened as a shadow trade
+# (no capital, no orders) and resolved on closed 1m candles with the bot's own
+# exit rules and cost booking; see shadow.py and research/PREREG_SHADOW.md.
+# Env SHADOW_LEARNER=false switches it off.
+SHADOW_LEARNER: bool = os.getenv("SHADOW_LEARNER", "true").strip().lower() in ("1", "true", "yes")
+SHADOW_NOTIONAL_USD: float = 150.0      # ~ the median real short notional; sizes the survival stop and borrow
+SHADOW_BORROW_DAILY: float = 0.0003     # 0.03%/day on short notional, as in the research studies
+SHADOW_MAX_HOLD_HOURS: float = 48.0     # cap so a shadow winner cannot stay open forever
+SHADOW_QUEUE_MAX: int = 20_000          # in-memory queue bound between housekeeping runs
+
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
 # ═════════════════════════════════════════════════════════════════════════════
