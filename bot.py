@@ -446,25 +446,35 @@ def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
     except (KeyError, TypeError, ValueError):
         return
     age_min = (time.time() - opened.timestamp()) / 60.0
-    if entry <= 0 or tp0 <= 0 or sl0 <= 0 or age_min < DECAY_MIN_CANDLES:
-        return
-    lam = 1.0 - math.exp(-age_min / max(DECAY_HALFLIFE_CANDLES, 1e-6))
-    if lam < 0.03:
-        return
     stop = float(pos.get("stop_price", 0.0) or 0.0)
     tp = float(pos.get("tp_price", 0.0) or 0.0)
+    new_tp, new_sl = designed_decay_moves(entry, tp0, sl0, age_min, stop, tp,
+                                          pos.get("side", "long") == "short")
+    if new_tp is not None:
+        update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
+    if new_sl is not None:
+        update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
+
+
+def designed_decay_moves(
+    entry: float, tp0: float, sl0: float, age_min: float, stop: float, tp: float,
+    is_short: bool,
+) -> tuple[Optional[float], Optional[float]]:
+    """Pure core of _apply_designed_time_decay: the (new_tp, new_stop) the
+    designed decay moves to at age_min, each None if that level does not move.
+    Shared with the shadow learner so both use the same exit rule."""
+    if entry <= 0 or tp0 <= 0 or sl0 <= 0 or age_min < DECAY_MIN_CANDLES:
+        return None, None
+    lam = 1.0 - math.exp(-age_min / max(DECAY_HALFLIFE_CANDLES, 1e-6))
+    if lam < 0.03:
+        return None, None
     target_tp = entry + (tp0 - entry) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
     target_sl = sl0 + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - sl0)
-    if pos.get("side", "long") == "short":
-        if tp < target_tp < entry - 1e-9:
-            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
-        if entry + 1e-9 < target_sl < stop:
-            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
-    else:
-        if entry + 1e-9 < target_tp < tp:
-            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
-        if stop < target_sl < entry - 1e-9:
-            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
+    if is_short:
+        return (target_tp if tp < target_tp < entry - 1e-9 else None,
+                target_sl if entry + 1e-9 < target_sl < stop else None)
+    return (target_tp if entry + 1e-9 < target_tp < tp else None,
+            target_sl if stop < target_sl < entry - 1e-9 else None)
 
 
 def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
@@ -999,6 +1009,47 @@ def _hard_stop_open_pnl(pos: dict, mark_price: float) -> float:
     return (mark - avg) * qty
 
 
+def trail_stop_move(is_short: bool, tp: float, stop: float, candle_high: float,
+                    candle_low: float, atr: float) -> Optional[float]:
+    """Pure core of the tick-path trailing stop: once price passes the target,
+    the stop trails 1 ATR behind the extreme. Returns the new stop, or None if
+    it does not move. Shared with the shadow learner."""
+    if atr <= 0 or tp <= 0:
+        return None
+    if is_short:
+        if candle_low < tp:
+            new_stop = candle_low + atr
+            return new_stop if new_stop < stop else None
+        return None
+    if candle_high > tp:
+        new_stop = candle_high - atr
+        return new_stop if new_stop > stop else None
+    return None
+
+
+def breakeven_stop_move(is_short: bool, avg_cost: float, stop: float, candle_high: float,
+                        candle_low: float, close: float, atr: float) -> tuple[Optional[float], bool]:
+    """Pure core of the ATR break-even stop: (new_stop, deferred). new_stop is
+    the entry price once the wick reached BE_TRIGGER_ATR_MULT x ATR AND the
+    close is BE_MIN_PROFIT_ATR x ATR in profit (None if the stop does not move);
+    deferred is True when the wick triggered but the close guard held it back.
+    Shared with the shadow learner."""
+    if atr <= 0 or avg_cost <= 0:
+        return None, False
+    min_profit = BE_MIN_PROFIT_ATR * atr
+    if is_short:
+        if candle_low <= avg_cost - BE_TRIGGER_ATR_MULT * atr:
+            if avg_cost - close >= min_profit:
+                return (avg_cost if avg_cost < stop else None), False
+            return None, True
+        return None, False
+    if candle_high >= avg_cost + BE_TRIGGER_ATR_MULT * atr:
+        if close - avg_cost >= min_profit:
+            return (avg_cost if avg_cost > stop else None), False
+        return None, True
+    return None, False
+
+
 # ── Tick-level exit check ─────────────────────────────────────────────────────
 
 async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -1066,26 +1117,20 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # Short : if candle low drops BELOW tp_price (original short target), trail
     #         the stop down to (candle_low + 1xATR), locking in profit.
     # The directional guard means the stop only ever ratchets favourably.
-    if _atr > 0 and not is_short:
-        if tp > 0 and candle_high > tp:
-            new_stop = candle_high - _atr
-            if new_stop > stop:
-                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
-                stop = new_stop
-                log.info(
-                    "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
-                    sym, new_stop, candle_high, _atr,
-                )
-    elif _atr > 0 and is_short:
-        if tp > 0 and candle_low < tp:
-            new_stop = candle_low + _atr
-            if new_stop < stop:
-                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
-                stop = new_stop
-                log.info(
-                    "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
-                    sym, new_stop, candle_low, _atr,
-                )
+    new_stop = trail_stop_move(is_short, tp, stop, candle_high, candle_low, _atr)
+    if new_stop is not None:
+        update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
+        stop = new_stop
+        if is_short:
+            log.info(
+                "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
+                sym, new_stop, candle_low, _atr,
+            )
+        else:
+            log.info(
+                "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
+                sym, new_stop, candle_high, _atr,
+            )
     # ── END TRAILING STOP ─────────────────────────────────────────────────────
 
     # ── PURE BREAK-EVEN STOP (V2.2 + Suffocation Fix) ────────────────────────
@@ -1103,38 +1148,22 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     if _atr > 0 and avg_cost > 0:
         _close_now = float(candle.get("close", avg_cost))
         _min_be_profit = BE_MIN_PROFIT_ATR * _atr   # ATR-based floor always available here
-        if is_short:
-            if candle_low <= avg_cost - BE_TRIGGER_ATR_MULT * _atr:
-                if avg_cost - _close_now >= _min_be_profit:
-                    be_stop = avg_cost
-                    if be_stop < stop:
-                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
-                        stop = be_stop
-                        log.info(
-                            "BREAK-EVEN STOP (short) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
-                            sym, be_stop, avg_cost, avg_cost - _close_now,
-                        )
-                else:
-                    log.info(
-                        "BE GUARD (short) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
-                        sym, avg_cost - _close_now, _min_be_profit, BE_MIN_PROFIT_ATR,
-                    )
-        else:
-            if candle_high >= avg_cost + BE_TRIGGER_ATR_MULT * _atr:
-                if _close_now - avg_cost >= _min_be_profit:
-                    be_stop = avg_cost
-                    if be_stop > stop:
-                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
-                        stop = be_stop
-                        log.info(
-                            "BREAK-EVEN STOP (long) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
-                            sym, be_stop, avg_cost, _close_now - avg_cost,
-                        )
-                else:
-                    log.info(
-                        "BE GUARD (long) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
-                        sym, _close_now - avg_cost, _min_be_profit, BE_MIN_PROFIT_ATR,
-                    )
+        be_stop, be_deferred = breakeven_stop_move(
+            is_short, avg_cost, stop, candle_high, candle_low, _close_now, _atr)
+        _close_profit = (avg_cost - _close_now) if is_short else (_close_now - avg_cost)
+        _side_word = "short" if is_short else "long"
+        if be_stop is not None:
+            update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
+            stop = be_stop
+            log.info(
+                "BREAK-EVEN STOP (%s) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
+                _side_word, sym, be_stop, avg_cost, _close_profit,
+            )
+        elif be_deferred:
+            log.info(
+                "BE GUARD (%s) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
+                _side_word, sym, _close_profit, _min_be_profit, BE_MIN_PROFIT_ATR,
+            )
     elif avg_cost > 0:
         # ATR unavailable: fall back to absolute % threshold for the close check only.
         _close_now = float(candle.get("close", avg_cost))
