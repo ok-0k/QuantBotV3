@@ -80,7 +80,7 @@ from config import (
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
-    MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
+    MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS,
     STARTING_CASH,
     V3_FIXES, ENTRY_EVIDENCE_GATE, VALIDATED_STRATEGIES,
 )
@@ -695,22 +695,24 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 backoff = 1.0
-                # V4: after a long outage the in-memory candle cache has a gap
-                # that would poison every indicator — REST-backfill first.
+                # V4: after a drop the in-memory candle cache has a gap that
+                # would poison every indicator — REST-backfill first, on EVERY
+                # reconnect after an error. _ws_down_since is the error time,
+                # but a keepalive timeout is raised 10-30 s after the last
+                # message, so a short measured gap can still hide a lost
+                # closed candle (2026-10-19 16:38, ~1 s reconnect).
                 # (New entries were already frozen by the stale-data gate.)
                 if _ws_down_since is not None:
-                    gap = time.time() - _ws_down_since
-                    if gap > WS_BACKFILL_AFTER_SECS:
-                        log.warning(
-                            "WS was down %.0fs (> %.0fs) — backfilling candle "
-                            "history before consuming the stream",
-                            gap, WS_BACKFILL_AFTER_SECS,
-                        )
-                        try:
-                            refreshed = await _load_history_for_all_symbols()
-                            log.info("Backfill complete for %d symbols", len(refreshed))
-                        except Exception as _bf_exc:
-                            log.error("Backfill failed (%s) — stale gate still protects entries", _bf_exc)
+                    log.warning(
+                        "WS reconnected %.0fs after the error — backfilling candle "
+                        "history before consuming the stream",
+                        time.time() - _ws_down_since,
+                    )
+                    try:
+                        refreshed = await _load_history_for_all_symbols()
+                        log.info("Backfill complete for %d symbols", len(refreshed))
+                    except Exception as _bf_exc:
+                        log.error("Backfill failed (%s) — stale gate still protects entries", _bf_exc)
                     _ws_down_since = None
                 log.info("WebSocket connected")
                 async for raw_msg in ws:

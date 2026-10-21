@@ -409,10 +409,6 @@ STALE_ENTRY_MAX_SECS: float = float(os.getenv("STALE_ENTRY_MAX_SECS", "180"))
 # alone would otherwise permit.
 MAX_ORDER_EQUITY_FRAC: float = float(os.getenv("MAX_ORDER_EQUITY_FRAC", "0.15"))
 
-# WS reconnect: if the stream was down longer than this, REST-backfill candle
-# history before trading again so indicators don't run on a gapped cache.
-WS_BACKFILL_AFTER_SECS: float = float(os.getenv("WS_BACKFILL_AFTER_SECS", "90"))
-
 # Testnet adapter behaviour
 ORDER_POLL_TIMEOUT_SECS: float = float(os.getenv("ORDER_POLL_TIMEOUT_SECS", "20"))
 ORDER_MAX_RETRIES: int = int(os.getenv("ORDER_MAX_RETRIES", "2"))
