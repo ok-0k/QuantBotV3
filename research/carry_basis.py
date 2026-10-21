@@ -20,10 +20,10 @@ import math
 import numpy as np
 import pandas as pd
 
-from config import SYMBOLS
 from research import strategies as S
 from research.data import load_funding, load_premium
 from research.study import DATA_START, IS_START, OOS_START, funding_buckets, load_spot_tradable
+from research.universe import RESEARCH_SYMBOLS as SYMBOLS
 
 PERIODS_PER_YEAR = 1095
 

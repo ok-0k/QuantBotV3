@@ -95,7 +95,7 @@ def market_outages(symbols) -> pd.Series:
 
 
 def main(argv=None) -> None:
-    from config import SYMBOLS
+    from research.universe import RESEARCH_SYMBOLS as SYMBOLS
     ap = argparse.ArgumentParser(prog="research.smc_data_check")
     ap.add_argument("--download", action="store_true")
     ap.add_argument("--workers", type=int, default=2)

@@ -49,6 +49,7 @@ import pandas as pd
 
 from research import data
 from research import smc
+from research.universe import RESEARCH_SYMBOLS
 
 REPO = Path(__file__).resolve().parent.parent
 SCOPES = ("symbol", "portfolio")
@@ -60,8 +61,7 @@ BIAS_NAME = {1: "bullish", -1: "bearish", 0: "neutral"}
 
 
 def universe() -> list[str]:
-    from config import SYMBOLS                      # after preflight: TRADING_ENV_FILE is checked
-    return list(SYMBOLS)
+    return list(RESEARCH_SYMBOLS)
 
 
 def _git(*args: str) -> str:

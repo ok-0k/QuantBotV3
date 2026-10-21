@@ -11,9 +11,9 @@ import sys
 import numpy as np
 import pandas as pd
 
-from config import SYMBOLS
 from research.data import build_panel, load_funding, resample
 from research.study import DATA_START
+from research.universe import RESEARCH_SYMBOLS as SYMBOLS
 
 
 def main() -> None:

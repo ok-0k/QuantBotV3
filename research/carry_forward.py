@@ -29,14 +29,18 @@ verdict was affected and the frozen rules above are unchanged):
   * A sleeve is only live while its spot pair trades
     (research.study.spot_tradable): a hedge cannot outlive its spot leg, as
     the phantom MATICUSDT hedge did in the backtest (see RESULTS.md).
+
+Universe (2026-10-21, no rule change): "config.SYMBOLS" above is now the
+frozen copy research.universe.RESEARCH_SYMBOLS (the same 50, same order), so
+the live bot dropping its delisted pairs leaves this test's universe unchanged.
 """
 
 import pandas as pd
 
-from config import SYMBOLS
 from research import strategies as S
 from research.data import load_funding, load_premium, utc
 from research.study import DATA_START, funding_buckets, load_spot_tradable
+from research.universe import RESEARCH_SYMBOLS as SYMBOLS
 
 FORWARD_START = utc(2026, 10, 7)
 THETA_ON = 0.0002
