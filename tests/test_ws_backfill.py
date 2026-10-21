@@ -1,6 +1,7 @@
 """
-Websocket reconnect backfill: every reconnect after an error REST-backfills
-the candle history before the stream is consumed, however short the drop.
+Websocket reconnect backfill: every connect but the process's first (after
+an error or a clean server close) REST-backfills the candle history before
+the stream is consumed, however short the drop.
 A keepalive timeout is raised 10-30 s after the last message, so the gap
 measured from the error never showed how many closed candles were lost
 (2026-10-19 16:38: a ~1 s reconnect missed the 16:38 close on ~46 symbols).
@@ -91,3 +92,10 @@ def test_first_connect_does_not_backfill(listener):
     events = listener(["k1", bot._shutdown_event.set, "k2"])
     assert events == ["connect", "msg:k1"]
     assert "backfill" not in events
+
+
+def test_clean_server_close_backfills_on_the_next_connect(listener):
+    # Binance closes connections itself: the `async for` just ends, no exception
+    events = listener(["k1"], ["k2", bot._shutdown_event.set, "k3"])
+    assert events == ["connect", "msg:k1", "connect", "backfill", "msg:k2"]
+    assert bot._ws_down_since is None

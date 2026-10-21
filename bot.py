@@ -697,14 +697,15 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
                 backoff = 1.0
                 # V4: after a drop the in-memory candle cache has a gap that
                 # would poison every indicator — REST-backfill first, on EVERY
-                # reconnect after an error. _ws_down_since is the error time,
-                # but a keepalive timeout is raised 10-30 s after the last
-                # message, so a short measured gap can still hide a lost
-                # closed candle (2026-10-19 16:38, ~1 s reconnect).
+                # connect but the process's first (an error or a clean server
+                # close). _ws_down_since is when the drop was noticed, but a
+                # keepalive timeout is raised 10-30 s after the last message,
+                # so a short measured gap can still hide a lost closed candle
+                # (2026-10-19 16:38, ~1 s reconnect).
                 # (New entries were already frozen by the stale-data gate.)
                 if _ws_down_since is not None:
                     log.warning(
-                        "WS reconnected %.0fs after the error — backfilling candle "
+                        "WS reconnected %.0fs after the drop — backfilling candle "
                         "history before consuming the stream",
                         time.time() - _ws_down_since,
                     )
@@ -719,6 +720,11 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
                     if _shutdown_event.is_set():
                         return
                     await _handle_ws_message(raw_msg, loop)
+            # The server closed the stream cleanly (Binance does): a drop too.
+            if _shutdown_event.is_set():
+                return
+            _ws_down_since = time.time()
+            log.warning("WebSocket closed by the server - reconnecting")
 
         except Exception as exc:
             if _shutdown_event.is_set():
