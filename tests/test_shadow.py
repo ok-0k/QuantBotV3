@@ -120,7 +120,7 @@ def test_refused_short_is_captured_with_the_real_entry_levels(harness, fresh):
                                     side="short")
     assert q[0]["entry"] == pytest.approx(entry)
     assert (q[0]["stop0"], q[0]["tp0"]) == pytest.approx((stop, tp))
-    assert q[0]["last_ms"] == candles[-1]["time"]
+    assert q[0]["last_ms"] == q[0]["opened_ms"] // M * M - M          # resolution starts at the entry minute
     assert _rows(fresh, "SELECT * FROM shadow_trades") == []          # nothing written yet
 
 
@@ -193,8 +193,8 @@ def test_no_capture_when_the_entry_is_allowed(harness, fresh, monkeypatch):
 def test_housekeeping_snapshot_excludes_the_live_minute(fresh, monkeypatch):
     seen = {}
 
-    def job(records, candles, now_ms):
-        seen.update(records=records, candles=candles, now_ms=now_ms)
+    def job(candles, now_ms):
+        seen.update(candles=candles, now_ms=now_ms)
         return {}, [], []
     monkeypatch.setattr(bot, "_shadow_job", job)
     now = int(time.time() * 1000) // M * M
@@ -206,7 +206,7 @@ def test_housekeeping_snapshot_excludes_the_live_minute(fresh, monkeypatch):
     asyncio.run(bot._shadow_housekeeping(timeout=5))
     times = [c["time"] for c in seen["candles"][SYM]]
     assert now not in times and (now - 2 * M) in times
-    assert seen["records"] == [{"x": 1}] and len(shadow._queue) == 0
+    assert len(shadow._queue) == 1                  # only process() drains, under its lock
     assert json.loads(fresh.get_portfolio_stat(shadow.STATS_KEY))["at"]
 
 
@@ -294,6 +294,18 @@ def test_break_even_moves_the_stop_to_entry_then_it_exits_there():
     assert out == ("stop_loss_short", 100.0, T_START + M)
 
 
+def test_entry_minute_is_tested_for_the_stop_only():
+    entry_minute = T_START
+    t = trade(opened_ms=entry_minute + 20_000)
+    t["last_ms"] = entry_minute - M
+    # entry minute touches the target and wicks below it: never a take-profit
+    assert run_series(t, bars([(100, 100.2, 89.0, 99.5)])) is None
+    assert (t["stop"], t["tp"]) == (103.5, 90.0)                             # no level moves either
+    t = trade(opened_ms=entry_minute + 20_000)
+    t["last_ms"] = entry_minute - M
+    assert run_series(t, bars([(100, 103.8, 99.0, 101)])) == ("stop_loss_short", 103.5, entry_minute)
+
+
 def test_designed_decay_matches_the_bot_helper():
     t = trade(opened_ms=T_START - 59 * M)        # 60 min old after the first candle
     assert run_series(t, bars([100.0])) is None
@@ -376,14 +388,14 @@ def _rec(ts="2026-10-21T00:00:00+00:00", strategy=NAME, symbol=SYM, entry=100.0,
 
 
 def test_process_inserts_dedupes_sets_t0_once_and_resolves(fresh):
-    s = shadow.process([_rec(), _rec(ts="2026-10-21T00:01:00+00:00"), _rec(strategy="QF_TR_S9_M99")],
-                       {SYM: history() + bars([100.0])}, RULES, T_START + 3 * M, fresh)
+    s = shadow.process({SYM: history() + bars([100.0])}, RULES, T_START + 3 * M, fresh,
+                       records=[_rec(), _rec(ts="2026-10-21T00:01:00+00:00"), _rec(strategy="QF_TR_S9_M99")])
     assert (s["opened"], s["duplicates"], s["errors"]) == (2, 1, 0)
     assert fresh.get_portfolio_stat(shadow.T0_KEY) == "2026-10-21T00:00:00+00:00"
-    shadow.process([_rec(ts="2026-10-22T00:00:00+00:00", symbol=SYMBOLS[1])], {}, RULES, T_START, fresh)
+    shadow.process({}, RULES, T_START, fresh, records=[_rec(ts="2026-10-22T00:00:00+00:00", symbol=SYMBOLS[1])])
     assert fresh.get_portfolio_stat(shadow.T0_KEY) == "2026-10-21T00:00:00+00:00"   # written once
-    s = shadow.process([], {SYM: history() + bars([100.0, (100, 103.6, 99, 101)])}, RULES,
-                       T_START + 5 * M, fresh)
+    s = shadow.process({SYM: history() + bars([100.0, (100, 103.6, 99, 101)])}, RULES,
+                       T_START + 5 * M, fresh, records=[])
     assert s["closed"] == 2
     rows = _rows(fresh, "SELECT * FROM shadow_trades WHERE symbol=? ORDER BY id", (SYM,))
     assert all(r["status"] == "closed" and r["exit_reason"] == "stop_loss_short" for r in rows)
@@ -394,16 +406,49 @@ def test_process_survives_a_bad_row_and_counts_it(fresh):
     with fresh.get_db() as conn:
         conn.execute("INSERT INTO shadow_trades (opened_ts, opened_ms, symbol, strategy, entry, stop0, tp0, "
                      "stop, tp, last_ms) VALUES ('x', 0, ?, 'N', 0, 0, 0, 0, 0, 0)", (SYM,))
-    s = shadow.process([], {SYM: [{"time": M, "open": "bad"}]}, RULES, 10 ** 13, fresh)
+    s = shadow.process({SYM: [{"time": M, "open": "bad"}]}, RULES, 10 ** 13, fresh, records=[])
     assert s["errors"] >= 1
 
 
-def test_process_refuses_to_run_twice_at_once(fresh):
+def test_process_refuses_to_run_twice_at_once_and_keeps_the_queue(fresh, monkeypatch):
+    monkeypatch.setattr(shadow, "SHADOW_LEARNER", True)
+    shadow.capture(_rec())
     assert shadow._lock.acquire(blocking=False)
     try:
-        assert shadow.process([_rec()], {}, RULES, T_START, fresh).get("skipped_busy") == 1
+        assert shadow.process({}, RULES, T_START, fresh).get("skipped_busy") == 1
+        assert len(shadow._queue) == 1                                  # nothing drained, nothing lost
     finally:
         shadow._lock.release()
+    s = shadow.process({}, RULES, T_START, fresh)
+    assert (s["queued"], s["opened"], len(shadow._queue)) == (1, 1, 0)
+
+
+def test_queue_overflow_is_counted(fresh, monkeypatch):
+    from collections import deque
+    monkeypatch.setattr(shadow, "SHADOW_LEARNER", True)
+    monkeypatch.setattr(shadow, "_queue", deque(maxlen=3))
+    shadow.take_dropped()
+    for i in range(5):
+        shadow.capture(_rec(symbol=SYMBOLS[i]))
+    s = shadow.process({}, RULES, T_START, fresh)
+    assert (s["queued"], s["dropped"]) == (3, 2)
+    assert shadow.take_dropped() == 0
+
+
+def test_real_housekeeping_drains_and_inserts(fresh, monkeypatch):
+    monkeypatch.setattr(bot, "_candles_cache", {})
+    shadow.capture(_rec())
+    asyncio.run(bot._shadow_housekeeping(timeout=10))
+    assert len(shadow._queue) == 0
+    assert len(_rows(fresh, "SELECT * FROM shadow_trades")) == 1
+    assert json.loads(fresh.get_portfolio_stat(shadow.STATS_KEY))["opened"] == 1
+
+
+def test_blocklist_is_loaded_at_boot(fresh, monkeypatch):
+    fresh.set_portfolio_stat(shadow.BLOCKLIST_KEY, json.dumps([NAME]))
+    monkeypatch.setattr(bot, "_evidence_blocklist", set())
+    bot._load_evidence_blocklist()
+    assert bot._evidence_blocklist == {NAME}
 
 
 # ── learning statistics and the fixed evaluation dates ───────────────────────
@@ -425,10 +470,32 @@ def _closed_rows(db, name, per_day, days, start=datetime(2026, 10, 21, tzinfo=ti
 def test_name_stats_day_clustered():
     rows = [{"symbol": "A", "opened_ts": f"2026-10-{21 + d}T00:00", "r_net": v}
             for d, v in enumerate([1.0, 0.0, 2.0, 1.0])]
+    rows += [{"symbol": "B", "opened_ts": "2026-10-24T05:00", "r_net": 3.0}]   # 2 trades on one day
     s = shadow.name_stats(rows)
-    assert s["n"] == 4 and s["days"] == 4 and s["mean_r"] == 1.0
-    assert s["t"] == pytest.approx(1.0 / (np.std([1, 0, 2, 1], ddof=1) / 2))
-    assert (s["half1"], s["half2"]) == (0.5, 1.5) and s["max_symbol_share"] == 1.0
+    assert s["n"] == 5 and s["days"] == 4 and s["mean_r"] == pytest.approx(1.4)  # per-trade mean
+    r = [1.0, 0.0, 2.0, 1.0, 3.0]
+    d = ["21", "22", "23", "24", "24"]
+    assert s["t"] == pytest.approx(shadow.cluster_t(r, d))
+    assert s["half1"] == 0.5 and s["half2"] == pytest.approx(2.0)             # trade means per half
+    assert s["max_symbol_share"] == pytest.approx(4.0 / 7.0)
+
+
+def test_cluster_t_matches_the_research_formula():
+    import pandas  # noqa: F401  (research.smc needs it)
+    from research.smc import cluster_t as smc_cluster_t
+    rng = np.random.default_rng(3)
+    for _ in range(25):
+        n = int(rng.integers(5, 400))
+        r = rng.normal(0.05, 1.0, n)
+        day = rng.integers(0, max(2, n // 7), n)
+        assert shadow.cluster_t(list(r), list(day)) == pytest.approx(smc_cluster_t(r, day), rel=1e-9)
+    assert math.isnan(shadow.cluster_t([1.0], ["a"])) and math.isnan(shadow.cluster_t([1.0, 2.0], ["a", "a"]))
+
+
+def test_bonferroni_bar_from_the_frozen_name_count():
+    assert shadow.bonferroni_t(1) == 3.6                                  # floor
+    assert shadow.bonferroni_t(150) == pytest.approx(3.6)                 # z(1.67e-4) = 3.59 -> floor
+    assert shadow.bonferroni_t(400) == pytest.approx(3.836, abs=1e-3)     # z(0.05 / 800)
 
 
 @pytest.mark.parametrize("field, value, ok", [
@@ -468,6 +535,7 @@ def test_evaluation_only_at_fixed_dates_and_only_for_names_frozen_at_t0(fresh, m
         assert shadow.evaluate(conn, t0 + timedelta(days=112)) is None            # in the future
         e = shadow.evaluate(conn, t0 + timedelta(days=56))
         assert e["candidates"] == [NAME]
+        assert e["n_names"] == 1 and e["t_bar"] == 3.6
         assert shadow.passes(e["stats"]["LATE_NAME"])                             # passes, still excluded
         s = shadow.summary(conn, now=t0 + timedelta(days=60))
     assert s["next_eval"] == (t0 + timedelta(days=112)).isoformat()

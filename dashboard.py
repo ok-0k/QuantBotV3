@@ -1900,7 +1900,7 @@ function renderLearning(s){
   g('learn-note').textContent = 'Every short the evidence gate refuses is tracked as a shadow trade with the bot\'s own '
     + 'exit rules and costs. Running numbers are not evidence before '+learnDate(s.next_eval)+'. A setup can '
     + 'only become a candidate at the two fixed evaluation dates (8 and 16 weeks), with at least 300 trades, '
-    + '+0.10R average and t ≥ 3.6; promotion to live trading is a manual, reviewed step.';
+    + '+0.10R average and a t-stat of at least 3.6; promotion to live trading is a manual, reviewed step.';
 }
 
 function loadInsights(){

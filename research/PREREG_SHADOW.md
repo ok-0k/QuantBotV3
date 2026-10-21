@@ -57,7 +57,11 @@ of its shadow population.
 
 ## Exit model (per closed 1-minute candle)
 
-In this order, using the bot's own pure helpers:
+**The entry minute** (the minute containing the entry time) is tested for the
+stop only, on its high: part of its range printed before the entry, so the
+order of events is unknown. It never books a target and never moves a level.
+
+Every later minute, in this order, using the bot's own pure helpers:
 1. Survival stop: open P&L at the close below `HARD_STOP_LOSS_USD` → exit at the close.
 2. Trailing stop: `bot.trail_stop_move`.
 3. Break-even: `bot.breakeven_stop_move`.
@@ -108,15 +112,19 @@ At an evaluation date, an eligible name is a **candidate** only if all hold:
 | closed shadow trades | ≥ 300 |
 | distinct UTC days with a trade | ≥ 20 |
 | mean net R per trade | ≥ +0.10 |
-| day-clustered t-stat | ≥ 3.6 |
+| day-clustered t-stat of the trade mean | ≥ the bar below (at least 3.6) |
 | mean net R in each half of its days | > 0 in both |
 | largest single-symbol share of total net R | ≤ 25% |
 
-- **Day-clustered t** = mean of daily mean R ÷ (standard deviation of daily
-  means ÷ √days). Days are UTC days of `opened_ts`.
-- **Halves** split the name's days at the median day.
-- **Multiple testing:** about 150 names × 2 looks ≈ 300 tests; one-sided 5% /
-  300 → z ≈ 3.6.
+- **Day-clustered t** = mean net R per trade ÷ its standard error clustered by
+  UTC day of `opened_ts`: SE = √(G/(G−1) · Σ_g (Σ_{i∈g} (r_i − mean))²) / N, the
+  same formula as `research.smc.cluster_t` (a test pins the two together).
+- **Halves** split the name's days at the median day; each half's figure is
+  the mean over its trades.
+- **The bar (multiple testing):** one-sided z for 0.05 / (2 looks × N), where N
+  is the number of names frozen at T0, and never below 3.6. Each evaluation
+  records N and the bar. (153 names were seen in 8 days before this was
+  written, so N will likely be above 150; z for 150 names ≈ 3.59.)
 
 Every eligible name's numbers are reported at each evaluation, not only
 candidates.
@@ -136,8 +144,18 @@ key `evidence_blocklist`) when its last 50 closed real trades have a mean net
 P&L ≤ $0. The gate refuses blocklisted names. Only the owner clears the
 blocklist.
 
-## Switches
+## Switches and data integrity
 
 `SHADOW_LEARNER=false` (env) turns the shadow learner off. It never affects a
 real decision: capture is in memory only and never raises; all database work
 runs in a worker thread with its own transactions.
+
+- The capture queue is drained only by the worker after it holds its lock, so
+  a run that is still busy (or timed out) never loses records.
+- If the queue overflows its bound (20,000), the evicted records are counted
+  (`dropped` in the portfolio key `shadow_stats`) and reported at each evaluation.
+- The demotion blocklist is loaded at boot, before any entry is evaluated, and
+  refreshed every minute.
+- Before deploy, the live database must have no `shadow_t0` key (T0 is set by
+  the first shadow trade the merged code records). Sandbox runs use a scratch
+  database only.

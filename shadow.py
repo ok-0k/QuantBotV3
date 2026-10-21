@@ -30,6 +30,7 @@ import logging
 import math
 import statistics as st
 import threading
+from statistics import NormalDist
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,7 +49,8 @@ NO_DATA_CLOSE_MS = 30 * MINUTE_MS   # no candles at all for this long: close at 
 EVAL_OFFSETS_DAYS = (56, 112)       # T0 + 8 weeks, T0 + 16 weeks
 NAME_FREEZE_LOOKBACK_DAYS = 14      # names eligible = seen in the 14 days before T0
 CANDIDATE_RULE = {"min_trades": 300, "min_days": 20, "min_mean_r": 0.10,
-                  "min_t": 3.6, "max_symbol_share": 0.25}
+                  "min_t": 3.6, "max_symbol_share": 0.25}   # min_t is the floor; see bonferroni_t()
+FAMILY_ALPHA = 0.05                 # one-sided, split over 2 looks x the names frozen at T0
 DEMOTION_RULE = {"window": 50, "max_mean_net_usd": 0.0}
 T0_KEY = "shadow_t0"
 STATS_KEY = "shadow_stats"
@@ -56,6 +58,8 @@ BLOCKLIST_KEY = "evidence_blocklist"
 
 _queue: deque = deque(maxlen=SHADOW_QUEUE_MAX)
 _lock = threading.Lock()            # process() is never run twice at once
+_drop_lock = threading.Lock()
+_dropped = 0                        # records evicted because the queue was full
 
 
 @dataclass(frozen=True)
@@ -73,12 +77,24 @@ class Rules:
 
 def capture(record: dict) -> None:
     """Queue one refused short signal. Never touches the database, never raises."""
+    global _dropped
     if not SHADOW_LEARNER:
         return
     try:
+        if _queue.maxlen is not None and len(_queue) >= _queue.maxlen:
+            with _drop_lock:
+                _dropped += 1           # append below evicts the oldest record
         _queue.append(dict(record))
     except Exception as exc:          # pragma: no cover - defensive
         log.debug("shadow capture failed: %s", exc)
+
+
+def take_dropped() -> int:
+    """Records evicted from a full queue since the last call (then reset)."""
+    global _dropped
+    with _drop_lock:
+        n, _dropped = _dropped, 0
+    return n
 
 
 def drain() -> list[dict]:
@@ -110,11 +126,17 @@ def step(trade: dict, candle: dict, history: list[dict], rules: Rules) -> Option
     """Apply one closed candle to an open short shadow trade: survival ->
     trail -> break-even -> decay -> stop in place (wick) -> target in place
     (wick, fee-gated) -> moved stop (close) -> moved target (close, fee-gated)
-    -> 4h losing exit -> shadow cap. Mutates trade['stop'] / ['tp'].
+    -> 4h losing exit -> shadow cap. The entry minute is tested for the stop
+    only (wick), never the target. Mutates trade['stop'] / ['tp'].
     Returns (exit_reason, exit_price) or None. `history` = closed candles
     before this one."""
     entry, stop, tp = trade["entry"], trade["stop"], trade["tp"]
     o, h, l, c = (float(candle[k]) for k in ("open", "high", "low", "close"))
+    if int(candle["time"]) == trade["opened_ms"] // MINUTE_MS * MINUTE_MS:
+        # The entry minute: part of its range printed before the entry, so the
+        # order of events is unknown. Conservative: the stop only, never the
+        # target, and no level moves.
+        return ("stop_loss_short", stop) if stop > 0 and h >= stop else None
     shares = SHADOW_NOTIONAL_USD / entry
     age_min = (int(candle["time"]) + MINUTE_MS - trade["opened_ms"]) / MINUTE_MS
     stop_open, tp_open = stop, tp
@@ -185,16 +207,21 @@ def _iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
 
 
-def process(records: list[dict], candles: dict[str, list[dict]], rules: Rules,
-            now_ms: int, db) -> dict:
+def process(candles: dict[str, list[dict]], rules: Rules, now_ms: int, db,
+            records: Optional[list[dict]] = None) -> dict:
     """Insert queued shadow entries (one open per (symbol, strategy)) and
     resolve every open shadow trade. Runs in an executor thread; each write is
-    its own transaction on this thread's connection. Returns counters."""
-    stats = {"queued": len(records), "opened": 0, "duplicates": 0, "closed": 0,
-             "gap_stops": 0, "errors": 0}
+    its own transaction on this thread's connection. The capture queue is
+    drained only after the lock is taken (records=None), so a run that is
+    still busy never loses records. Returns counters."""
+    stats = {"queued": 0, "opened": 0, "duplicates": 0, "closed": 0,
+             "gap_stops": 0, "errors": 0, "dropped": 0}
     if not _lock.acquire(blocking=False):
         return {**stats, "skipped_busy": 1}
     try:
+        if records is None:
+            records = drain()
+        stats["queued"], stats["dropped"] = len(records), take_dropped()
         with db.get_db() as conn:
             if conn.execute("SELECT value FROM portfolio WHERE key=?", (T0_KEY,)).fetchone() is None and records:
                 conn.execute("INSERT OR IGNORE INTO portfolio VALUES (?, ?)", (T0_KEY, records[0]["opened_ts"]))
@@ -274,6 +301,31 @@ def eligible_names(conn, t0_dt: datetime) -> set[str]:
         "AND strategy IS NOT NULL", (lo, t0_dt.isoformat()))}
 
 
+def cluster_t(r: list[float], day: list) -> float:
+    """t-stat of the trade mean with standard errors clustered by day:
+    SE = sqrt(G/(G-1) * sum_g (sum_{i in g} (r_i - mean))^2) / N.
+    Same formula as research.smc.cluster_t (pinned by a test)."""
+    n = len(r)
+    if n < 2:
+        return float("nan")
+    m = sum(r) / n
+    g = defaultdict(float)
+    for x, d in zip(r, day):
+        g[d] += x - m
+    G = len(g)
+    if G < 2:
+        return float("nan")
+    se = math.sqrt(G / (G - 1) * sum(v * v for v in g.values())) / n
+    return m / se if se > 0 else float("nan")
+
+
+def bonferroni_t(n_names: int) -> float:
+    """The evaluation bar: one-sided z for FAMILY_ALPHA / (2 looks x names
+    frozen at T0), never below CANDIDATE_RULE['min_t'] (3.6)."""
+    z = NormalDist().inv_cdf(1 - FAMILY_ALPHA / (2 * max(int(n_names), 1)))
+    return max(CANDIDATE_RULE["min_t"], z)
+
+
 def name_stats(rows: list[dict]) -> dict:
     """n, days, mean net R, day-clustered t, both-halves means, largest
     single-symbol share of net R."""
@@ -287,10 +339,9 @@ def name_stats(rows: list[dict]) -> dict:
         if x["r_net"] is not None and math.isfinite(x["r_net"]):
             by_day[x["opened_ts"][:10]].append(x["r_net"])
     days = sorted(by_day)
-    means = [st.mean(by_day[d]) for d in days]
     out["days"], out["mean_r"] = len(days), st.mean(rs)
-    if len(means) >= 2 and st.stdev(means) > 0:
-        out["t"] = st.mean(means) / (st.stdev(means) / math.sqrt(len(means)))
+    t = cluster_t([r for d in days for r in by_day[d]], [d for d in days for _ in by_day[d]])
+    out["t"] = t if math.isfinite(t) else None
     mid = days[len(days) // 2] if len(days) >= 2 else None
     if mid:
         h1 = [r for d in days if d < mid for r in by_day[d]]
@@ -307,11 +358,12 @@ def name_stats(rows: list[dict]) -> dict:
     return out
 
 
-def passes(s: dict) -> bool:
+def passes(s: dict, min_t: Optional[float] = None) -> bool:
     R = CANDIDATE_RULE
+    bar = R["min_t"] if min_t is None else min_t
     return (s["n"] >= R["min_trades"] and s["days"] >= R["min_days"]
             and s["mean_r"] is not None and s["mean_r"] >= R["min_mean_r"]
-            and s["t"] is not None and s["t"] >= R["min_t"]
+            and s["t"] is not None and s["t"] >= bar
             and (s["half1"] or 0) > 0 and (s["half2"] or 0) > 0
             and s["max_symbol_share"] is not None and s["max_symbol_share"] <= R["max_symbol_share"])
 
@@ -335,9 +387,11 @@ def evaluate(conn, at: datetime) -> Optional[dict]:
     if t0_dt is None or at not in eval_dates(t0_dt) or at > datetime.now(timezone.utc):
         return None
     names = eligible_names(conn, t0_dt)
+    bar = bonferroni_t(len(names))
     per = {n: name_stats(rows) for n, rows in _closed(conn, t0_dt, at).items()}
     return {"at": at.isoformat(), "t0": t0_dt.isoformat(), "rule": CANDIDATE_RULE,
-            "candidates": sorted(n for n, s in per.items() if n in names and passes(s)),
+            "n_names": len(names), "t_bar": round(bar, 3),
+            "candidates": sorted(n for n, s in per.items() if n in names and passes(s, bar)),
             "stats": per, "eligible": sorted(names)}
 
 

@@ -650,14 +650,32 @@ def _shadow_capture(ensemble: dict, direction: str, candles: list[dict]) -> None
         if not (0 < tp < entry < stop):
             return
         now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        # Resolution starts at the entry minute itself (tested for the stop
+        # only); candles[-1] may already be that forming minute or the one before.
+        entry_minute = now_ms // 60_000 * 60_000
         shadow.capture({
-            "opened_ts": now.isoformat(), "opened_ms": int(now.timestamp() * 1000),
+            "opened_ts": now.isoformat(), "opened_ms": now_ms,
             "symbol": str(ensemble.get("symbol", "")), "strategy": name, "regime": regime,
-            "entry": entry, "stop0": stop, "tp0": tp, "last_ms": int(candles[-1]["time"]),
+            "entry": entry, "stop0": stop, "tp0": tp, "last_ms": entry_minute - 60_000,
             "features": {"ml_prob": ensemble.get("ml_prob"), "conf": round(conf, 4)},
         })
     except Exception as exc:   # pragma: no cover - defensive
         log.debug("shadow capture skipped for %s: %s", ensemble.get("symbol"), exc)
+
+
+def _load_evidence_blocklist() -> None:
+    """Boot: load the runtime demotion blocklist before any entry can be
+    evaluated (housekeeping refreshes it every minute after that)."""
+    global _evidence_blocklist
+    try:
+        with _db.get_db() as conn:
+            _evidence_blocklist = set(shadow.blocklist(conn))
+        if _evidence_blocklist:
+            log.warning("Evidence gate blocklist (demoted): %s", ", ".join(sorted(_evidence_blocklist)))
+    except Exception as exc:
+        log.error("Evidence blocklist load failed (%s) — validated names stay allowed "
+                  "until housekeeping refreshes it", exc)
 
 
 _SHADOW_RULES = shadow.Rules(
@@ -669,10 +687,11 @@ _SHADOW_RULES = shadow.Rules(
 )
 
 
-def _shadow_job(records: list[dict], candles: dict, now_ms: int) -> tuple[dict, list[str], list[str]]:
-    """Runs in a worker thread with its own DB connection: shadow inserts and
-    resolution, then the demotion check and the blocklist read."""
-    stats = shadow.process(records, candles, _SHADOW_RULES, now_ms, _db)
+def _shadow_job(candles: dict, now_ms: int) -> tuple[dict, list[str], list[str]]:
+    """Runs in a worker thread with its own DB connection: shadow inserts
+    (draining the capture queue once it holds the lock) and resolution, then
+    the demotion check and the blocklist read."""
+    stats = shadow.process(candles, _SHADOW_RULES, now_ms, _db) if SHADOW_LEARNER else {}
     with _db.get_db() as conn:
         demoted = shadow.demotion_check(conn, VALIDATED_STRATEGIES)
         block = shadow.blocklist(conn)
@@ -681,19 +700,17 @@ def _shadow_job(records: list[dict], candles: dict, now_ms: int) -> tuple[dict, 
 
 async def _shadow_housekeeping(timeout: float = 45.0) -> None:
     """Housekeeping step: snapshot CLOSED candles (the cache's last element can
-    be the live minute), drain the capture queue and hand both to a worker
-    thread. A slow database delays only this step, never an entry or exit."""
+    be the live minute) and hand them to a worker thread, which drains the
+    capture queue itself. A slow database delays only this step, never an
+    entry or exit."""
     global _evidence_blocklist
     now_ms = int(time.time() * 1000)
     closed_before = now_ms - 2_000
-    snap = {s: [c for c in v if int(c["time"]) + 60_000 <= closed_before]
-            for s, v in list(_candles_cache.items())}
-    records = shadow.drain() if SHADOW_LEARNER else []
+    snap = ({s: [c for c in v if int(c["time"]) + 60_000 <= closed_before]
+             for s, v in list(_candles_cache.items())} if SHADOW_LEARNER else {})
     loop = asyncio.get_running_loop()
     stats, demoted, block = await asyncio.wait_for(
-        loop.run_in_executor(None, _shadow_job, records if SHADOW_LEARNER else [],
-                             snap if SHADOW_LEARNER else {}, now_ms),
-        timeout=timeout)
+        loop.run_in_executor(None, _shadow_job, snap, now_ms), timeout=timeout)
     _evidence_blocklist = set(block)
     for name in demoted:
         log.warning("Evidence gate: %s DEMOTED (last %d real trades mean net <= $%.2f) — "
@@ -3412,6 +3429,7 @@ async def main() -> int:
     init_db()
     _report_model_ages()
     _report_evidence_gate()
+    _load_evidence_blocklist()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
