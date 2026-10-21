@@ -237,6 +237,8 @@ _exec_adapter = get_execution_adapter()
 
 # V4: WS-outage tracking for the reconnect backfill.
 _ws_down_since: Optional[float] = None
+_WS_STABLE_SECS = 60.0          # a connection up this long resets the reconnect backoff
+_ws_clock = time.monotonic      # connection uptime clock (tests fake it)
 
 _candles_cache:        dict[str, list[dict]] = {}
 _closed_candle_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
@@ -692,9 +694,10 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
 
     while not _shutdown_event.is_set():
         log.info("Connecting WebSocket -> %s", url)
+        up_since: Optional[float] = None
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                backoff = 1.0
+                up_since = _ws_clock()
                 # V4: after a drop the in-memory candle cache has a gap that
                 # would poison every indicator — REST-backfill first, on EVERY
                 # connect but the process's first (an error or a clean server
@@ -720,24 +723,35 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
                     if _shutdown_event.is_set():
                         return
                     await _handle_ws_message(raw_msg, loop)
-            # The server closed the stream cleanly (Binance does): a drop too.
-            if _shutdown_event.is_set():
-                return
-            _ws_down_since = time.time()
-            log.warning("WebSocket closed by the server - reconnecting")
-
+            error = None                  # the server closed the stream cleanly (Binance does)
         except Exception as exc:
-            if _shutdown_event.is_set():
-                return
-            if _ws_down_since is None:
-                _ws_down_since = time.time()
-            log.error("WebSocket error: %s - reconnecting in %.1fs", exc, backoff)
-            try:
-                await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff)
-                return
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 60.0)
+            error = exc
+        if _shutdown_event.is_set():
+            return
+        if _ws_down_since is None:
+            _ws_down_since = time.time()
+        # Every drop (error or clean close) waits before reconnecting, and the
+        # backoff only resets after a connection stayed up _WS_STABLE_SECS: a
+        # server that keeps closing at once gets 1, 2, 4 .. 60 s waits, so at
+        # most one reconnect backfill per wait, never a REST request storm.
+        if up_since is not None and _ws_clock() - up_since >= _WS_STABLE_SECS:
+            backoff = 1.0
+        if error is None:
+            log.warning("WebSocket closed by the server - reconnecting in %.1fs", backoff)
+        else:
+            log.error("WebSocket error: %s - reconnecting in %.1fs", error, backoff)
+        if await _ws_reconnect_wait(backoff):
+            return
+        backoff = min(backoff * 2, 60.0)
+
+
+async def _ws_reconnect_wait(secs: float) -> bool:
+    """Wait before a reconnect; True if shutdown was requested meanwhile."""
+    try:
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=secs)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 # ── Fee-gate helpers (pure, no I/O, safe to call from async context) ─────────
