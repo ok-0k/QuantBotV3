@@ -272,7 +272,7 @@ vcgencmd measure_temp; free -h
 | `HARD_STOP_LOSS_USD` | −15 | Survival stop per position |
 | `MAX_HOLD_OPEN_SECONDS` | 14,400 | Closes losing positions after 4h |
 | `MAX_DRAWDOWN_PCT` / `CB_RECOVERY_PCT` | 20% / 10% | Circuit breaker trips at 20% drawdown, clears at 10% |
-| `STALE_ENTRY_MAX_SECS` / `WS_BACKFILL_AFTER_SECS` | 180 / 90 | Stale-data entry gate, REST backfill after a websocket outage |
+| `STALE_ENTRY_MAX_SECS` | 180 | Stale-data entry gate (every websocket reconnect after an error also REST-backfills candles) |
 | `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
 | `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
 | `ENTRY_EVIDENCE_GATE` | on | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=false` turns it off |
