@@ -77,12 +77,13 @@ from config import (
     SHORT_MARGIN_PCT, SHORT_MAX_OPEN, SYMBOL_COOLDOWN_SECS,
     DECAY_HALFLIFE_CANDLES, DECAY_MIN_CANDLES,
     DECAY_SL_TIGHTEN_STRENGTH, DECAY_TP_PULL_STRENGTH, EXPERIMENT_NAME,
+    EXPERIMENT_ARM_SYMBOLS,
     BE_TRIGGER_ATR_MULT, BE_MIN_PROFIT_ATR, BE_MIN_PROFIT_PCT,
     FEE_GATE_ROUND_TRIP, MICRO_WIN_REWARD_PENALTY, MICRO_WIN_USD,
     MIN_EXPECTED_TP_NET_USD,
-    MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS, WS_BACKFILL_AFTER_SECS,
+    MAX_ORDER_EQUITY_FRAC, STALE_ENTRY_MAX_SECS,
     STARTING_CASH,
-    V3_FIXES, ENTRY_EVIDENCE_GATE, VALIDATED_STRATEGIES,
+    V3_FIXES, ENTRY_EVIDENCE_GATE, VALIDATED_STRATEGIES, SHADOW_LEARNER,
 )
 from execution import OrderIntent, get_execution_adapter, make_client_order_id
 from rl_agent import compute_position_fraction
@@ -100,6 +101,8 @@ from accounting_v2 import (
     shaped_reward_net,
 )
 from binance_margin import evaluate_margin_health, fetch_margin_account_snapshot
+import db as _db
+import shadow
 from risk_engine import (
     apply_dynamic_rr,
     correlation_blocks_entry,
@@ -237,6 +240,8 @@ _exec_adapter = get_execution_adapter()
 
 # V4: WS-outage tracking for the reconnect backfill.
 _ws_down_since: Optional[float] = None
+_WS_STABLE_SECS = 60.0          # a connection up this long resets the reconnect backoff
+_ws_clock = time.monotonic      # connection uptime clock (tests fake it)
 
 _candles_cache:        dict[str, list[dict]] = {}
 _closed_candle_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
@@ -259,6 +264,9 @@ _entry_in_flight:   dict[str, dict] = {}
 # time of the last row written (at most one per _ENTRY_BLOCK_JOURNAL_SECS).
 _ENTRY_BLOCK_JOURNAL_SECS = 300.0
 _entry_block_journaled: dict[tuple[str, str], float] = {}
+# Validated names demoted at runtime (shadow.demotion_check); refreshed by
+# housekeeping so the gate never reads the DB for it.
+_evidence_blocklist: set[str] = set()
 # Circuit breaker state as last seen after an evaluation (None = not evaluated
 # yet in this process); drives the one-time "entries halted" warning.
 _cb_last_open: Optional[bool] = None
@@ -377,12 +385,14 @@ async def _refresh_margin_health(
 def _experiment_arm(symbol: str) -> Optional[str]:
     """Arm ("A"/"B") of the active experiment for a symbol, or None if off.
 
-    Alternates in SYMBOLS order: balanced, deterministic, splits the majors.
+    Alternates in EXPERIMENT_ARM_SYMBOLS order (SYMBOLS frozen as decay_v2
+    ran it): balanced, deterministic, splits the majors, and unchanged when
+    a symbol is dropped from SYMBOLS.
     """
     if not EXPERIMENT_NAME:
         return None
     try:
-        idx = SYMBOLS.index(symbol)
+        idx = EXPERIMENT_ARM_SYMBOLS.index(symbol)
     except ValueError:
         idx = sum(symbol.encode())        # stable fallback for unknown symbols
     return "A" if idx % 2 == 0 else "B"
@@ -446,25 +456,35 @@ def _apply_designed_time_decay(sym: str, pos: dict, feats: dict) -> None:
     except (KeyError, TypeError, ValueError):
         return
     age_min = (time.time() - opened.timestamp()) / 60.0
-    if entry <= 0 or tp0 <= 0 or sl0 <= 0 or age_min < DECAY_MIN_CANDLES:
-        return
-    lam = 1.0 - math.exp(-age_min / max(DECAY_HALFLIFE_CANDLES, 1e-6))
-    if lam < 0.03:
-        return
     stop = float(pos.get("stop_price", 0.0) or 0.0)
     tp = float(pos.get("tp_price", 0.0) or 0.0)
+    new_tp, new_sl = designed_decay_moves(entry, tp0, sl0, age_min, stop, tp,
+                                          pos.get("side", "long") == "short")
+    if new_tp is not None:
+        update_tp_price(sym, new_tp, only_tighten=V3_FIXES)
+    if new_sl is not None:
+        update_stop_price(sym, new_sl, only_tighten=V3_FIXES)
+
+
+def designed_decay_moves(
+    entry: float, tp0: float, sl0: float, age_min: float, stop: float, tp: float,
+    is_short: bool,
+) -> tuple[Optional[float], Optional[float]]:
+    """Pure core of _apply_designed_time_decay: the (new_tp, new_stop) the
+    designed decay moves to at age_min, each None if that level does not move.
+    Shared with the shadow learner so both use the same exit rule."""
+    if entry <= 0 or tp0 <= 0 or sl0 <= 0 or age_min < DECAY_MIN_CANDLES:
+        return None, None
+    lam = 1.0 - math.exp(-age_min / max(DECAY_HALFLIFE_CANDLES, 1e-6))
+    if lam < 0.03:
+        return None, None
     target_tp = entry + (tp0 - entry) * (1.0 - lam * DECAY_TP_PULL_STRENGTH)
     target_sl = sl0 + lam * DECAY_SL_TIGHTEN_STRENGTH * (entry - sl0)
-    if pos.get("side", "long") == "short":
-        if tp < target_tp < entry - 1e-9:
-            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
-        if entry + 1e-9 < target_sl < stop:
-            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
-    else:
-        if entry + 1e-9 < target_tp < tp:
-            update_tp_price(sym, target_tp, only_tighten=V3_FIXES)
-        if stop < target_sl < entry - 1e-9:
-            update_stop_price(sym, target_sl, only_tighten=V3_FIXES)
+    if is_short:
+        return (target_tp if tp < target_tp < entry - 1e-9 else None,
+                target_sl if entry + 1e-9 < target_sl < stop else None)
+    return (target_tp if entry + 1e-9 < target_tp < tp else None,
+            target_sl if stop < target_sl < entry - 1e-9 else None)
 
 
 def _apply_ml_time_decay(sym: str, pos: dict, candles: list[dict]) -> None:
@@ -608,7 +628,101 @@ def _has_validated_edge(ensemble: dict, direction: str) -> bool:
     test: its exact name is in config.VALIDATED_STRATEGIES. No prefix or
     family matching — a pass covers one tested config, not its variants."""
     name = _top_strategy(ensemble, direction)
-    return bool(name) and name in VALIDATED_STRATEGIES
+    return bool(name) and name in VALIDATED_STRATEGIES and name not in _evidence_blocklist
+
+
+def _shadow_capture(ensemble: dict, direction: str, candles: list[dict]) -> None:
+    """Queue a refused short for the shadow learner. In-memory only (no DB, no
+    network) and never raises, so it cannot change or delay the real decision
+    that has already been made. Levels come from the same functions a real
+    short entry uses (brain.get_stop_take + apply_dynamic_rr on the slipped
+    entry price, with the same confidence multiplier)."""
+    if not SHADOW_LEARNER or direction != "short" or not candles:
+        return
+    try:
+        price = float(ensemble.get("price") or 0.0)
+        name = _top_strategy(ensemble, direction)
+        if price <= 0 or not name:
+            return
+        entry = price * (1 - SLIPPAGE_PCT)
+        regime = ensemble.get("regime", "ranging")
+        conf = float(ensemble.get("position_size_mult", 1.0)) * dynamic_conviction_size_mult(
+            float(ensemble.get("ml_prob", 0.5)), "short")
+        stop, tp = brain.get_stop_take(entry, candles, name == "YOLO_FIRE", side="short",
+                                       regime=regime, confidence_mult=conf)
+        stop, tp = apply_dynamic_rr(entry=entry, stop=stop, take=tp,
+                                    atr=_wilder_atr(candles), side="short")
+        if not (0 < tp < entry < stop):
+            return
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        # Resolution starts at the entry minute itself (tested for the stop
+        # only); candles[-1] may already be that forming minute or the one before.
+        entry_minute = now_ms // 60_000 * 60_000
+        shadow.capture({
+            "opened_ts": now.isoformat(), "opened_ms": now_ms,
+            "symbol": str(ensemble.get("symbol", "")), "strategy": name, "regime": regime,
+            "entry": entry, "stop0": stop, "tp0": tp, "last_ms": entry_minute - 60_000,
+            "features": {"ml_prob": ensemble.get("ml_prob"), "conf": round(conf, 4)},
+        })
+    except Exception as exc:   # pragma: no cover - defensive
+        log.debug("shadow capture skipped for %s: %s", ensemble.get("symbol"), exc)
+
+
+def _load_evidence_blocklist() -> None:
+    """Boot: load the runtime demotion blocklist before any entry can be
+    evaluated (housekeeping refreshes it every minute after that)."""
+    global _evidence_blocklist
+    try:
+        with _db.get_db() as conn:
+            _evidence_blocklist = set(shadow.blocklist(conn))
+        if _evidence_blocklist:
+            log.warning("Evidence gate blocklist (demoted): %s", ", ".join(sorted(_evidence_blocklist)))
+    except Exception as exc:
+        log.error("Evidence blocklist load failed (%s) — validated names stay allowed "
+                  "until housekeeping refreshes it", exc)
+
+
+_SHADOW_RULES = shadow.Rules(
+    trail=lambda *a: trail_stop_move(*a),
+    breakeven=lambda *a: breakeven_stop_move(*a),
+    decay=lambda *a: designed_decay_moves(*a),
+    clears_fees=lambda *a: _profit_clears_fees(*a),
+    atr=lambda c: _wilder_atr(c),
+)
+
+
+def _shadow_job(candles: dict, now_ms: int) -> tuple[dict, list[str], list[str]]:
+    """Runs in a worker thread with its own DB connection: shadow inserts
+    (draining the capture queue once it holds the lock) and resolution, then
+    the demotion check and the blocklist read."""
+    stats = shadow.process(candles, _SHADOW_RULES, now_ms, _db) if SHADOW_LEARNER else {}
+    with _db.get_db() as conn:
+        demoted = shadow.demotion_check(conn, VALIDATED_STRATEGIES)
+        block = shadow.blocklist(conn)
+    return stats, demoted, block
+
+
+async def _shadow_housekeeping(timeout: float = 45.0) -> None:
+    """Housekeeping step: snapshot CLOSED candles (the cache's last element can
+    be the live minute) and hand them to a worker thread, which drains the
+    capture queue itself. A slow database delays only this step, never an
+    entry or exit."""
+    global _evidence_blocklist
+    now_ms = int(time.time() * 1000)
+    closed_before = now_ms - 2_000
+    snap = ({s: [c for c in v if int(c["time"]) + 60_000 <= closed_before]
+             for s, v in list(_candles_cache.items())} if SHADOW_LEARNER else {})
+    loop = asyncio.get_running_loop()
+    stats, demoted, block = await asyncio.wait_for(
+        loop.run_in_executor(None, _shadow_job, snap, now_ms), timeout=timeout)
+    _evidence_blocklist = set(block)
+    for name in demoted:
+        log.warning("Evidence gate: %s DEMOTED (last %d real trades mean net <= $%.2f) — "
+                    "blocklisted until the owner clears it", name,
+                    shadow.DEMOTION_RULE["window"], shadow.DEMOTION_RULE["max_mean_net_usd"])
+    if SHADOW_LEARNER:
+        set_portfolio_stat(shadow.STATS_KEY, json.dumps({**stats, "at": _now()}))
 
 
 def _handle_signal(signame: str) -> None:
@@ -692,44 +806,64 @@ async def websocket_listener(loop: asyncio.AbstractEventLoop) -> None:
 
     while not _shutdown_event.is_set():
         log.info("Connecting WebSocket -> %s", url)
+        up_since: Optional[float] = None
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                backoff = 1.0
-                # V4: after a long outage the in-memory candle cache has a gap
-                # that would poison every indicator — REST-backfill first.
+                up_since = _ws_clock()
+                # V4: after a drop the in-memory candle cache has a gap that
+                # would poison every indicator — REST-backfill first, on EVERY
+                # connect but the process's first (an error or a clean server
+                # close). _ws_down_since is when the drop was noticed, but a
+                # keepalive timeout is raised 10-30 s after the last message,
+                # so a short measured gap can still hide a lost closed candle
+                # (2026-10-19 16:38, ~1 s reconnect).
                 # (New entries were already frozen by the stale-data gate.)
                 if _ws_down_since is not None:
-                    gap = time.time() - _ws_down_since
-                    if gap > WS_BACKFILL_AFTER_SECS:
-                        log.warning(
-                            "WS was down %.0fs (> %.0fs) — backfilling candle "
-                            "history before consuming the stream",
-                            gap, WS_BACKFILL_AFTER_SECS,
-                        )
-                        try:
-                            refreshed = await _load_history_for_all_symbols()
-                            log.info("Backfill complete for %d symbols", len(refreshed))
-                        except Exception as _bf_exc:
-                            log.error("Backfill failed (%s) — stale gate still protects entries", _bf_exc)
+                    log.warning(
+                        "WS reconnected %.0fs after the drop — backfilling candle "
+                        "history before consuming the stream",
+                        time.time() - _ws_down_since,
+                    )
+                    try:
+                        refreshed = await _load_history_for_all_symbols()
+                        log.info("Backfill complete for %d symbols", len(refreshed))
+                    except Exception as _bf_exc:
+                        log.error("Backfill failed (%s) — stale gate still protects entries", _bf_exc)
                     _ws_down_since = None
                 log.info("WebSocket connected")
                 async for raw_msg in ws:
                     if _shutdown_event.is_set():
                         return
                     await _handle_ws_message(raw_msg, loop)
-
+            error = None                  # the server closed the stream cleanly (Binance does)
         except Exception as exc:
-            if _shutdown_event.is_set():
-                return
-            if _ws_down_since is None:
-                _ws_down_since = time.time()
-            log.error("WebSocket error: %s - reconnecting in %.1fs", exc, backoff)
-            try:
-                await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff)
-                return
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 60.0)
+            error = exc
+        if _shutdown_event.is_set():
+            return
+        if _ws_down_since is None:
+            _ws_down_since = time.time()
+        # Every drop (error or clean close) waits before reconnecting, and the
+        # backoff only resets after a connection stayed up _WS_STABLE_SECS: a
+        # server that keeps closing at once gets 1, 2, 4 .. 60 s waits, so at
+        # most one reconnect backfill per wait, never a REST request storm.
+        if up_since is not None and _ws_clock() - up_since >= _WS_STABLE_SECS:
+            backoff = 1.0
+        if error is None:
+            log.warning("WebSocket closed by the server - reconnecting in %.1fs", backoff)
+        else:
+            log.error("WebSocket error: %s - reconnecting in %.1fs", error, backoff)
+        if await _ws_reconnect_wait(backoff):
+            return
+        backoff = min(backoff * 2, 60.0)
+
+
+async def _ws_reconnect_wait(secs: float) -> bool:
+    """Wait before a reconnect; True if shutdown was requested meanwhile."""
+    try:
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=secs)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 # ── Fee-gate helpers (pure, no I/O, safe to call from async context) ─────────
@@ -999,6 +1133,47 @@ def _hard_stop_open_pnl(pos: dict, mark_price: float) -> float:
     return (mark - avg) * qty
 
 
+def trail_stop_move(is_short: bool, tp: float, stop: float, candle_high: float,
+                    candle_low: float, atr: float) -> Optional[float]:
+    """Pure core of the tick-path trailing stop: once price passes the target,
+    the stop trails 1 ATR behind the extreme. Returns the new stop, or None if
+    it does not move. Shared with the shadow learner."""
+    if atr <= 0 or tp <= 0:
+        return None
+    if is_short:
+        if candle_low < tp:
+            new_stop = candle_low + atr
+            return new_stop if new_stop < stop else None
+        return None
+    if candle_high > tp:
+        new_stop = candle_high - atr
+        return new_stop if new_stop > stop else None
+    return None
+
+
+def breakeven_stop_move(is_short: bool, avg_cost: float, stop: float, candle_high: float,
+                        candle_low: float, close: float, atr: float) -> tuple[Optional[float], bool]:
+    """Pure core of the ATR break-even stop: (new_stop, deferred). new_stop is
+    the entry price once the wick reached BE_TRIGGER_ATR_MULT x ATR AND the
+    close is BE_MIN_PROFIT_ATR x ATR in profit (None if the stop does not move);
+    deferred is True when the wick triggered but the close guard held it back.
+    Shared with the shadow learner."""
+    if atr <= 0 or avg_cost <= 0:
+        return None, False
+    min_profit = BE_MIN_PROFIT_ATR * atr
+    if is_short:
+        if candle_low <= avg_cost - BE_TRIGGER_ATR_MULT * atr:
+            if avg_cost - close >= min_profit:
+                return (avg_cost if avg_cost < stop else None), False
+            return None, True
+        return None, False
+    if candle_high >= avg_cost + BE_TRIGGER_ATR_MULT * atr:
+        if close - avg_cost >= min_profit:
+            return (avg_cost if avg_cost > stop else None), False
+        return None, True
+    return None, False
+
+
 # ── Tick-level exit check ─────────────────────────────────────────────────────
 
 async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -1066,26 +1241,20 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # Short : if candle low drops BELOW tp_price (original short target), trail
     #         the stop down to (candle_low + 1xATR), locking in profit.
     # The directional guard means the stop only ever ratchets favourably.
-    if _atr > 0 and not is_short:
-        if tp > 0 and candle_high > tp:
-            new_stop = candle_high - _atr
-            if new_stop > stop:
-                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
-                stop = new_stop
-                log.info(
-                    "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
-                    sym, new_stop, candle_high, _atr,
-                )
-    elif _atr > 0 and is_short:
-        if tp > 0 and candle_low < tp:
-            new_stop = candle_low + _atr
-            if new_stop < stop:
-                update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
-                stop = new_stop
-                log.info(
-                    "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
-                    sym, new_stop, candle_low, _atr,
-                )
+    new_stop = trail_stop_move(is_short, tp, stop, candle_high, candle_low, _atr)
+    if new_stop is not None:
+        update_stop_price(sym, new_stop, only_tighten=V3_FIXES)
+        stop = new_stop
+        if is_short:
+            log.info(
+                "TRAIL STOP SHORT %s -> $%.4f  (low=$%.4f  atr=$%.4f)",
+                sym, new_stop, candle_low, _atr,
+            )
+        else:
+            log.info(
+                "TRAIL STOP %s -> $%.4f  (high=$%.4f  atr=$%.4f)",
+                sym, new_stop, candle_high, _atr,
+            )
     # ── END TRAILING STOP ─────────────────────────────────────────────────────
 
     # ── PURE BREAK-EVEN STOP (V2.2 + Suffocation Fix) ────────────────────────
@@ -1103,38 +1272,22 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     if _atr > 0 and avg_cost > 0:
         _close_now = float(candle.get("close", avg_cost))
         _min_be_profit = BE_MIN_PROFIT_ATR * _atr   # ATR-based floor always available here
-        if is_short:
-            if candle_low <= avg_cost - BE_TRIGGER_ATR_MULT * _atr:
-                if avg_cost - _close_now >= _min_be_profit:
-                    be_stop = avg_cost
-                    if be_stop < stop:
-                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
-                        stop = be_stop
-                        log.info(
-                            "BREAK-EVEN STOP (short) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
-                            sym, be_stop, avg_cost, avg_cost - _close_now,
-                        )
-                else:
-                    log.info(
-                        "BE GUARD (short) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
-                        sym, avg_cost - _close_now, _min_be_profit, BE_MIN_PROFIT_ATR,
-                    )
-        else:
-            if candle_high >= avg_cost + BE_TRIGGER_ATR_MULT * _atr:
-                if _close_now - avg_cost >= _min_be_profit:
-                    be_stop = avg_cost
-                    if be_stop > stop:
-                        update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
-                        stop = be_stop
-                        log.info(
-                            "BREAK-EVEN STOP (long) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
-                            sym, be_stop, avg_cost, _close_now - avg_cost,
-                        )
-                else:
-                    log.info(
-                        "BE GUARD (long) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
-                        sym, _close_now - avg_cost, _min_be_profit, BE_MIN_PROFIT_ATR,
-                    )
+        be_stop, be_deferred = breakeven_stop_move(
+            is_short, avg_cost, stop, candle_high, candle_low, _close_now, _atr)
+        _close_profit = (avg_cost - _close_now) if is_short else (_close_now - avg_cost)
+        _side_word = "short" if is_short else "long"
+        if be_stop is not None:
+            update_stop_price(sym, be_stop, only_tighten=V3_FIXES)
+            stop = be_stop
+            log.info(
+                "BREAK-EVEN STOP (%s) %s -> $%.4f  (entry=$%.4f  close_profit=$%.4f)",
+                _side_word, sym, be_stop, avg_cost, _close_profit,
+            )
+        elif be_deferred:
+            log.info(
+                "BE GUARD (%s) %s — close profit $%.4f < min $%.4f (%.1f ATR); BE deferred",
+                _side_word, sym, _close_profit, _min_be_profit, BE_MIN_PROFIT_ATR,
+            )
     elif avg_cost > 0:
         # ATR unavailable: fall back to absolute % threshold for the close check only.
         _close_now = float(candle.get("close", avg_cost))
@@ -1174,17 +1327,25 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # trigger level understated losses, e.g. a stop 5.7% under market booked ~$0.
     _mark_now = float(candle.get("close", 0.0) or 0.0)
     if V3_FIXES:
-        # Order as in exit_monitor: survival -> stop -> take-profit, so a
-        # fee-gated TP can no longer hide a breached stop, and a candle that
-        # touched both books the stop (conservative).
+        # Order: survival -> stop in place (wick) -> take-profit in place
+        # (wick, fee-cleared) -> moved stop (mark) -> moved take-profit (mark).
+        # A fee-gated TP can no longer hide a breached stop, and a candle that
+        # touched both levels in place books the stop (conservative).
         # The candle's high/low is the whole minute so far, partly printed
         # before a stop moved within the minute existed (trail / break-even,
         # in this call or an earlier tick, or decay). It is only tested
         # against the loosest stop in place since the minute began (_ext_stop);
         # a stop moved since triggers on the mark only. Otherwise a break-even
         # armed mid-candle is "hit" by the minute's earlier high, closing a
-        # winner at entry. A take-profit is tested against the level stored
-        # when this call began (_tp0) as before, or the current one on the mark.
+        # winner at entry. A take-profit in place (the level stored when this
+        # call began, _tp0) that the wick traded through, and that would book a
+        # positive net, exits at the target BEFORE a moved stop is tested on
+        # the mark: the resting limit filled when price passed it, and a trail
+        # built from that same move must not pre-empt it. A fee-gated target
+        # falls through to the moved-stop check. Same order as the shadow
+        # learner (shadow.step).
+        _tp_clears = lambda px: _profit_clears_fees(          # noqa: E731
+            avg_cost, float(pos.get("shares", 0.0)), px, is_short)
         _mkey = (pos.get("opened_ts"), candle.get("time"))
         _seen = _tick_minute_stop.get(sym)
         if _seen is None or _seen[0] != _mkey:
@@ -1201,12 +1362,12 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 stop = _ext_stop
                 reason = f"stop_loss_tick (low=${candle_low:,.4f} <= stop=${stop:,.4f})"
                 exit_price = min(stop, _mark_now) if _mark_now > 0 else stop
+            elif _tp0 > 0 and candle_high >= _tp0 and _tp_clears(_tp0):
+                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
+                exit_price = _tp0
             elif stop > 0 and 0 < _mark_now <= stop:
                 reason = f"stop_loss_tick (mark=${_mark_now:,.4f} <= stop=${stop:,.4f})"
                 exit_price = _mark_now
-            elif _tp0 > 0 and candle_high >= _tp0:
-                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
-                exit_price = _tp0
             elif tp > 0 and _mark_now >= tp:
                 reason = f"take_profit_tick (mark=${_mark_now:,.4f} >= tp=${tp:,.4f})"
                 exit_price = tp
@@ -1215,12 +1376,12 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 stop = _ext_stop
                 reason = f"stop_loss_tick_short (high=${candle_high:,.4f} >= stop=${stop:,.4f})"
                 exit_price = max(stop, _mark_now)
+            elif _tp0 > 0 and candle_low <= _tp0 and _tp_clears(_tp0):
+                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
+                exit_price = _tp0
             elif stop > 0 and _mark_now >= stop:
                 reason = f"stop_loss_tick_short (mark=${_mark_now:,.4f} >= stop=${stop:,.4f})"
                 exit_price = _mark_now
-            elif _tp0 > 0 and candle_low <= _tp0:
-                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
-                exit_price = _tp0
             elif tp > 0 and 0 < _mark_now <= tp:
                 reason = f"take_profit_tick_short (mark=${_mark_now:,.4f} <= tp=${tp:,.4f})"
                 exit_price = tp
@@ -1541,6 +1702,7 @@ async def _evaluate_and_trade(
         log.debug("%s %s blocked - no validated edge (%s)", symbol, direction.upper(),
                   _top_strategy(ensemble, direction))
         _journal_entry_block(ensemble, direction, "no_validated_edge", _ts)
+        _shadow_capture(ensemble, direction, candles)   # in-memory only; never raises
         return
 
     if direction == "buy" and open_position_count() >= MAX_OPEN_POSITIONS:
@@ -3163,6 +3325,12 @@ async def housekeeping_loop() -> None:
         # ── Ledger reconciliation (IMPR-1): ledger_drift for the dashboard ────
         _report_cash_invariant(periodic=True)   # report-only; never raises
 
+        # ── Shadow learner + evidence-gate demotion (worker thread) ───────────
+        try:
+            await _shadow_housekeeping()
+        except Exception as _hk_sh_exc:
+            log.error("❌ Housekeeping — shadow learner step FAILED: %s", _hk_sh_exc)
+
         # ── Confirmation log (only emitted when both succeed) ─────────────────
         n_buckets = len(getattr(brain, "_edge_profiles", {}))
         log.info(
@@ -3204,6 +3372,20 @@ def _report_evidence_gate() -> None:
             log.info("Evidence gate ON, %d validated: entries only from %s", n, ", ".join(sorted(VALIDATED_STRATEGIES)))
         else:
             log.warning("Evidence gate ON, 0 validated: no new entries (exits still run)")
+    log.info("Shadow learner %s", "ON: refused shorts are tracked as shadow trades"
+             if SHADOW_LEARNER else "OFF")
+
+
+def _report_unfed_positions() -> list[str]:
+    """Open positions on a symbol that is not in SYMBOLS (e.g. dropped after a
+    delisting) get no candles or price feed, so exit_monitor skips them and
+    their stops never fire. Say so at boot; the owner closes them by hand or
+    re-adds the symbol."""
+    unfed = sorted({p["symbol"] for p in get_all_positions()} - set(SYMBOLS))
+    for sym in unfed:
+        log.error("Open position on %s, which is not in SYMBOLS: no price feed, so its "
+                  "exits will not run. Close it by hand or re-add the symbol.", sym)
+    return unfed
 
 
 def _report_model_ages() -> None:
@@ -3292,6 +3474,8 @@ async def main() -> int:
     init_db()
     _report_model_ages()
     _report_evidence_gate()
+    _report_unfed_positions()
+    _load_evidence_blocklist()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

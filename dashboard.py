@@ -1239,6 +1239,16 @@ section.block{margin-top:36px;}
 
   <section class="block">
     <div class="block-hdr">
+      <span class="block-title">Learning</span>
+      <span class="count-badge" id="learn-badge">—</span>
+    </div>
+    <div class="stats-grid" id="learning-grid"></div>
+    <div class="list-card" id="learning-list"></div>
+    <div class="ins-note" id="learn-note"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-hdr">
       <span class="block-title">How Trades End</span>
       <span class="count-badge" id="mix-count">7 days</span>
     </div>
@@ -1855,8 +1865,46 @@ function renderInsights(d){
     + (e.note ? 'Note: ' + e.note : '');
 }
 
+function learnDate(iso){
+  return iso ? new Date(iso).toLocaleDateString('en-CA', {timeZone:'America/Vancouver'}) : '—';
+}
+
+function renderLearning(s){
+  if(!s){
+    g('learn-badge').textContent = 'off';
+    g('learning-grid').innerHTML = '<div class="stat-card"><div class="stat-label">Shadow learner unavailable</div></div>';
+    g('learning-list').innerHTML = ''; g('learn-note').textContent = '';
+    return;
+  }
+  g('learn-badge').textContent = s.enabled ? 'shadow trades' : 'off';
+  const evals = s.evaluations || [];
+  const nCand = evals.reduce((n, e)=>n + (e.candidates||[]).length, 0);
+  const fmtR = v => v==null ? '—' : (v>=0?'+':'') + v.toFixed(2) + 'R';
+  const cards = [
+    {label:'Shadow trades', value:(s.closed||0).toLocaleString()+' closed', sub:(s.open||0)+' open · no capital used'},
+    {label:'Average per trade', value:fmtR(s.all_mean_r), cls: s.all_mean_r==null?'':(s.all_mean_r>0?'pos':'neg'),
+     sub:'net of fees, slippage and borrow'},
+    {label:'Next evaluation', value:learnDate(s.next_eval), sub:s.t0 ? 'started '+learnDate(s.t0) : 'starts with the first shadow trade'},
+    {label:'Candidates', value:String(nCand), cls:nCand?'pos':'',
+     sub:evals.length ? evals.length+' of 2 evaluations done' : 'decided only at the 2 evaluation dates'},
+  ];
+  g('learning-grid').innerHTML = statCards(cards);
+  const rows = s.running || [];
+  g('learning-list').innerHTML = rows.length ? rows.map(r=>`
+    <div class="mix-row">
+      <span class="mix-name">${r.name}</span>
+      <span class="mix-n num">${r.n} trades · ${r.days} days</span>
+      <span class="mix-net num ${r.mean_r>0?'pos':'neg'}">${fmtR(r.mean_r)}</span>
+      <span class="mix-n num">t ${r.t==null?'—':r.t.toFixed(1)}</span>
+    </div>`).join('') : '<div class="empty-state">No setup has 30 closed shadow trades yet</div>';
+  g('learn-note').textContent = 'Every short the evidence gate refuses is tracked as a shadow trade with the bot\'s own '
+    + 'exit rules and costs. Running numbers are not evidence before '+learnDate(s.next_eval)+'. A setup can '
+    + 'only become a candidate at the two fixed evaluation dates (8 and 16 weeks), with at least 300 trades, '
+    + '+0.10R average and a t-stat of at least 3.6; promotion to live trading is a manual, reviewed step.';
+}
+
 function loadInsights(){
-  fetch('/api/insights').then(r=>r.json()).then(renderInsights).catch(console.error);
+  fetch('/api/insights').then(r=>r.json()).then(d=>{ renderInsights(d); renderLearning(d.shadow); }).catch(console.error);
 }
 loadInsights();
 setInterval(loadInsights, 60000);

@@ -33,7 +33,7 @@ ROOT = Path(os.getenv("RESEARCH_DATA_DIR", "/home/admin/trading_data/research"))
 OFFLINE = os.getenv("RESEARCH_OFFLINE", "").strip().lower() in ("1", "true", "yes")
 SPOT_KLINES = "https://api.binance.com/api/v3/klines"
 PERP_FUNDING = "https://fapi.binance.com/fapi/v1/fundingRate"
-INTERVAL_MS = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 _THROTTLE_S = 0.25
 _FIELDS = ("t", "o", "h", "l", "c", "v", "qv")
 

@@ -73,18 +73,23 @@ LOSS_AVERSION_PENALTY: float = 1.5
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
+# MATICUSDT, MKRUSDT, OCEANUSDT and AGIXUSDT were dropped on 2026-10-21: all
+# delisted from Binance spot, so their streams sent nothing and REST returned
+# only pre-delisting candles. The research universe (research.universe) and
+# the experiment arm order (EXPERIMENT_ARM_SYMBOLS) are frozen 50-symbol
+# copies that still list them.
 SYMBOLS = [
     # Large caps — highest liquidity
     "BTCUSDT",   "ETHUSDT",   "BNBUSDT",   "SOLUSDT",   "XRPUSDT",
     # Mid caps — good volatility
-    "DOGEUSDT",  "ADAUSDT",   "AVAXUSDT",  "DOTUSDT",   "MATICUSDT",
+    "DOGEUSDT",  "ADAUSDT",   "AVAXUSDT",  "DOTUSDT",
     "LINKUSDT",  "LTCUSDT",   "ATOMUSDT",  "UNIUSDT",   "APTUSDT",
     "NEARUSDT",  "FILUSDT",   "INJUSDT",   "OPUSDT",    "ARBUSDT",
     "SEIUSDT",   "SUIUSDT",   "TIAUSDT",   "STXUSDT",   "RUNEUSDT",
     # DeFi
-    "AAVEUSDT",  "MKRUSDT",   "SNXUSDT",   "CRVUSDT",   "COMPUSDT",
+    "AAVEUSDT",  "SNXUSDT",   "CRVUSDT",   "COMPUSDT",
     # AI / infra
-    "FETUSDT",   "RENDERUSDT","WLDUSDT",   "OCEANUSDT", "AGIXUSDT",
+    "FETUSDT",   "RENDERUSDT","WLDUSDT",
     # Gaming / NFT
     "SANDUSDT",  "MANAUSDT",  "AXSUSDT",   "ENJUSDT",   "GALAUSDT",
     "APEUSDT",   "GMTUSDT",   "BLURUSDT",  "ILVUSDT",   "CHZUSDT",
@@ -337,10 +342,10 @@ DECAY_TP_PULL_STRENGTH: float = 0.15  # fraction of distance to entry per unit �
 DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 
 # ── CONTROLLED EXPERIMENT (symbol-split A/B, paper) ──────────────────────────
-# Symbols alternate between arm A and arm B in SYMBOLS order (balanced, majors
-# split). The arm is recorded in every entry's entry_features, and each arm
-# gets its own share of SHORT_MAX_OPEN slots so a slow-exiting arm cannot
-# starve the other. EXPERIMENT_NAME="" (the default) means no experiment.
+# Symbols alternate between arm A and arm B in EXPERIMENT_ARM_SYMBOLS order
+# (balanced, majors split). The arm is recorded in every entry's
+# entry_features, and each arm gets its own share of SHORT_MAX_OPEN slots so
+# a slow-exiting arm cannot starve the other. EXPERIMENT_NAME="" (the default) means no experiment.
 #
 # decay_v2 (2026-10-06 .. 2026-10-14, ended. Re-run it with env
 # EXPERIMENT_NAME=decay_v2):
@@ -350,6 +355,23 @@ DECAY_SL_TIGHTEN_STRENGTH: float = 0.10
 #   B = decay as designed: lambda = 1 - exp(-age_min / DECAY_HALFLIFE_CANDLES)
 #       from wall-clock age, applied to the INITIAL levels (idempotent).
 EXPERIMENT_NAME: str = os.getenv("EXPERIMENT_NAME", "").strip()
+# Arm order: SYMBOLS frozen as decay_v2 ran it (f2a051a, 50 symbols incl. the
+# 4 since-delisted pairs), A on even index. Frozen so that dropping a symbol
+# from SYMBOLS never moves another symbol to the other arm: a decay_v2 re-run
+# and its report rebuild the same groups. A symbol not listed here gets a
+# stable hash-based arm (bot._experiment_arm).
+EXPERIMENT_ARM_SYMBOLS: tuple[str, ...] = (
+    "BTCUSDT",   "ETHUSDT",   "BNBUSDT",   "SOLUSDT",   "XRPUSDT",
+    "DOGEUSDT",  "ADAUSDT",   "AVAXUSDT",  "DOTUSDT",   "MATICUSDT",
+    "LINKUSDT",  "LTCUSDT",   "ATOMUSDT",  "UNIUSDT",   "APTUSDT",
+    "NEARUSDT",  "FILUSDT",   "INJUSDT",   "OPUSDT",    "ARBUSDT",
+    "SEIUSDT",   "SUIUSDT",   "TIAUSDT",   "STXUSDT",   "RUNEUSDT",
+    "AAVEUSDT",  "MKRUSDT",   "SNXUSDT",   "CRVUSDT",   "COMPUSDT",
+    "FETUSDT",   "RENDERUSDT","WLDUSDT",   "OCEANUSDT", "AGIXUSDT",
+    "SANDUSDT",  "MANAUSDT",  "AXSUSDT",   "ENJUSDT",   "GALAUSDT",
+    "APEUSDT",   "GMTUSDT",   "BLURUSDT",  "ILVUSDT",   "CHZUSDT",
+    "HBARUSDT",  "EGLDUSDT",  "FLOWUSDT",  "ICPUSDT",   "QNTUSDT",
+)
 
 # ── V3 FIXES (deferred behaviour fixes, default ON since decay_v2 ended) ─────
 # Verified bugs whose fixes change live exits/entries, held back while the
@@ -374,6 +396,17 @@ ENTRY_EVIDENCE_GATE: bool = os.getenv("ENTRY_EVIDENCE_GATE", "true").strip().low
 # Exact strategy names cleared to trade while the gate is on. No prefix or
 # family matching: a pass covers one pre-registered config, not its variants.
 VALIDATED_STRATEGIES: frozenset[str] = frozenset()
+
+# ── SHADOW LEARNER (default ON) ──────────────────────────────────────────────
+# Every short entry the evidence gate refuses is also opened as a shadow trade
+# (no capital, no orders) and resolved on closed 1m candles with the bot's own
+# exit rules and cost booking; see shadow.py and research/PREREG_SHADOW.md.
+# Env SHADOW_LEARNER=false switches it off.
+SHADOW_LEARNER: bool = os.getenv("SHADOW_LEARNER", "true").strip().lower() in ("1", "true", "yes")
+SHADOW_NOTIONAL_USD: float = 150.0      # ~ the median real short notional; sizes the survival stop and borrow
+SHADOW_BORROW_DAILY: float = 0.0003     # 0.03%/day on short notional, as in the research studies
+SHADOW_MAX_HOLD_HOURS: float = 48.0     # cap so a shadow winner cannot stay open forever
+SHADOW_QUEUE_MAX: int = 20_000          # in-memory queue bound between housekeeping runs
 
 # ═════════════════════════════════════════════════════════════════════════════
 # V4 — Execution layer & order-safety protections
@@ -408,10 +441,6 @@ STALE_ENTRY_MAX_SECS: float = float(os.getenv("STALE_ENTRY_MAX_SECS", "180"))
 # argue for capping single-name exposure well below what the sizing model
 # alone would otherwise permit.
 MAX_ORDER_EQUITY_FRAC: float = float(os.getenv("MAX_ORDER_EQUITY_FRAC", "0.15"))
-
-# WS reconnect: if the stream was down longer than this, REST-backfill candle
-# history before trading again so indicators don't run on a gapped cache.
-WS_BACKFILL_AFTER_SECS: float = float(os.getenv("WS_BACKFILL_AFTER_SECS", "90"))
 
 # Testnet adapter behaviour
 ORDER_POLL_TIMEOUT_SECS: float = float(os.getenv("ORDER_POLL_TIMEOUT_SECS", "20"))

@@ -16,7 +16,7 @@ import statistics as st
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-from config import DB_PATH, EXPERIMENT_NAME, FEE_GATE_ROUND_TRIP, SLIPPAGE_PCT, SYMBOLS
+from config import DB_PATH, EXPERIMENT_ARM_SYMBOLS, EXPERIMENT_NAME, FEE_GATE_ROUND_TRIP, SLIPPAGE_PCT
 
 # Round-trip cost of a trade as a % of notional: fee + slippage on both fills.
 COST_PCT = (FEE_GATE_ROUND_TRIP + 2 * SLIPPAGE_PCT) * 100
@@ -103,9 +103,10 @@ def lifetime(conn: sqlite3.Connection) -> dict:
 
 def arm_symbols() -> dict[str, list[str]]:
     """Symbols per arm by the bot's assignment rule (bot._experiment_arm:
-    alternate by SYMBOLS index, A on even), delisted symbols excluded."""
+    alternate by EXPERIMENT_ARM_SYMBOLS index, A on even), delisted symbols
+    excluded. The frozen order keeps decay_v2's groups when SYMBOLS shrinks."""
     out: dict[str, list[str]] = {"A": [], "B": []}
-    for i, sym in enumerate(SYMBOLS):
+    for i, sym in enumerate(EXPERIMENT_ARM_SYMBOLS):
         if sym not in DELISTED_SYMBOLS:
             out["A" if i % 2 == 0 else "B"].append(sym)
     return out
@@ -131,7 +132,7 @@ def per_symbol_day(closed: list[tuple[str, str, str, float]], days: list[str]) -
     daily: dict[str, dict[str, float]] = {"A": defaultdict(float), "B": defaultdict(float)}
     for arm, sym, day, pnl in closed:
         if arm in daily and sym not in DELISTED_SYMBOLS:
-            symbols[arm].add(sym)          # traded but no longer in SYMBOLS: still counts
+            symbols[arm].add(sym)          # traded but not in the arm order: still counts
             daily[arm][day] += pnl
     n = {arm: max(len(symbols[arm]), 1) for arm in daily}
     per_day = {arm: [daily[arm][d] / n[arm] for d in days] for arm in daily}
@@ -239,6 +240,16 @@ def experiment(conn: sqlite3.Connection, name: str | None = None) -> dict | None
     return out
 
 
+def _shadow_summary(conn) -> dict | None:
+    """Shadow learner running numbers (shadow.summary); None if unavailable.
+    Running numbers are NOT evidence before the next evaluation date."""
+    try:
+        import shadow
+        return shadow.summary(conn)
+    except Exception:   # e.g. an old DB without the shadow_trades table
+        return None
+
+
 def snapshot(db_path=None) -> dict:
     """Everything the dashboard's Insights section shows, in one read."""
     conn = connect(db_path)
@@ -249,6 +260,7 @@ def snapshot(db_path=None) -> dict:
             "day": journal_window(conn, 1.0),
             "lifetime": lifetime(conn),
             "experiment": experiment(conn),
+            "shadow": _shadow_summary(conn),
         }
     finally:
         conn.close()

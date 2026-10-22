@@ -53,7 +53,8 @@ class Result:
 
 
 def run(weights: pd.DataFrame, close: pd.DataFrame, bars_per_day: float,
-        costs: Costs = Costs(), band: float = 0.0) -> Result:
+        costs: Costs = Costs(), band: float = 0.0,
+        trade_at: pd.Series | None = None) -> Result:
     """Simulate target weights against close prices (same index/columns).
 
     band: no-trade band. A position whose sign matches its target and whose
@@ -62,9 +63,16 @@ def run(weights: pd.DataFrame, close: pd.DataFrame, bars_per_day: float,
     (constant-weight; for volatile shorts this behaves like an inverse ETF
     and decays). band=0.5 trades on signal changes and large drift only —
     how a discretionary or systematic trader actually holds positions.
+
+    trade_at: optional bool Series on close's index. On bars where it is
+    False (or absent) nothing trades: the book keeps its drifted weights and
+    that bar's weight row is ignored. On True bars the weight row (and the
+    band) apply as usual. None (default) = trade every bar, as before. Used
+    for strategies that rebalance on a schedule coarser than the bar grid.
     """
     close = close.sort_index()
     W = weights.reindex(index=close.index, columns=close.columns).fillna(0.0).to_numpy(float)
+    TA = None if trade_at is None else trade_at.reindex(close.index, fill_value=False).to_numpy(bool)
     R = close.pct_change(fill_method=None).to_numpy(float)
     R = np.where(np.isfinite(R), R, 0.0)            # missing next bar: flat (no fill possible)
     T, N = W.shape
@@ -74,7 +82,9 @@ def run(weights: pd.DataFrame, close: pd.DataFrame, bars_per_day: float,
     borrow_bar = costs.borrow_daily / bars_per_day
     for t in range(T - 1):
         target = W[t]
-        if band > 0:
+        if TA is not None and not TA[t]:
+            target = held                           # off-schedule bar: hold, no trade
+        elif band > 0:
             keep = (np.sign(held) == np.sign(target)) & (target != 0) & \
                    (np.abs(held - target) <= band * np.abs(target))
             target = np.where(keep, held, target)

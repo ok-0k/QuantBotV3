@@ -252,6 +252,32 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_orders_sym_state ON orders(symbol, state);
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opened_ts TEXT NOT NULL,
+                opened_ms INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'short',
+                regime TEXT,
+                entry REAL NOT NULL,
+                stop0 REAL NOT NULL,
+                tp0 REAL NOT NULL,
+                stop REAL NOT NULL,
+                tp REAL NOT NULL,
+                last_ms INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                closed_ts TEXT,
+                exit_price REAL,
+                exit_reason TEXT,
+                net_usd REAL,
+                r_net REAL,
+                hold_min REAL,
+                entry_features TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_shadow_open ON shadow_trades (status, symbol, strategy)")
 
         # ── SAFE MIGRATIONS (idempotent — run every startup) ──────────────────
         # Each block checks whether the column exists before adding it.

@@ -1,0 +1,2 @@
+commit 8b4ec7a0d46c408cd7daef575bc94bca03901555
+cd /home/admin/wt-research-funding && RESEARCH_OFFLINE=1 TRADING_ENV_FILE=/nonexistent TRADING_DATA_DIR=<scratch>/td TRADING_LOG_DIR=<scratch>/tl /home/admin/trading_bot/.venv/bin/python -m research.crowding_study --out /home/admin/wt-research-funding/research/runs/crowding_run1_20261014T035310Z

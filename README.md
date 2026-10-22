@@ -52,7 +52,7 @@ offline research toolkit with a cost-aware backtester.
 ## Architecture
 
 ```
-Binance WS (1m klines, 50 symbols)
+Binance WS (1m klines, 46 symbols)
    │  every update (~2 s) ──► _tick_exit_check: stops / targets / trailing / decay
    │  closed candle ────────► brain.get_ensemble_signal (short-only)
    │                              ├─ gates: circuit breaker / slots / correlation / exposure (blocks are journalled)
@@ -83,12 +83,14 @@ Nightly cron 04:00 (Pi time): stop bot → prune_db.sh (verified backup, then pr
 | `config.py` | All tunables, env overrides, `~/.config/quant-bot/env` loader |
 | `dashboard.py` | FastAPI + SSE dashboard (optional `DASHBOARD_AUTH_TOKEN`) |
 | `ml_engine.py`, `features.py`, `rl_agent.py` | XGBoost gate, features, SAC actor inference |
-| `insights.py` | Read-only journal analytics behind the dashboard's Insights / Experiment / "How Trades End" sections |
+| `insights.py` | Read-only journal analytics behind the dashboard's Insights / Experiment / Learning / "How Trades End" sections |
+| `shadow.py` | Shadow learner: refused shorts tracked as shadow trades, learning statistics, demotion blocklist |
 | `prune_db.sh` | Nightly maintenance: integrity-checked compressed backup first, then trims candles and old equity detail, **never trade data** |
 | `scripts/restore_db.sh` | Restore a nightly backup (refuses while either service runs; dry run by default) |
 | `scripts/set_ledger_anchor.py` | Record a reviewed out-of-band cash change so the ledger check reads ~0 (dry run by default) |
 | `scripts/reset_circuit_breaker.py` | Re-base the breaker's peak equity after a reviewed drawdown (dry run by default) |
 | `scripts/experiment_report.py` | Read-only A/B report for an experiment (pass its name, e.g. `decay_v2`) |
+| `scripts/shadow_report.py` | Read-only shadow learner report (running numbers and the fixed evaluations) |
 | `scripts/entry_edge.py` | Read-only: the bot's entries against random entry, using Binance history |
 | `set_cash_balance.py`, `heal_equity.py` | Manual cash tools. The first records the change in `capital_adjustments`; the second refuses while positions are open |
 | `research/` | Offline backtester, data cache, pre-registered study, carry analysis ([results](research/RESULTS.md)) |
@@ -156,6 +158,31 @@ opens no new positions until a signal passes. Env `ENTRY_EVIDENCE_GATE=false`
 turns it off. The dashboard's System section shows an Evidence Gate tile, and
 the bot logs one warning at startup while the gate is on with nothing validated.
 
+### Shadow learner (`SHADOW_LEARNER`, on by default)
+
+The bot keeps learning while the gate holds it flat. Every short the evidence
+gate refuses is also opened as a **shadow trade**: no capital, no orders. Shadow
+trades are resolved on closed 1-minute candles with the bot's own exit rules
+(trailing stop, break-even, designed time decay, the take-profit fee gate, the
+4-hour exit) and its own cost booking, plus 0.03%/day short borrow. Results are
+kept per exact strategy name in the `shadow_trades` table.
+
+- **No peeking:** a setup can only become a candidate at two fixed evaluation
+  dates, 8 and 16 weeks after the first shadow trade, with at least 300 trades,
+  an average of at least +0.10R net and a day-clustered t of at least 3.6.
+  Running numbers before then are shown but decide nothing.
+- **Promotion is manual:** a candidate gets an independent code check and PM
+  review, then the owner adds its exact name to `VALIDATED_STRATEGIES`.
+- **Demotion is automatic:** a validated name whose last 50 real trades average
+  a loss is blocklisted at runtime; only the owner clears it.
+- **Isolation:** the entry path only queues the signal in memory; all database
+  work runs in a worker thread during housekeeping. It can't change or delay a
+  real decision. Env `SHADOW_LEARNER=false` turns it off.
+
+The full rule and every difference from live trading are in
+`research/PREREG_SHADOW.md`. The dashboard's Learning section shows progress;
+`scripts/shadow_report.py` prints it.
+
 ## Trade journal
 
 Every `trades` row carries:
@@ -189,7 +216,8 @@ onto the entry price within about 5 minutes once a trade passed about 15 minutes
 That is the cause of the old ~20-minute trade lifecycle.
 
 - **How the split works:** symbols alternate between group A and group B in
-  `SYMBOLS` order.
+  `EXPERIMENT_ARM_SYMBOLS` order (the 50-symbol list as the experiment ran, so
+  dropping a symbol from `SYMBOLS` does not regroup the others).
 - **Group A** keeps the legacy behaviour.
 - **Group B** uses the decay as designed: λ comes from the trade's wall-clock
   age and is applied to the *initial* levels.
@@ -225,7 +253,9 @@ committed before any result was seen) is in `research/`:
 Data is cached in `/home/admin/trading_data/research/` (outside the repo). The
 backtester charges the same costs as the paper model: 0.10% fee + 0.08% slippage
 per fill, plus 0.03%/day short borrow. Hedge legs are only allowed in hours when
-the spot pair actually trades. Unit tests prove there is no lookahead.
+the spot pair actually trades. Unit tests prove there is no lookahead. The
+research universe is frozen in `research/universe.py` (the live bot's 50 symbols
+as of 2026-10, delisted pairs included up to delisting), not read from `SYMBOLS`.
 
 ---
 
@@ -259,7 +289,7 @@ vcgencmd measure_temp; free -h
 | Constant | Value | Notes |
 |----------|-------|-------|
 | `STARTING_CASH` | 10,000 | Paper balance |
-| `SYMBOLS` | 50 pairs | 4 are delisted on Binance spot (MATIC, MKR, OCEAN, AGIX). Removing them shifts the list positions the `decay_v2` report uses to rebuild its groups |
+| `SYMBOLS` | 46 pairs | The 4 delisted on Binance spot (MATIC, MKR, OCEAN, AGIX) were dropped 2026-10-21. Experiment groups and research keep the frozen 50 (`EXPERIMENT_ARM_SYMBOLS`, `research/universe.py`) |
 | `EXECUTION_MODE` | paper | `paper` or `testnet` (env). **No live mode** |
 | `SHORT_MAX_OPEN` | 5 | 3 per group while an experiment runs |
 | `MAX_ORDER_EQUITY_FRAC` | 15% | Hard per-order clamp |
@@ -272,10 +302,11 @@ vcgencmd measure_temp; free -h
 | `HARD_STOP_LOSS_USD` | −15 | Survival stop per position |
 | `MAX_HOLD_OPEN_SECONDS` | 14,400 | Closes losing positions after 4h |
 | `MAX_DRAWDOWN_PCT` / `CB_RECOVERY_PCT` | 20% / 10% | Circuit breaker trips at 20% drawdown, clears at 10% |
-| `STALE_ENTRY_MAX_SECS` / `WS_BACKFILL_AFTER_SECS` | 180 / 90 | Stale-data entry gate, REST backfill after a websocket outage |
+| `STALE_ENTRY_MAX_SECS` | 180 | Stale-data entry gate (every websocket reconnect after an error also REST-backfills candles) |
 | `EXPERIMENT_NAME` | empty | No experiment. Env `EXPERIMENT_NAME=decay_v2` re-runs the decay split |
 | `V3_FIXES` | on | Deferred exit fixes. Env `V3_FIXES=false` turns them off |
 | `ENTRY_EVIDENCE_GATE` | on | Entries only from `VALIDATED_STRATEGIES` (empty). Env `ENTRY_EVIDENCE_GATE=false` turns it off |
+| `SHADOW_LEARNER` | on | Refused shorts tracked as shadow trades. Env `SHADOW_LEARNER=false` turns it off |
 
 ## Execution modes and order protections
 
@@ -309,7 +340,7 @@ and blank the webhook.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q                   # 349 tests; throwaway temp DB, never the live one
+.venv/bin/python -m pytest tests/ -q                   # ~480 tests, ~2 min; throwaway temp DB, never the live one
 V3_FIXES=false .venv/bin/python -m pytest tests/ -q    # same suite with the deferred exit fixes off
 ```
 
