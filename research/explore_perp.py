@@ -206,7 +206,7 @@ def summ(res: bt.Result, ex: dict, bench: pd.Series, a, b, bpy: float) -> dict:
 # ── crowding (48 configs) ───────────────────────────────────────────────────
 
 def crowding(out: Path) -> None:
-    from config import SYMBOLS
+    from research.universe import RESEARCH_SYMBOLS as SYMBOLS
     from research import crowding as C
     from research import crowding_study as CS
     t0 = time.time()
@@ -250,7 +250,7 @@ def crowding(out: Path) -> None:
 # ── price strategies (17) + carry (2) from the 2026-10-07 study ─────────────
 
 def price(out: Path) -> None:
-    from config import SYMBOLS
+    from research.universe import RESEARCH_SYMBOLS as SYMBOLS
     from research import strategies as S
     from research import study as ST
     t0 = time.time()
@@ -446,7 +446,7 @@ def diag(out: Path) -> None:
     symbol, the perp basis that the re-score ignores (premium change on the
     held weight, 8h resolution), and perp-cost re-runs without the symbols
     that carry most of it. Descriptive; nothing here is a screen."""
-    from config import SYMBOLS
+    from research.universe import RESEARCH_SYMBOLS as SYMBOLS
     from research import crowding as C
     from research import crowding_study as CS
     from research import strategies as S
