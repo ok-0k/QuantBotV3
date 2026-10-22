@@ -150,7 +150,12 @@ def test_entry_filled_away_from_limit_rederives_levels_at_the_fill(fresh, monkey
                                           ("buy", "BUY AAAUSDT committed with cash")])
 def test_fill_is_booked_even_if_cash_was_spent_during_the_round_trip(fresh, monkeypatch, caplog, action, text):
     """The order already executed: booking must not be skipped. Cash goes
-    negative and the warning names the cause."""
+    negative and the warning names the cause.
+
+    CURRENT BEHAVIOUR, NOT A REQUIREMENT (PM 2026-10-22): booking the real fill
+    is correct, but the negative cash comes from a race that a planned fix
+    (reserve cash at prepare time) would remove. If that fix lands and cash no
+    longer goes negative, update this test; it is not a regression."""
     def fill(i):
         fresh.set_cash(5.0)                               # other symbols spent it meanwhile
         return Fill(status="FILLED", qty=i.qty, price=i.limit_price)
