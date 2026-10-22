@@ -1327,17 +1327,25 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
     # trigger level understated losses, e.g. a stop 5.7% under market booked ~$0.
     _mark_now = float(candle.get("close", 0.0) or 0.0)
     if V3_FIXES:
-        # Order as in exit_monitor: survival -> stop -> take-profit, so a
-        # fee-gated TP can no longer hide a breached stop, and a candle that
-        # touched both books the stop (conservative).
+        # Order: survival -> stop in place (wick) -> take-profit in place
+        # (wick, fee-cleared) -> moved stop (mark) -> moved take-profit (mark).
+        # A fee-gated TP can no longer hide a breached stop, and a candle that
+        # touched both levels in place books the stop (conservative).
         # The candle's high/low is the whole minute so far, partly printed
         # before a stop moved within the minute existed (trail / break-even,
         # in this call or an earlier tick, or decay). It is only tested
         # against the loosest stop in place since the minute began (_ext_stop);
         # a stop moved since triggers on the mark only. Otherwise a break-even
         # armed mid-candle is "hit" by the minute's earlier high, closing a
-        # winner at entry. A take-profit is tested against the level stored
-        # when this call began (_tp0) as before, or the current one on the mark.
+        # winner at entry. A take-profit in place (the level stored when this
+        # call began, _tp0) that the wick traded through, and that would book a
+        # positive net, exits at the target BEFORE a moved stop is tested on
+        # the mark: the resting limit filled when price passed it, and a trail
+        # built from that same move must not pre-empt it. A fee-gated target
+        # falls through to the moved-stop check. Same order as the shadow
+        # learner (shadow.step).
+        _tp_clears = lambda px: _profit_clears_fees(          # noqa: E731
+            avg_cost, float(pos.get("shares", 0.0)), px, is_short)
         _mkey = (pos.get("opened_ts"), candle.get("time"))
         _seen = _tick_minute_stop.get(sym)
         if _seen is None or _seen[0] != _mkey:
@@ -1354,12 +1362,12 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 stop = _ext_stop
                 reason = f"stop_loss_tick (low=${candle_low:,.4f} <= stop=${stop:,.4f})"
                 exit_price = min(stop, _mark_now) if _mark_now > 0 else stop
+            elif _tp0 > 0 and candle_high >= _tp0 and _tp_clears(_tp0):
+                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
+                exit_price = _tp0
             elif stop > 0 and 0 < _mark_now <= stop:
                 reason = f"stop_loss_tick (mark=${_mark_now:,.4f} <= stop=${stop:,.4f})"
                 exit_price = _mark_now
-            elif _tp0 > 0 and candle_high >= _tp0:
-                reason = f"take_profit_tick (high=${candle_high:,.4f} >= tp=${_tp0:,.4f})"
-                exit_price = _tp0
             elif tp > 0 and _mark_now >= tp:
                 reason = f"take_profit_tick (mark=${_mark_now:,.4f} >= tp=${tp:,.4f})"
                 exit_price = tp
@@ -1368,12 +1376,12 @@ async def _tick_exit_check(sym: str, candle: dict, loop: asyncio.AbstractEventLo
                 stop = _ext_stop
                 reason = f"stop_loss_tick_short (high=${candle_high:,.4f} >= stop=${stop:,.4f})"
                 exit_price = max(stop, _mark_now)
+            elif _tp0 > 0 and candle_low <= _tp0 and _tp_clears(_tp0):
+                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
+                exit_price = _tp0
             elif stop > 0 and _mark_now >= stop:
                 reason = f"stop_loss_tick_short (mark=${_mark_now:,.4f} >= stop=${stop:,.4f})"
                 exit_price = _mark_now
-            elif _tp0 > 0 and candle_low <= _tp0:
-                reason = f"take_profit_tick_short (low=${candle_low:,.4f} <= tp=${_tp0:,.4f})"
-                exit_price = _tp0
             elif tp > 0 and 0 < _mark_now <= tp:
                 reason = f"take_profit_tick_short (mark=${_mark_now:,.4f} <= tp=${tp:,.4f})"
                 exit_price = tp

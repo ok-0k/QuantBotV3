@@ -168,13 +168,11 @@ def test_long_take_profit_fills_at_the_resting_limit(fresh):
     assert row["exit_reason"] == "TAKE_PROFIT"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: with V3_FIXES a candle that trades through a fee-clearing take-profit and then closes "
-    ">= 1 ATR off its extreme is booked as a TRAILING_STOP at the close, not a TAKE_PROFIT at tp. "
-    "The trail (extreme -/+ ATR) is derived from that same candle, so under the bot's own fill model "
-    "(take-profit = resting limit, fills AT tp) the target had already filled; the stop-before-target "
-    "ordering then fires the just-created trail on the mark. Short e.g.: tp 99.0, low 98.9, close 99.2 "
-    "-> cover at 99.2 (TRAILING_STOP) instead of 99.0. Legacy (V3 off) books the target."))
+# Fixed (fix/tick-tp-order): with V3_FIXES a candle that traded through a
+# fee-clearing take-profit and then closed >= 1 ATR off its extreme used to be
+# booked as a TRAILING_STOP at the close (the trail built from that same
+# candle fired on the mark before the target was tested). The target in place
+# is now tested on the wick before a moved stop is tested on the mark.
 @pytest.mark.parametrize("side", ["short", "long"])
 def test_touched_take_profit_is_not_pre_empted_by_a_trail_from_the_same_candle(fresh, side):
     atr = _history()
@@ -190,6 +188,22 @@ def test_touched_take_profit_is_not_pre_empted_by_a_trail_from_the_same_candle(f
     assert row["exit_reason"] == "TAKE_PROFIT"
     slip = (1 + SLIPPAGE_PCT) if side == "short" else (1 - SLIPPAGE_PCT)
     assert row["exec_price"] == pytest.approx(tp * slip)
+
+
+def test_fee_gated_target_falls_through_to_a_stop_trailed_by_the_same_candle(fresh):
+    """The target in place is tested before a moved stop only when it would
+    book a positive net. A touched but fee-gated target must not hide a stop
+    that the same candle trailed and the mark then crossed."""
+    atr = _history()                                     # ~0.06
+    tp = 99.85                                           # 0.15% target: cannot clear fees + slippage
+    fresh.open_short(SYM, 1.0, ENTRY, "QF", 100.55, tp, 20.0)
+    low, close = 99.80, 99.90                            # trail -> 99.80 + ATR ~ 99.86 <= close
+    assert low + atr <= close < 100.55 and low > ENTRY - 4.5 * atr   # no break-even, no stop in place
+    _tick(high=99.95, low=low, close=close)
+    row = _exits(fresh)[0]
+    assert row["exit_reason"] == "TRAILING_STOP"
+    assert row["exec_price"] == pytest.approx(close * (1 + SLIPPAGE_PCT))
+    assert not _is_open(fresh)
 
 
 def test_legacy_survival_floor_fires_when_no_level_is_touched(fresh, monkeypatch):
