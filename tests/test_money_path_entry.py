@@ -308,3 +308,13 @@ def test_cover_signal_without_a_position_is_journaled_no_position(evaluate, fres
     _nothing_happened(fresh)
     row = _rows(fresh)[-1]
     assert (row["action"], row["status"], row["reason"]) == ("cover", "skipped", "no_position")
+
+
+def test_long_entries_stop_at_the_open_position_cap(evaluate, fresh, monkeypatch):
+    monkeypatch.setattr(bot, "MAX_OPEN_POSITIONS", 2)
+    for peer in PEERS[:2]:
+        fresh.open_position(peer, 1.0, 100.0, "QF", 95.0, 110.0)
+    fresh.set_cash(STARTING_CASH - 200.0)
+    evaluate(live=0.97, signal="buy", ml_prob=0.97)
+    assert {p["symbol"] for p in fresh.get_all_positions()} == set(PEERS[:2])
+    assert fresh.get_cash() == pytest.approx(STARTING_CASH - 200.0) and _rows(fresh) == []

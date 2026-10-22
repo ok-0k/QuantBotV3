@@ -327,3 +327,13 @@ def test_four_hour_time_exit_applies_to_longs_too(fresh):
     _mark(99.7)
     _monitor(fresh.get_position(SYM))
     assert _exits(fresh)[0]["exit_reason"] == "TIME_HOLD_EXIT"
+
+
+def test_legacy_long_stop_gapped_through_also_fills_at_the_market(fresh, monkeypatch):
+    monkeypatch.setattr(bot, "V3_FIXES", False)
+    _history()
+    _long(fresh, stop=99.5, tp=103.0)
+    _tick(high=99.4, low=99.0, close=99.2)
+    row = _exits(fresh)[0]
+    assert row["exec_price"] == pytest.approx(99.2 * (1 - SLIPPAGE_PCT))
+    assert row["exit_reason"] == "STOP_LOSS"
